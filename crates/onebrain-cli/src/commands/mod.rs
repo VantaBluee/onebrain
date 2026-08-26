@@ -1,10 +1,12 @@
 pub mod doctor;
 pub mod ls;
+pub mod pair;
 pub mod pull;
 pub mod rm;
 pub mod run;
 pub mod status;
 pub mod stop;
+pub mod unpair;
 pub mod up;
 pub mod version;
 

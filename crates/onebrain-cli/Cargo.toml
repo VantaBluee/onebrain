@@ -17,6 +17,9 @@ onebrain-engine = { workspace = true }
 onebrain-models = { workspace = true }
 onebraind = { workspace = true }
 clap = { workspace = true }
+# Terminal QR rendering for `onebrain pair` (unicode half-block renderer;
+# workspace pin disables default features, so no image dependency).
+qrcode = { workspace = true }
 reqwest = { workspace = true }
 # Only to drive onebrain-models' async download from the synchronous `pull`
 # command (current-thread runtime); everything else uses reqwest::blocking.

@@ -62,10 +62,10 @@ pub enum ClientError {
     #[error("lost the daemon's response stream ({0}); check `onebrain status` and retry")]
     Stream(String),
     #[error(
-        "the daemon's load stream ended without a terminal status; \
+        "the daemon's {what} stream ended without a terminal status; \
          check the daemon log under the data dir (`onebrain doctor` prints it)"
     )]
-    NoTerminal,
+    NoTerminal { what: &'static str },
 }
 
 /// A connected view of the local daemon's internal API.
@@ -161,7 +161,7 @@ impl DaemonClient {
         &self,
         model: &str,
         ctx: Option<u32>,
-        mut on_progress: impl FnMut(&serde_json::Value),
+        on_progress: impl FnMut(&serde_json::Value),
     ) -> Result<serde_json::Value, ClientError> {
         let mut body = serde_json::json!({ "model": model });
         if let Some(n) = ctx {
@@ -185,6 +185,103 @@ impl DaemonClient {
             return Err(Self::api_error(status.as_u16(), resp.text().ok()));
         }
 
+        Self::stream_ndjson(resp, "load", &["ready", "error"], on_progress)
+    }
+
+    /// `POST /api/internal/pair/start` — open a pairing window and stream
+    /// its NDJSON events. `on_event` sees every non-terminal line (`window`
+    /// with the code + ticket, then `attempt`); the terminal line
+    /// (`paired`, `expired`, or `failed`) is returned instead.
+    pub fn pair_start(
+        &self,
+        on_event: impl FnMut(&serde_json::Value),
+    ) -> Result<serde_json::Value, ClientError> {
+        let url = format!("{}/api/internal/pair/start", self.base_url);
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(&self.token)
+            .send()
+            .map_err(|e| ClientError::Unreachable {
+                url: url.clone(),
+                detail: e.to_string(),
+            })?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(Self::api_error(status.as_u16(), resp.text().ok()));
+        }
+        Self::stream_ndjson(resp, "pairing", &["paired", "expired", "failed"], on_event)
+    }
+
+    /// `POST /api/internal/pair/join` — join a pairing window elsewhere.
+    /// `target` is a ticket or a bare 6-digit code; `code` accompanies a
+    /// ticket. Returns the daemon's `{peer}` response. No client-side
+    /// timeout: a code-only join may probe several LAN candidates.
+    pub fn pair_join(
+        &self,
+        target: &str,
+        code: Option<&str>,
+    ) -> Result<serde_json::Value, ClientError> {
+        let mut body = serde_json::json!({ "target": target });
+        if let Some(code) = code {
+            body["code"] = code.into();
+        }
+        let url = format!("{}/api/internal/pair/join", self.base_url);
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(&self.token)
+            .json(&body)
+            .send()
+            .map_err(|e| ClientError::Unreachable {
+                url: url.clone(),
+                detail: e.to_string(),
+            })?;
+        Self::success_json(resp)
+    }
+
+    /// `GET /api/internal/peers` — paired peers with live link state.
+    pub fn peers(&self) -> Result<serde_json::Value, ClientError> {
+        let url = format!("{}/api/internal/peers", self.base_url);
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(&self.token)
+            .timeout(Duration::from_secs(5))
+            .send()
+            .map_err(|e| ClientError::Unreachable {
+                url: url.clone(),
+                detail: e.to_string(),
+            })?;
+        Self::success_json(resp)
+    }
+
+    /// `POST /api/internal/unpair` — revoke a pairing by peer name.
+    pub fn unpair(&self, name: &str) -> Result<serde_json::Value, ClientError> {
+        let url = format!("{}/api/internal/unpair", self.base_url);
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(&self.token)
+            .json(&serde_json::json!({ "name": name }))
+            .timeout(Duration::from_secs(10))
+            .send()
+            .map_err(|e| ClientError::Unreachable {
+                url: url.clone(),
+                detail: e.to_string(),
+            })?;
+        Self::success_json(resp)
+    }
+
+    /// Read an NDJSON body line by line: events whose `status` is in
+    /// `terminal` are returned, everything else goes to `on_event`.
+    /// Malformed lines (keep-alives) are tolerated.
+    fn stream_ndjson(
+        resp: reqwest::blocking::Response,
+        what: &'static str,
+        terminal: &[&str],
+        mut on_event: impl FnMut(&serde_json::Value),
+    ) -> Result<serde_json::Value, ClientError> {
         let reader = BufReader::new(resp);
         for line in reader.lines() {
             let line = line.map_err(|e| ClientError::Stream(e.to_string()))?;
@@ -196,11 +293,11 @@ impl DaemonClient {
                 continue; // tolerate malformed keep-alives
             };
             match event.get("status").and_then(|s| s.as_str()) {
-                Some("ready") | Some("error") => return Ok(event),
-                _ => on_progress(&event),
+                Some(status) if terminal.contains(&status) => return Ok(event),
+                _ => on_event(&event),
             }
         }
-        Err(ClientError::NoTerminal)
+        Err(ClientError::NoTerminal { what })
     }
 
     /// `POST /api/internal/shutdown` — asks the daemon to exit gracefully.

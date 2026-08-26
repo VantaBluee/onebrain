@@ -25,6 +25,30 @@ pub struct Config {
     pub api_bind: String,
     /// Context length for the inference session created at model load.
     pub ctx_len: u32,
+    /// Mesh transport switches (`[mesh]` table, docs/mesh.md).
+    pub mesh: MeshSection,
+}
+
+/// The `[mesh]` table: switches passed to `onebrain-mesh::MeshConfig`.
+/// Both default on — the mesh is useful out of the box; these exist for
+/// locked-down networks (no multicast, no third-party relays).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MeshSection {
+    /// Advertise and discover peers on the LAN via mDNS.
+    pub enable_mdns: bool,
+    /// Use n0's relay + pkarr infrastructure for dial-by-key across
+    /// networks. Off, only direct addresses (tickets, mDNS) can connect.
+    pub enable_relays: bool,
+}
+
+impl Default for MeshSection {
+    fn default() -> Self {
+        MeshSection {
+            enable_mdns: true,
+            enable_relays: true,
+        }
+    }
 }
 
 impl Default for Config {
@@ -35,6 +59,7 @@ impl Default for Config {
             battery_drain_threshold: 25,
             api_bind: "127.0.0.1:11435".to_string(),
             ctx_len: 4096,
+            mesh: MeshSection::default(),
         }
     }
 }
@@ -84,6 +109,9 @@ mod tests {
         // The API listens on loopback only in M1 (internal-api contract).
         assert_eq!(c.api_bind, "127.0.0.1:11435");
         assert_eq!(c.ctx_len, 4096);
+        // Mesh defaults on: pairing works out of the box (docs/mesh.md).
+        assert!(c.mesh.enable_mdns);
+        assert!(c.mesh.enable_relays);
     }
 
     #[test]
@@ -110,6 +138,29 @@ mod tests {
         assert!(!c.localhost_auth_exempt);
         assert_eq!(c.api_bind, "127.0.0.1:11435");
         assert_eq!(c.ctx_len, 4096);
+        assert_eq!(c.mesh, MeshSection::default());
+    }
+
+    #[test]
+    fn mesh_section_parses_and_defaults_missing_switches() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[mesh]\nenable_mdns = false\n").unwrap();
+        let c = Config::load(&path).unwrap();
+        assert!(!c.mesh.enable_mdns);
+        // Unset switches in a partial [mesh] table default on.
+        assert!(c.mesh.enable_relays);
+    }
+
+    #[test]
+    fn unknown_keys_in_mesh_section_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[mesh]\ndisable_auth = true\n").unwrap();
+        assert!(matches!(
+            Config::load(&path),
+            Err(DaemonError::ConfigParse { .. })
+        ));
     }
 
     #[test]

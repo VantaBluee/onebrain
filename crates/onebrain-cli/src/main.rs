@@ -30,7 +30,14 @@ enum Command {
     /// Start the daemon on this device (head role).
     Up,
     /// Pair this device with another (shows a code; or pass one).
-    Pair { code: Option<String> },
+    Pair {
+        /// Ticket or 6-digit code from the host device. Omit to host a
+        /// pairing window on this device instead.
+        target: Option<String>,
+        /// 6-digit code to go with a ticket (otherwise prompted).
+        #[arg(long)]
+        code: Option<String>,
+    },
     /// Ensure weights, plan placement, load, and serve a model.
     Run {
         model: String,
@@ -92,8 +99,10 @@ fn main() {
             Ok(()) => Ok(()),
             Err(e) => Err(commands::CliError(e.to_string())),
         },
-        Command::Pair { .. } => commands::not_yet("pair", "M2"),
-        Command::Unpair { .. } => commands::not_yet("unpair", "M2"),
+        Command::Pair { target, code } => {
+            commands::pair::run(target.as_deref(), code.as_deref(), cli.json)
+        }
+        Command::Unpair { name } => commands::unpair::run(&name, cli.json),
         Command::Bench => commands::not_yet("bench", "M4"),
     };
 

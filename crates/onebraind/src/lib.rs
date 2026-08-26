@@ -3,8 +3,8 @@
 //!
 //! M1 scope: the long-running single-node daemon — API token, single-
 //! instance lock, the engine-host thread, the internal control API, and the
-//! runtime that wires them to the public HTTP gateway. The mesh endpoint
-//! arrives in M2.
+//! runtime that wires them to the public HTTP gateway. M2 adds the mesh
+//! service (device identity, pairing, peers) and its internal endpoints.
 
 pub mod config;
 pub mod engine_host;
@@ -130,4 +130,10 @@ pub enum DaemonError {
          `onebrain up`; `onebrain doctor` shows the log locations."
     )]
     Serve { source: std::io::Error },
+    // The mesh error's own message carries the remedy (docs/mesh.md).
+    #[error("the mesh service failed to start: {source}")]
+    Mesh {
+        #[source]
+        source: onebrain_mesh::MeshError,
+    },
 }

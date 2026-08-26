@@ -9,6 +9,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use onebrain_api::auth::AuthConfig;
 use onebrain_api::ApiState;
+use onebrain_mesh::{identity, MeshConfig, MeshHandle, MeshService};
 use tokio::sync::Notify;
 
 use crate::config::Config;
@@ -33,7 +34,7 @@ pub fn run_blocking() -> Result<(), DaemonError> {
         .try_init();
 
     let paths = AppPaths::resolve()?;
-    let config = Config::load(&paths.config_file())?;
+    let mut config = Config::load(&paths.config_file())?;
     let run_dir = paths.data_dir.join("run");
     // The lock is the single-instance authority; hold it before touching
     // any shared state. Exits with the already-running remedy if held.
@@ -45,13 +46,61 @@ pub fn run_blocking() -> Result<(), DaemonError> {
         source,
     })?;
 
+    // Device identity for the mesh: created at first start, never
+    // regenerated (docs/mesh.md "Identity"). A malformed key file is a
+    // startup error, not a silent re-key.
+    let device_key = identity::load_or_create(&paths.config_dir)
+        .map_err(|source| DaemonError::Mesh { source })?;
+    // Node name shown to peers: config wins; first run derives it from the
+    // hostname and persists it so renaming the machine later does not
+    // re-identify this node to its peers.
+    let node_name = match config.node_name.clone() {
+        Some(name) => name,
+        None => {
+            let name = default_node_name();
+            config.node_name = Some(name.clone());
+            if let Err(e) = config.save(&paths.config_file()) {
+                tracing::warn!(error = %e, "could not persist node_name; using it for this run only");
+            }
+            name
+        }
+    };
+
     let (host, host_thread) = EngineHost::spawn();
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|source| DaemonError::Runtime { source })?;
-    let served = runtime.block_on(serve(&config, token, host.clone(), &cache_root, &run_dir));
+
+    let mesh_config = MeshConfig {
+        enable_mdns: config.mesh.enable_mdns,
+        enable_relays: config.mesh.enable_relays,
+        engine_build: onebrain_engine::engine_build_hash().0,
+        ..MeshConfig::default()
+    };
+    let served = match runtime.block_on(MeshService::spawn(
+        device_key,
+        paths.config_dir.join("peers.toml"),
+        node_name,
+        mesh_config,
+    )) {
+        Ok(mesh) => {
+            let served = runtime.block_on(serve(
+                &config,
+                token,
+                host.clone(),
+                &cache_root,
+                &run_dir,
+                mesh.clone(),
+            ));
+            // Close mesh connections and the endpoint before tearing down
+            // the rest; peers see a clean close instead of a timeout.
+            let _ = runtime.block_on(mesh.shutdown());
+            served
+        }
+        Err(source) => Err(DaemonError::Mesh { source }),
+    };
 
     // Teardown in dependency order: stop the engine host (drops Session and
     // Model), only then free the process-wide engine backend.
@@ -64,12 +113,23 @@ pub fn run_blocking() -> Result<(), DaemonError> {
     served
 }
 
+/// Hostname fallback for `node_name` when the config does not set one.
+fn default_node_name() -> String {
+    std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "onebrain-node".to_string())
+}
+
 async fn serve(
     config: &Config,
     token: String,
     host: EngineHost,
     cache_root: &Path,
     run_dir: &Path,
+    mesh: MeshHandle,
 ) -> Result<(), DaemonError> {
     let product_version: &'static str = env!("CARGO_PKG_VERSION");
     let shutdown = Arc::new(Notify::new());
@@ -107,6 +167,7 @@ async fn serve(
         started: Instant::now(),
         product_version,
         shutdown: shutdown.clone(),
+        mesh,
     });
     let app = onebrain_api::router(api_state).merge(internal_router(internal_state));
 
