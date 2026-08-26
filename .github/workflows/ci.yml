@@ -77,9 +77,61 @@ jobs:
         run: cargo xtask smoke
 
       # The M1 DoD rehearsal, per OS: sandboxed daemon, both API dialects
-      # streaming real tokens, kill -9 recovery, graceful stop.
+      # streaming real tokens, kill -9 recovery, graceful stop. The Build
+      # step above already compiled everything (OB_E2E_SKIP_BUILD).
       - name: End-to-end rehearsal (daemon + both API dialects)
         run: cargo xtask e2e
+        env:
+          OB_E2E_SKIP_BUILD: "1"
+
+      # The M2 DoD rehearsal, per OS: two sandboxed daemons (mDNS/relays
+      # disabled) pair through the internal API with ticket + code, both
+      # report the peer connected with RTT/bandwidth, and unpair degrades
+      # the link. mDNS itself is NOT exercised in CI (multicast is
+      # unreliable on hosted runners; it is on the manual checklist).
+      - name: Pair-sim rehearsal (two daemons, mesh pairing)
+        run: cargo xtask pair-sim
+        env:
+          OB_E2E_SKIP_BUILD: "1"
+
+  # M2 netem leg (docs/mesh.md): the pair-sim scenario with each daemon in
+  # its own network namespace, the veth pair between them shaped by tc netem
+  # to 1 Gbit / 0.5 ms per direction; asserts the probed bandwidth lands in
+  # [500, 1100] Mbps and the heartbeat RTT in [0.4, 3.0] ms. Root is needed
+  # for `ip netns`/`tc`, so the workspace is prebuilt as the runner user
+  # (keeping ~/.cargo and target/ runner-owned for rust-cache) and only the
+  # sim runs under sudo (-E preserves HOME/CARGO env; PATH is re-injected
+  # because sudo resets it even with -E).
+  pair-sim-netem:
+    name: pair-sim-netem
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    env:
+      RUSTFLAGS: -Dwarnings
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout (with vendored llama.cpp submodule)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Prebuild (as the runner user, so caches stay runner-owned)
+        run: |
+          cargo build --workspace --exclude xtask
+          cargo build -p xtask
+
+      # OB_E2E_SKIP_BUILD is essential here: an inner build under sudo
+      # would write root-owned artifacts into the runner-owned cache.
+      - name: Pair-sim under netem (1 Gbit / 0.5 ms namespaces)
+        run: sudo -E env PATH=$PATH OB_E2E_SKIP_BUILD=1 cargo xtask pair-sim --netem
 
   # Compile-only proof that the GPU backend features build on every platform
   # that supports them. These must be green per the spec (no continue-on-error).
@@ -110,7 +162,6 @@ jobs:
     continue-on-error: false
     env:
       RUSTFLAGS: -Dwarnings
-      VULKAN_VERSION: 1.4.309.0
     defaults:
       run:
         shell: bash
@@ -136,14 +187,18 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y vulkan-sdk
 
+      # LunarG retires old point releases from the CDN (pinned versions rot
+      # into 404s), so resolve the current version at install time.
       - name: Install Vulkan SDK (Windows, silent installer)
         if: matrix.vulkan && runner.os == 'Windows'
         shell: pwsh
         run: |
-          curl.exe -L --fail --retry 3 -o "$env:RUNNER_TEMP\vulkan-sdk-installer.exe" "https://sdk.lunarg.com/sdk/download/$env:VULKAN_VERSION/windows/vulkansdk-windows-X64-$env:VULKAN_VERSION.exe"
+          $ver = (Invoke-RestMethod "https://vulkan.lunarg.com/sdk/latest/windows.txt").ToString().Trim()
+          Write-Host "Vulkan SDK version: $ver"
+          curl.exe -L --fail --retry 3 -o "$env:RUNNER_TEMP\vulkan-sdk-installer.exe" "https://sdk.lunarg.com/sdk/download/$ver/windows/vulkansdk-windows-X64-$ver.exe"
           Start-Process -FilePath "$env:RUNNER_TEMP\vulkan-sdk-installer.exe" -ArgumentList "--accept-licenses","--default-answer","--confirm-command","install" -NoNewWindow -Wait
-          Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\$env:VULKAN_VERSION"
-          Add-Content $env:GITHUB_PATH "C:\VulkanSDK\$env:VULKAN_VERSION\Bin"
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\$ver"
+          Add-Content $env:GITHUB_PATH "C:\VulkanSDK\$ver\Bin"
 
       - name: Install CUDA toolkit 12.x (Linux, network method)
         if: matrix.cuda && runner.os == 'Linux'

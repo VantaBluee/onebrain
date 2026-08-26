@@ -37,6 +37,13 @@ pub fn run() -> Result<()> {
     // 1. Build (streams cargo's own output), then locate the binary the way
     //    dist.rs does: a no-op re-invocation with JSON compiler messages.
     let binary = step("build: cargo build --workspace", || {
+        // CI sets OB_E2E_SKIP_BUILD=1: its own Build step already compiled
+        // the workspace, and `--exclude xtask` unifies features differently
+        // enough to trigger a huge pointless rebuild on slow runners.
+        if std::env::var("OB_E2E_SKIP_BUILD").as_deref() == Ok("1") {
+            println!("  (skipping inner build: OB_E2E_SKIP_BUILD=1)");
+            return locate_onebrain_binary(&root);
+        }
         // xtask itself is excluded: workspace-level feature unification can
         // force a rebuild of the xtask binary that is running this very
         // command, which fails on Windows ("Access is denied" replacing a
@@ -77,10 +84,31 @@ pub fn run() -> Result<()> {
 
     // 3. Scenario, with best-effort cleanup even on failure.
     let outcome = scenario(&ctx, &model_path);
+    if outcome.is_err() {
+        dump_daemon_log(&ctx.home);
+    }
     cleanup(&ctx);
     outcome?;
     println!("e2e: all steps passed");
     Ok(())
+}
+
+/// On failure, surface what the daemon itself saw — CI can't be debugged
+/// from the client side alone.
+pub(crate) fn dump_daemon_log(home: &std::path::Path) {
+    let path = home.join("data").join("logs").join("daemon.log");
+    match std::fs::read_to_string(&path) {
+        Ok(text) => {
+            let lines: Vec<&str> = text.lines().collect();
+            let tail = &lines[lines.len().saturating_sub(60)..];
+            eprintln!("---- daemon.log tail ({}) ----", path.display());
+            for line in tail {
+                eprintln!("  {line}");
+            }
+            eprintln!("---- end daemon.log ----");
+        }
+        Err(e) => eprintln!("(no daemon log at {}: {e})", path.display()),
+    }
 }
 
 /// Handle to the sandboxed installation.
@@ -430,8 +458,9 @@ fn scenario(ctx: &Ctx, model_path: &Path) -> Result<()> {
 
 /// One checklist entry. On failure the detailed cause is printed here and a
 /// terse error propagates (aborting the scenario — later steps depend on
-/// earlier ones), which makes the process exit nonzero.
-fn step<T>(name: &str, f: impl FnOnce() -> Result<T>) -> Result<T> {
+/// earlier ones), which makes the process exit nonzero. Shared with the
+/// pair-sim rehearsal.
+pub(crate) fn step<T>(name: &str, f: impl FnOnce() -> Result<T>) -> Result<T> {
     match f() {
         Ok(v) => {
             println!("[PASS] {name}");
@@ -439,7 +468,7 @@ fn step<T>(name: &str, f: impl FnOnce() -> Result<T>) -> Result<T> {
         }
         Err(e) => {
             println!("[FAIL] {name}\n       {e:#}");
-            Err(anyhow!("e2e failed at step: {name}"))
+            Err(anyhow!("failed at step: {name}"))
         }
     }
 }
@@ -475,8 +504,9 @@ fn cleanup(ctx: &Ctx) {
     }
 }
 
-/// SIGKILL-equivalent hard kill (no graceful shutdown path).
-fn kill_hard(pid: u32) -> Result<()> {
+/// SIGKILL-equivalent hard kill (no graceful shutdown path). Shared with the
+/// pair-sim rehearsal.
+pub(crate) fn kill_hard(pid: u32) -> Result<()> {
     #[cfg(windows)]
     let output = Command::new("taskkill")
         .args(["/F", "/PID", &pid.to_string()])
@@ -499,7 +529,8 @@ fn kill_hard(pid: u32) -> Result<()> {
 /// Locate the built `onebrain` executable the way dist.rs does: re-invoke
 /// cargo (a no-op after the workspace build) with JSON compiler messages and
 /// read the compiler-artifact record for the bin target named "onebrain".
-fn locate_onebrain_binary(root: &Path) -> Result<PathBuf> {
+/// Shared with the pair-sim rehearsal.
+pub(crate) fn locate_onebrain_binary(root: &Path) -> Result<PathBuf> {
     let output = Command::new("cargo")
         .current_dir(root)
         .args([
