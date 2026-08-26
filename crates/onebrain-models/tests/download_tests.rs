@@ -186,10 +186,16 @@ async fn resume_after_cancel_is_byte_exact() {
     })
     .await
     .unwrap();
-    assert_eq!(
-        first_progress,
-        Some(part_len),
-        "resume must continue from the bytes already on disk"
+    // Not an equality check: dropping a tokio::fs::File lets an in-flight
+    // write op complete in the background, so the .part can legitimately
+    // grow a little after our metadata read. The invariant is that resume
+    // starts from at least what we saw on disk (never from zero) — the
+    // byte-exact final hash below is the true correctness proof.
+    let resumed_from = first_progress.expect("resume must report progress");
+    assert!(
+        resumed_from >= part_len && resumed_from < BLOB_LEN as u64,
+        "resume must continue from the bytes already on disk \
+         (resumed at {resumed_from}, saw {part_len} at cancel)"
     );
 
     // Byte-exact result: same BLAKE3 as a straight copy of the source blob.

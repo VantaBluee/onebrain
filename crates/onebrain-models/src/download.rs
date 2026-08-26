@@ -297,7 +297,11 @@ async fn run_attempt(
         };
         file.write_all(&chunk).await.map_err(io_err)?;
         // Flush through to the OS so a cancelled (dropped) future leaves the
-        // bytes on disk for the next resume.
+        // bytes on disk for the next resume. Caveat: tokio::fs lets an
+        // in-flight op finish in the background after a drop, so a .part may
+        // grow slightly post-cancel; resume re-measures at open and the
+        // completion re-hash catches any interleaving, so the worst case is
+        // one transparent retry.
         file.flush().await.map_err(io_err)?;
         written += chunk.len() as u64;
         progress(written, total.unwrap_or(0));

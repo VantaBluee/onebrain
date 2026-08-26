@@ -49,8 +49,13 @@ jobs:
       # The llama.cpp CMake build lands in target/ via the cmake crate's
       # OUT_DIR, so rust-cache covers it too. cmake and a C++ toolchain are
       # preinstalled on all these runners; ccache is deliberately skipped.
+      # key MUST separate ubuntu versions: both are "Linux" to rust-cache,
+      # and artifacts built against 24.04's glibc fail to link on 22.04
+      # (__isoc23_* symbols).
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}
 
       - name: Format
         run: cargo fmt --all --check
