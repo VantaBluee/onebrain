@@ -47,7 +47,8 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
-fn ensure_model(cache: &std::path::Path) -> Result<PathBuf> {
+/// Also reused by `cargo xtask e2e` (e2e.rs) for its `onebrain run` step.
+pub(crate) fn ensure_model(cache: &std::path::Path) -> Result<PathBuf> {
     for (name, _) in CANDIDATES {
         let path = cache.join(name);
         if path.exists() {
