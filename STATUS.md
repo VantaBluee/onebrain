@@ -21,15 +21,20 @@ item completed. Spec: the build prompt (§8 milestones); decisions live in
       unknown keys rejected)
 - [x] `cargo xtask dist` (stage binary + SHA256SUMS), `cargo xtask smoke`
       (tiny-GGUF download + engine smoke test)
-- [ ] Workspace builds clean on Windows host (in progress — first full build
-      running; llama.cpp path fix for MSBuild `\\?\` issue applied)
-- [ ] Engine smoke test passes locally (`cargo xtask smoke`)
-- [ ] fmt/clippy clean
-- [ ] CI workflows committed (.github/) — being authored
-- [ ] Docs: README, CHANGELOG, ADRs 0001–0003, dual licenses — being authored
-- [ ] Initial commit + GitHub repository + green CI matrix on all three OSes
-      (**blocked on a GitHub repo** — needs the user to create/authorize one;
-      everything else is local)
+- [x] Workspace builds clean on Windows host (debug + release)
+- [x] Engine smoke test passes locally (`cargo xtask smoke`: stories260K
+      GGUF, real CPU generation, greedy-determinism assertion)
+- [x] `onebrain --version` / `onebrain doctor` verified on the staged
+      release binary; `cargo xtask dist` stages binary + SHA256SUMS + licenses
+- [x] fmt clean; clippy clean under `RUSTFLAGS=-Dwarnings`
+- [x] CI workflows committed (.github/workflows/ci.yml + release.yml,
+      dependabot.yml)
+- [x] Docs: README, CHANGELOG, ADRs 0001–0003, dual licenses
+- [x] Initial commits (5, conventional; note: the vendor submodule pin rode
+      in the scaffolding commit)
+- [ ] GitHub repository + first push + green CI matrix on all three OSes
+      (**needs the user**: repo creation/authorization; the macOS/Linux legs
+      of the DoD can only be proven by CI)
 
 ### M0 Definition of Done
 Green Actions matrix (macos-14/15, ubuntu-22.04/24.04, windows-2022):
