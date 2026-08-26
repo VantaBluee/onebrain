@@ -162,6 +162,10 @@ jobs:
     continue-on-error: false
     env:
       RUSTFLAGS: -Dwarnings
+      # Compile-proof economy: one CUDA arch instead of llama.cpp's broad
+      # default list (which exceeds 90 min on 2-core runners). Release
+      # artifact builds do NOT set this.
+      OB_CUDA_ARCHS: "86"
     defaults:
       run:
         shell: bash

@@ -48,6 +48,7 @@ fn main() {
         vendor.join("include/llama.h").display()
     );
     println!("cargo:rerun-if-env-changed=OB_GGML_NATIVE");
+    println!("cargo:rerun-if-env-changed=OB_CUDA_ARCHS");
 
     let features = enabled_backends();
 
@@ -88,6 +89,12 @@ fn main() {
             }
             "cuda" => {
                 cfg.define("GGML_CUDA", "ON");
+                // Full multi-arch CUDA builds take >90 min on CI runners;
+                // compile-proof jobs constrain to one architecture. Unset =
+                // llama.cpp's default (broad) arch list for real builds.
+                if let Ok(archs) = env::var("OB_CUDA_ARCHS") {
+                    cfg.define("CMAKE_CUDA_ARCHITECTURES", archs);
+                }
             }
             "vulkan" => {
                 cfg.define("GGML_VULKAN", "ON");
