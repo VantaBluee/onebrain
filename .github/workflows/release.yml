@@ -1,0 +1,100 @@
+# OneBrain release — tag-triggered (v*). Builds `cargo xtask dist` on the
+# three OSes and attaches the archives to a draft GitHub release. Artifacts
+# are unsigned for now; signing arrives in M8.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  dist:
+    name: dist (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, ubuntu-22.04, windows-2022]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout (with vendored llama.cpp submodule)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo xtask dist
+        run: cargo xtask dist
+
+      - name: Verify staged binary runs (--version)
+        run: |
+          bin="$(find dist -type f \( -name onebrain -o -name onebrain.exe \) | head -n 1)"
+          test -n "$bin"
+          "$bin" --version
+
+      # Stage dirs are dist/onebrain-v<version>-<target>/ — archive each one.
+      - name: Package archives
+        run: |
+          cd dist
+          for d in onebrain-*/ ; do
+            d="${d%/}"
+            if [ "$RUNNER_OS" = "Windows" ]; then
+              7z a "${d}.zip" "$d"
+            else
+              tar -czf "${d}.tar.gz" "$d"
+            fi
+          done
+
+      - name: Upload archives
+        uses: actions/upload-artifact@v4
+        with:
+          name: onebrain-${{ matrix.os }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+          if-no-files-found: error
+
+  release:
+    name: draft release
+    needs: dist
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout (gh needs repo context)
+        uses: actions/checkout@v4
+
+      - name: Download all dist archives
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create draft GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          shopt -s nullglob
+          files=(artifacts/*/*.tar.gz artifacts/*/*.zip)
+          test "${#files[@]}" -gt 0
+          gh release create "$GITHUB_REF_NAME" \
+            --draft \
+            --verify-tag \
+            --title "$GITHUB_REF_NAME" \
+            --notes "Draft release for $GITHUB_REF_NAME. Artifacts are unsigned; signing lands in M8." \
+            "${files[@]}"

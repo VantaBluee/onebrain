@@ -1,0 +1,235 @@
+# OneBrain CI — M0 Definition of Done: green matrix on macOS/Linux/Windows,
+# `onebrain --version` artifacts for all three OSes.
+#
+# Warnings policy: CI enforces RUSTFLAGS=-Dwarnings (job-level env); local
+# builds stay permissive.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, macos-15, ubuntu-22.04, ubuntu-24.04, windows-2022]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env:
+      RUSTFLAGS: -Dwarnings
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout (with vendored llama.cpp submodule)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install stable Rust (rustfmt + clippy)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # The llama.cpp CMake build lands in target/ via the cmake crate's
+      # OUT_DIR, so rust-cache covers it too. cmake and a C++ toolchain are
+      # preinstalled on all these runners; ccache is deliberately skipped.
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets
+
+      - name: Build
+        run: cargo build --workspace
+
+      - name: Test
+        run: cargo test --workspace
+
+      # `cargo xtask smoke` downloads a tiny GGUF into target-smoke/ and runs
+      # the CPU smoke inference test. Cache the model, keyed on the download
+      # URLs (hashing the xtask source that declares them).
+      - name: Cache smoke-test model
+        uses: actions/cache@v4
+        with:
+          path: target-smoke
+          key: smoke-gguf-${{ hashFiles('xtask/src/smoke.rs') }}
+
+      - name: Smoke inference (tiny GGUF, CPU)
+        run: cargo xtask smoke
+
+  # Compile-only proof that the GPU backend features build on every platform
+  # that supports them. These must be green per the spec (no continue-on-error).
+  gpu-compile:
+    name: gpu-compile (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-vulkan
+            os: ubuntu-22.04
+            vulkan: true
+            features: vulkan
+          - name: linux-cuda
+            os: ubuntu-22.04
+            cuda: true
+            features: cuda
+          - name: windows-cuda-vulkan
+            os: windows-2022
+            cuda: true
+            vulkan: true
+            features: cuda vulkan
+          - name: macos-metal
+            os: macos-15
+            features: metal
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    continue-on-error: false
+    env:
+      RUSTFLAGS: -Dwarnings
+      VULKAN_VERSION: 1.4.309.0
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout (with vendored llama.cpp submodule)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+
+      - name: Install Vulkan SDK (Linux, LunarG apt repo)
+        if: matrix.vulkan && runner.os == 'Linux'
+        run: |
+          wget -qO- https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo tee /etc/apt/trusted.gpg.d/lunarg.asc
+          sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-jammy.list https://packages.lunarg.com/vulkan/lunarg-vulkan-jammy.list
+          sudo apt-get update -y
+          sudo apt-get install -y vulkan-sdk
+
+      - name: Install Vulkan SDK (Windows, silent installer)
+        if: matrix.vulkan && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          curl.exe -L --fail --retry 3 -o "$env:RUNNER_TEMP\vulkan-sdk-installer.exe" "https://sdk.lunarg.com/sdk/download/$env:VULKAN_VERSION/windows/vulkansdk-windows-X64-$env:VULKAN_VERSION.exe"
+          Start-Process -FilePath "$env:RUNNER_TEMP\vulkan-sdk-installer.exe" -ArgumentList "--accept-licenses","--default-answer","--confirm-command","install" -NoNewWindow -Wait
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\$env:VULKAN_VERSION"
+          Add-Content $env:GITHUB_PATH "C:\VulkanSDK\$env:VULKAN_VERSION\Bin"
+
+      - name: Install CUDA toolkit 12.x (Linux, network method)
+        if: matrix.cuda && runner.os == 'Linux'
+        uses: Jimver/cuda-toolkit@v0.2
+        with:
+          cuda: "12.4.1"
+          method: network
+          sub-packages: '["nvcc", "cudart"]'
+          non-cuda-sub-packages: '["libcublas", "libcublas-dev"]'
+
+      - name: Install CUDA toolkit 12.x (Windows, network method)
+        if: matrix.cuda && runner.os == 'Windows'
+        uses: Jimver/cuda-toolkit@v0.2
+        with:
+          cuda: "12.4.1"
+          method: network
+          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "thrust", "visual_studio_integration"]'
+
+      - name: cargo check GPU features
+        run: |
+          for feature in ${{ matrix.features }}; do
+            echo "::group::cargo check -p onebrain-engine --features ${feature}"
+            cargo check -p onebrain-engine --features "${feature}"
+            echo "::endgroup::"
+          done
+
+  # M0 security checklist: cargo audit / cargo deny in CI. audit runs now;
+  # deny is wired below (commented) for when deny.toml lands at the repo root.
+  lint-deps:
+    name: lint-deps
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      - name: cargo audit
+        run: cargo audit
+
+      # Enable once deny.toml exists at the repo root:
+      # - name: Install cargo-deny
+      #   uses: taiki-e/install-action@v2
+      #   with:
+      #     tool: cargo-deny
+      # - name: cargo deny
+      #   run: cargo deny check
+
+  # Per-OS `onebrain --version` artifacts (M0 DoD).
+  dist:
+    name: dist (${{ matrix.os }})
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, ubuntu-22.04, windows-2022]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env:
+      RUSTFLAGS: -Dwarnings
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout (with vendored llama.cpp submodule)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo xtask dist
+        run: cargo xtask dist
+
+      - name: Verify staged binary runs (--version)
+        run: |
+          bin="$(find dist -type f \( -name onebrain -o -name onebrain.exe \) | head -n 1)"
+          test -n "$bin"
+          "$bin" --version
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: onebrain-${{ matrix.os }}
+          path: dist/**
+          if-no-files-found: error

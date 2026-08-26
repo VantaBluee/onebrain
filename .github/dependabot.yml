@@ -1,0 +1,18 @@
+# Weekly dependency updates for the Rust workspace and the Actions workflows.
+# The vendor/llama.cpp submodule is deliberately NOT managed here — engine
+# pins are bumped by hand because the build-hash handshake couples them to
+# the wire protocol.
+
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
