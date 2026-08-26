@@ -142,7 +142,7 @@ jobs:
 
       - name: Install CUDA toolkit 12.x (Linux, network method)
         if: matrix.cuda && runner.os == 'Linux'
-        uses: Jimver/cuda-toolkit@v0.2
+        uses: Jimver/cuda-toolkit@v0.2.36
         with:
           cuda: "12.4.1"
           method: network
@@ -151,7 +151,7 @@ jobs:
 
       - name: Install CUDA toolkit 12.x (Windows, network method)
         if: matrix.cuda && runner.os == 'Windows'
-        uses: Jimver/cuda-toolkit@v0.2
+        uses: Jimver/cuda-toolkit@v0.2.36
         with:
           cuda: "12.4.1"
           method: network

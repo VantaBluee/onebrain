@@ -72,6 +72,14 @@ fn main() {
         .unwrap_or(false);
     cfg.define("GGML_NATIVE", if native { "ON" } else { "OFF" });
 
+    // llama.cpp enables Metal by default on Apple; our backend set is
+    // driven only by cargo features (build-hash determinism), so force it
+    // off unless requested — otherwise CPU-only mac builds compile Metal
+    // objects that build.rs then doesn't link frameworks for.
+    if !features.iter().any(|f| f == "metal") {
+        cfg.define("GGML_METAL", "OFF");
+    }
+
     for f in &features {
         match f.as_str() {
             "metal" => {
