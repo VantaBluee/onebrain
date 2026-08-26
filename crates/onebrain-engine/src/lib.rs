@@ -36,6 +36,8 @@ pub enum EngineError {
     Decode { status: i32 },
     #[error("engine returned invalid UTF-8 where text was expected")]
     BadUtf8,
+    #[error("the model's chat template could not be applied")]
+    ChatTemplate,
 }
 
 /// The engine build identity exchanged at handshake: vendored llama.cpp
@@ -89,6 +91,73 @@ unsafe fn cstr_to_string(p: *const std::os::raw::c_char) -> String {
         return String::new();
     }
     CStr::from_ptr(p).to_string_lossy().into_owned()
+}
+
+/// What kind of compute device a backend exposes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceKind {
+    Cpu,
+    Gpu,
+    IntegratedGpu,
+    Accelerator,
+    Other,
+}
+
+/// One compute device visible to the compiled engine.
+#[derive(Debug, Clone)]
+pub struct DeviceInfo {
+    pub name: String,
+    pub description: String,
+    pub kind: DeviceKind,
+    pub free_bytes: u64,
+    pub total_bytes: u64,
+}
+
+/// Enumerate the compute devices the engine can use right now. Feeds
+/// backend autodetection, `onebrain doctor`, and (later) device profiling.
+pub fn devices() -> Vec<DeviceInfo> {
+    init();
+    let count = unsafe { sys::ob_dev_count() };
+    let mut out = Vec::with_capacity(count.max(0) as usize);
+    for i in 0..count {
+        let mut name = vec![0u8; 128];
+        let mut desc = vec![0u8; 256];
+        let mut free_b = 0u64;
+        let mut total_b = 0u64;
+        let kind = unsafe {
+            sys::ob_dev_info(
+                i,
+                name.as_mut_ptr().cast(),
+                name.len(),
+                desc.as_mut_ptr().cast(),
+                desc.len(),
+                &mut free_b,
+                &mut total_b,
+            )
+        };
+        if kind < 0 {
+            continue;
+        }
+        let trim = |mut v: Vec<u8>| {
+            let end = v.iter().position(|b| *b == 0).unwrap_or(v.len());
+            v.truncate(end);
+            String::from_utf8_lossy(&v).into_owned()
+        };
+        out.push(DeviceInfo {
+            name: trim(name),
+            description: trim(desc),
+            kind: match kind {
+                0 => DeviceKind::Cpu,
+                1 => DeviceKind::Gpu,
+                2 => DeviceKind::IntegratedGpu,
+                3 => DeviceKind::Accelerator,
+                _ => DeviceKind::Other,
+            },
+            free_bytes: free_b,
+            total_bytes: total_b,
+        });
+    }
+    out
 }
 
 /// Options for loading a model.
@@ -223,6 +292,73 @@ impl Model {
     pub fn is_eog(&self, token: Token) -> bool {
         unsafe { sys::ob_token_is_eog(self.ptr, token) }
     }
+
+    /// A GGUF metadata value by key (e.g. `general.architecture`).
+    pub fn meta(&self, key: &str) -> Option<String> {
+        let ckey = CString::new(key).ok()?;
+        let mut buf = vec![0u8; 512];
+        let n = unsafe {
+            sys::ob_model_meta(self.ptr, ckey.as_ptr(), buf.as_mut_ptr().cast(), buf.len())
+        };
+        if n < 0 {
+            return None;
+        }
+        buf.truncate(n as usize);
+        Some(String::from_utf8_lossy(&buf).into_owned())
+    }
+
+    /// Render a conversation through the model's built-in chat template.
+    /// Returns `Ok(None)` when the model ships no template (the caller picks
+    /// a fallback format and says so in logs).
+    pub fn apply_chat_template(
+        &self,
+        turns: &[(String, String)],
+        add_assistant: bool,
+    ) -> Result<Option<String>, EngineError> {
+        let roles: Vec<CString> = turns
+            .iter()
+            .map(|(r, _)| CString::new(r.as_str()))
+            .collect::<Result<_, _>>()
+            .map_err(|_| EngineError::Tokenize)?;
+        let contents: Vec<CString> = turns
+            .iter()
+            .map(|(_, c)| CString::new(c.as_str()))
+            .collect::<Result<_, _>>()
+            .map_err(|_| EngineError::Tokenize)?;
+        let role_ptrs: Vec<*const std::os::raw::c_char> =
+            roles.iter().map(|c| c.as_ptr()).collect();
+        let content_ptrs: Vec<*const std::os::raw::c_char> =
+            contents.iter().map(|c| c.as_ptr()).collect();
+
+        // Start with a generous guess; grow once if the template needs more.
+        let mut cap = turns.iter().map(|(r, c)| r.len() + c.len()).sum::<usize>() * 2 + 1024;
+        for _ in 0..2 {
+            let mut buf = vec![0u8; cap];
+            let n = unsafe {
+                sys::ob_chat_apply_template(
+                    self.ptr,
+                    role_ptrs.as_ptr(),
+                    content_ptrs.as_ptr(),
+                    turns.len(),
+                    add_assistant,
+                    buf.as_mut_ptr().cast(),
+                    buf.len() as i32,
+                )
+            };
+            if n == -2 {
+                return Ok(None);
+            }
+            if n < 0 {
+                return Err(EngineError::ChatTemplate);
+            }
+            if (n as usize) <= buf.len() {
+                buf.truncate(n as usize);
+                return Ok(Some(String::from_utf8_lossy(&buf).into_owned()));
+            }
+            cap = n as usize + 1;
+        }
+        Err(EngineError::ChatTemplate)
+    }
 }
 
 impl Drop for Model {
@@ -251,8 +387,50 @@ impl Default for SessionParams {
     }
 }
 
-/// One inference context over a model, with a greedy sampler (M0 scope; the
-/// full sampler surface arrives with the API milestone).
+/// Sampling configuration for a session.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SamplerParams {
+    /// `<= 0` selects greedy decoding (deterministic).
+    pub temperature: f32,
+    /// `>= 1` disables nucleus sampling.
+    pub top_p: f32,
+    /// `<= 0` disables top-k.
+    pub top_k: i32,
+    pub seed: u32,
+}
+
+impl Default for SamplerParams {
+    fn default() -> Self {
+        SamplerParams {
+            temperature: 0.8,
+            top_p: 0.95,
+            top_k: 40,
+            seed: 0xFFFF_FFFF, // llama.cpp's "random seed" sentinel
+        }
+    }
+}
+
+/// Why a generation ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinishReason {
+    /// End-of-generation token.
+    Stop,
+    /// Hit the `max_new` budget.
+    Length,
+    /// The caller broke out (client disconnect, stop sequence).
+    Aborted,
+}
+
+/// Outcome of one [`Session::generate`] call.
+#[derive(Debug, Clone, Copy)]
+pub struct GenerationStats {
+    pub prompt_tokens: usize,
+    pub generated_tokens: usize,
+    pub finished: FinishReason,
+}
+
+/// One inference context over a model with a configurable sampler chain
+/// (greedy by default until [`Session::set_sampler`] is called).
 pub struct Session<'m> {
     ptr: *mut sys::ObSession,
     model: &'m Model,
@@ -296,6 +474,68 @@ impl<'m> Session<'m> {
         unsafe { sys::ob_sample_greedy(self.ptr) }
     }
 
+    /// Sample with the configured chain (see [`Session::set_sampler`]).
+    pub fn sample(&mut self) -> Token {
+        unsafe { sys::ob_sample(self.ptr) }
+    }
+
+    /// Clear the KV cache and sampler state so the next decode starts a
+    /// fresh sequence. Much cheaper than recreating the session.
+    pub fn reset(&mut self) {
+        unsafe { sys::ob_session_reset(self.ptr) };
+    }
+
+    /// Replace the sampler chain. `temperature <= 0` selects greedy.
+    pub fn set_sampler(&mut self, params: &SamplerParams) {
+        unsafe {
+            sys::ob_session_set_sampler(
+                self.ptr,
+                params.temperature,
+                params.top_p,
+                params.top_k,
+                params.seed,
+            )
+        };
+    }
+
+    /// Streaming generation: prefill `prompt_tokens`, then sample with the
+    /// configured chain until EOG, `max_new`, or the callback returns
+    /// [`std::ops::ControlFlow::Break`] (client disconnect, stop sequence).
+    pub fn generate(
+        &mut self,
+        prompt_tokens: &[Token],
+        max_new: usize,
+        mut on_token: impl FnMut(Token, &str) -> std::ops::ControlFlow<()>,
+    ) -> Result<GenerationStats, EngineError> {
+        self.decode(prompt_tokens)?;
+        let mut generated = 0usize;
+        for _ in 0..max_new {
+            let tok = self.sample();
+            if self.model.is_eog(tok) {
+                return Ok(GenerationStats {
+                    prompt_tokens: prompt_tokens.len(),
+                    generated_tokens: generated,
+                    finished: FinishReason::Stop,
+                });
+            }
+            let piece = self.model.token_to_piece(tok)?;
+            generated += 1;
+            if on_token(tok, &piece).is_break() {
+                return Ok(GenerationStats {
+                    prompt_tokens: prompt_tokens.len(),
+                    generated_tokens: generated,
+                    finished: FinishReason::Aborted,
+                });
+            }
+            self.decode(&[tok])?;
+        }
+        Ok(GenerationStats {
+            prompt_tokens: prompt_tokens.len(),
+            generated_tokens: generated,
+            finished: FinishReason::Length,
+        })
+    }
+
     /// Convenience loop: prefill `prompt_tokens`, then greedily generate up
     /// to `max_new`, invoking `on_token` per generated token. Returns the
     /// generated tokens (EOG excluded).
@@ -330,6 +570,18 @@ impl Drop for Session<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn devices_enumerate() {
+        let devs = devices();
+        assert!(!devs.is_empty(), "at least the CPU device must exist");
+        assert!(devs.iter().any(|d| matches!(d.kind, DeviceKind::Cpu)));
+        let cpu = devs
+            .iter()
+            .find(|d| matches!(d.kind, DeviceKind::Cpu))
+            .unwrap();
+        assert!(cpu.total_bytes > 0, "CPU device must report memory");
+    }
 
     #[test]
     fn build_hash_is_stamped() {
@@ -386,5 +638,34 @@ mod tests {
         .unwrap();
         let toks2 = session2.generate_greedy(&prompt, 16, |_, _| {}).unwrap();
         assert_eq!(toks, toks2, "greedy decode must be deterministic");
+
+        // Session reset must behave like a fresh session: same prompt in the
+        // SAME session after reset() reproduces the same greedy tokens.
+        session2.reset();
+        let toks3 = session2.generate_greedy(&prompt, 16, |_, _| {}).unwrap();
+        assert_eq!(toks, toks3, "reset must clear all sequence state");
+
+        // The general sampler path with temperature <= 0 must equal greedy.
+        session2.reset();
+        session2.set_sampler(&SamplerParams {
+            temperature: 0.0,
+            ..Default::default()
+        });
+        let mut toks4 = Vec::new();
+        let stats = session2
+            .generate(&prompt, 16, |t, _| {
+                toks4.push(t);
+                std::ops::ControlFlow::Continue(())
+            })
+            .unwrap();
+        assert_eq!(toks, toks4, "temp<=0 sampling must match greedy");
+        assert_eq!(stats.generated_tokens, toks4.len());
+
+        // The tinyllamas models ship no chat template; the engine must say
+        // so cleanly rather than erroring.
+        let rendered = model
+            .apply_chat_template(&[("user".into(), "hi".into())], true)
+            .unwrap();
+        assert!(rendered.is_none(), "stories260K declares no chat template");
     }
 }

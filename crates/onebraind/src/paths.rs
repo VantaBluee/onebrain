@@ -17,7 +17,17 @@ pub struct AppPaths {
 }
 
 impl AppPaths {
+    /// Platform dirs, unless `ONEBRAIN_HOME` is set — then everything lives
+    /// under it (`<home>/config`, `<home>/data`). The override exists for
+    /// tests and sandboxed runs; never default it in shipped code paths.
     pub fn resolve() -> Result<AppPaths, DaemonError> {
+        if let Some(home) = std::env::var_os("ONEBRAIN_HOME") {
+            let home = PathBuf::from(home);
+            return Ok(AppPaths {
+                config_dir: home.join("config"),
+                data_dir: home.join("data"),
+            });
+        }
         let dirs =
             ProjectDirs::from("ai", "onebrain", "onebrain").ok_or(DaemonError::NoConfigDir)?;
         Ok(AppPaths {

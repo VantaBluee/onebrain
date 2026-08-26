@@ -184,3 +184,101 @@ int32_t ob_decode(ob_session * s, const int32_t * tokens, int32_t n_tokens) {
 int32_t ob_sample_greedy(ob_session * s) {
     return llama_sampler_sample(s->sampler, s->ctx, -1);
 }
+
+void ob_session_reset(ob_session * s) {
+    llama_memory_clear(llama_get_memory(s->ctx), /*data=*/true);
+    llama_sampler_reset(s->sampler);
+}
+
+void ob_session_set_sampler(ob_session * s, float temp, float top_p,
+                            int32_t top_k, uint32_t seed) {
+    struct llama_sampler * chain =
+        llama_sampler_chain_init(llama_sampler_chain_default_params());
+    if (chain == NULL) {
+        return; // keep the existing chain rather than crash
+    }
+    if (temp <= 0.0f) {
+        llama_sampler_chain_add(chain, llama_sampler_init_greedy());
+    } else {
+        if (top_k > 0) {
+            llama_sampler_chain_add(chain, llama_sampler_init_top_k(top_k));
+        }
+        if (top_p < 1.0f) {
+            llama_sampler_chain_add(chain, llama_sampler_init_top_p(top_p, 1));
+        }
+        llama_sampler_chain_add(chain, llama_sampler_init_temp(temp));
+        llama_sampler_chain_add(chain, llama_sampler_init_dist(seed));
+    }
+    llama_sampler_free(s->sampler);
+    s->sampler = chain;
+}
+
+int32_t ob_sample(ob_session * s) {
+    return llama_sampler_sample(s->sampler, s->ctx, -1);
+}
+
+int32_t ob_dev_count(void) {
+    return (int32_t) ggml_backend_dev_count();
+}
+
+static void ob_copy_str(char * dst, size_t dst_len, const char * src) {
+    if (dst == NULL || dst_len == 0) {
+        return;
+    }
+    if (src == NULL) {
+        dst[0] = '\0';
+        return;
+    }
+    size_t n = strlen(src);
+    if (n >= dst_len) {
+        n = dst_len - 1;
+    }
+    memcpy(dst, src, n);
+    dst[n] = '\0';
+}
+
+int32_t ob_dev_info(int32_t i, char * name, size_t name_len,
+                    char * desc, size_t desc_len,
+                    uint64_t * free_mem, uint64_t * total_mem) {
+    if (i < 0 || (size_t) i >= ggml_backend_dev_count()) {
+        return -1;
+    }
+    ggml_backend_dev_t dev = ggml_backend_dev_get((size_t) i);
+    ob_copy_str(name, name_len, ggml_backend_dev_name(dev));
+    ob_copy_str(desc, desc_len, ggml_backend_dev_description(dev));
+    size_t free_b = 0;
+    size_t total_b = 0;
+    ggml_backend_dev_memory(dev, &free_b, &total_b);
+    if (free_mem != NULL) {
+        *free_mem = (uint64_t) free_b;
+    }
+    if (total_mem != NULL) {
+        *total_mem = (uint64_t) total_b;
+    }
+    return (int32_t) ggml_backend_dev_type(dev);
+}
+
+int32_t ob_model_meta(const ob_model * m, const char * key, char * buf, size_t buf_size) {
+    return llama_model_meta_val_str(m->model, key, buf, buf_size);
+}
+
+int32_t ob_chat_apply_template(const ob_model * m,
+                               const char ** roles, const char ** contents, size_t n_msgs,
+                               bool add_assistant, char * buf, int32_t buf_len) {
+    const char * tmpl = llama_model_chat_template(m->model, NULL);
+    if (tmpl == NULL) {
+        return -2;
+    }
+    struct llama_chat_message * msgs =
+        calloc(n_msgs, sizeof(struct llama_chat_message));
+    if (msgs == NULL && n_msgs > 0) {
+        return -1;
+    }
+    for (size_t i = 0; i < n_msgs; i++) {
+        msgs[i].role = roles[i];
+        msgs[i].content = contents[i];
+    }
+    int32_t n = llama_chat_apply_template(tmpl, msgs, n_msgs, add_assistant, buf, buf_len);
+    free(msgs);
+    return n;
+}

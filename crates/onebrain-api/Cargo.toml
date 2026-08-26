@@ -9,8 +9,14 @@ rust-version.workspace = true
 
 [dependencies]
 onebrain-proto = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+futures = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-# axum + SSE streaming arrive with M1 (the serving milestone).
+
+[dev-dependencies]
+reqwest = { workspace = true }

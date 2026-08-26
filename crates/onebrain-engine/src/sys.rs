@@ -49,4 +49,34 @@ extern "C" {
     pub fn ob_session_free(s: *mut ObSession);
     pub fn ob_decode(s: *mut ObSession, tokens: *const i32, n_tokens: i32) -> i32;
     pub fn ob_sample_greedy(s: *mut ObSession) -> i32;
+    pub fn ob_session_reset(s: *mut ObSession);
+    pub fn ob_session_set_sampler(s: *mut ObSession, temp: f32, top_p: f32, top_k: i32, seed: u32);
+    pub fn ob_sample(s: *mut ObSession) -> i32;
+
+    pub fn ob_dev_count() -> i32;
+    pub fn ob_dev_info(
+        i: i32,
+        name: *mut c_char,
+        name_len: usize,
+        desc: *mut c_char,
+        desc_len: usize,
+        free_mem: *mut u64,
+        total_mem: *mut u64,
+    ) -> i32;
+
+    pub fn ob_model_meta(
+        m: *const ObModel,
+        key: *const c_char,
+        buf: *mut c_char,
+        buf_size: usize,
+    ) -> i32;
+    pub fn ob_chat_apply_template(
+        m: *const ObModel,
+        roles: *const *const c_char,
+        contents: *const *const c_char,
+        n_msgs: usize,
+        add_assistant: bool,
+        buf: *mut c_char,
+        buf_len: i32,
+    ) -> i32;
 }

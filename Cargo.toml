@@ -37,6 +37,8 @@ onebraind = { path = "crates/onebraind" }
 # External
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
@@ -48,6 +50,11 @@ directories = "6"
 toml = "0.8"
 blake3 = "1"
 axum = "0.8"
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "rustls-native-certs", "stream", "json", "blocking"] }
+fs4 = "1"
+hex = "0.4"
+getrandom = "0.3"
+tempfile = "3"
 rust-embed = "8"
 
 # Build-time
