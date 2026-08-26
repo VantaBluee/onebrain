@@ -1,0 +1,24 @@
+# Rust build output
+/target/
+**/*.rs.bk
+
+# Staged release artifacts and the cached smoke-test model
+/dist/
+/target-smoke/
+
+# llama.cpp out-of-tree build dirs (build.rs builds into OUT_DIR, but guard anyway)
+/vendor/llama.cpp/build*/
+
+# Model files and caches must never enter the repo
+*.gguf
+/models/
+
+# Editor/OS noise
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Bench artifacts produced locally (curated history is committed under bench/history/)
+/bench/local/

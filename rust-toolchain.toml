@@ -1,0 +1,6 @@
+[toolchain]
+# Track stable; CI pins the exact version it tested via the matrix lockstep.
+# Workers and heads exchange an engine build hash at handshake, so toolchain
+# drift between dev machines is detected structurally, not by convention.
+channel = "stable"
+components = ["rustfmt", "clippy"]
