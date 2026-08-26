@@ -1,0 +1,43 @@
+# OneBrain curated model registry (embedded into the binary via include_str!).
+#
+# Schema per entry — the table key is the model id:
+#   display_name    human-readable name shown by `onebrain ls` / the dashboard
+#   url             direct GGUF download (HTTPS)
+#   file_name       the on-disk file name inside <data_dir>/models/<id>/
+#   license         upstream model license (recorded, not enforced)
+#   min_memory_mb   minimum usable memory to load at the recommended context
+#   ctx_recommended recommended context length
+#
+# Every URL below was verified to answer HTTP 200 on 2026-08-26.
+
+["qwen3-0.6b"]
+display_name = "Qwen3 0.6B (Q8_0)"
+url = "https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf"
+file_name = "Qwen3-0.6B-Q8_0.gguf"
+license = "Apache-2.0"
+min_memory_mb = 2048
+ctx_recommended = 8192
+
+["qwen3-1.7b"]
+display_name = "Qwen3 1.7B (Q8_0)"
+url = "https://huggingface.co/Qwen/Qwen3-1.7B-GGUF/resolve/main/Qwen3-1.7B-Q8_0.gguf"
+file_name = "Qwen3-1.7B-Q8_0.gguf"
+license = "Apache-2.0"
+min_memory_mb = 4096
+ctx_recommended = 8192
+
+["qwen3-4b"]
+display_name = "Qwen3 4B (Q4_K_M)"
+url = "https://huggingface.co/Qwen/Qwen3-4B-GGUF/resolve/main/Qwen3-4B-Q4_K_M.gguf"
+file_name = "Qwen3-4B-Q4_K_M.gguf"
+license = "Apache-2.0"
+min_memory_mb = 6144
+ctx_recommended = 8192
+
+["tinystories-260k"]
+display_name = "TinyStories 260K (test model)"
+url = "https://huggingface.co/ggml-org/models/resolve/main/tinyllamas/stories260K.gguf"
+file_name = "stories260K.gguf"
+license = "MIT (llama2.c weights; trained on the public TinyStories dataset) — test model, not for real use"
+min_memory_mb = 64
+ctx_recommended = 512
