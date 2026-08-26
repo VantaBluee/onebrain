@@ -33,13 +33,40 @@ pub enum PairMessage {
     Rejected { reason: String },
 }
 
-/// Compute the key-confirmation MAC: a BLAKE3 keyed hash over the context
-/// and the two endpoint ids in sorted order (so both sides agree without
-/// caring who dialed).
-pub fn confirm_mac(shared_key: &[u8; 32], id_a: &str, id_b: &str) -> [u8; 32] {
-    let (lo, hi) = if id_a <= id_b { (id_a, id_b) } else { (id_b, id_a) };
+/// Which side of the pairing exchange a MAC belongs to. Binding the MAC to
+/// the sender's role makes reflection impossible: a party that does not
+/// know the code can never turn the MAC it received into the MAC it must
+/// send, because the two roles hash different domain tags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PairRole {
+    /// The device that opened the pairing window (`onebrain pair`).
+    Host,
+    /// The device that joined with the code/ticket.
+    Joiner,
+}
+
+impl PairRole {
+    fn tag(self) -> &'static [u8] {
+        match self {
+            PairRole::Host => b"host",
+            PairRole::Joiner => b"joiner",
+        }
+    }
+}
+
+/// Compute the key-confirmation MAC: a BLAKE3 keyed hash over the context,
+/// the sender's role, and the two endpoint ids in sorted order (id order
+/// independent of who dialed). Each side sends the MAC for its own role and
+/// verifies the peer's MAC against the opposite role.
+pub fn confirm_mac(shared_key: &[u8; 32], sender: PairRole, id_a: &str, id_b: &str) -> [u8; 32] {
+    let (lo, hi) = if id_a <= id_b {
+        (id_a, id_b)
+    } else {
+        (id_b, id_a)
+    };
     let mut hasher = blake3::Hasher::new_keyed(shared_key);
     hasher.update(PAIR_CONFIRM_CONTEXT.as_bytes());
+    hasher.update(sender.tag());
     hasher.update(lo.as_bytes());
     hasher.update(hi.as_bytes());
     *hasher.finalize().as_bytes()
@@ -50,16 +77,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mac_is_order_independent() {
+    fn mac_is_id_order_independent() {
         let key = [7u8; 32];
-        assert_eq!(confirm_mac(&key, "aa", "bb"), confirm_mac(&key, "bb", "aa"));
+        assert_eq!(
+            confirm_mac(&key, PairRole::Host, "aa", "bb"),
+            confirm_mac(&key, PairRole::Host, "bb", "aa")
+        );
     }
 
     #[test]
-    fn mac_differs_by_key_and_ids() {
+    fn mac_differs_by_role_key_and_ids() {
         let k1 = [1u8; 32];
         let k2 = [2u8; 32];
-        assert_ne!(confirm_mac(&k1, "aa", "bb"), confirm_mac(&k2, "aa", "bb"));
-        assert_ne!(confirm_mac(&k1, "aa", "bb"), confirm_mac(&k1, "aa", "cc"));
+        // A reflected MAC (same key, same ids, other role) must never verify.
+        assert_ne!(
+            confirm_mac(&k1, PairRole::Host, "aa", "bb"),
+            confirm_mac(&k1, PairRole::Joiner, "aa", "bb")
+        );
+        assert_ne!(
+            confirm_mac(&k1, PairRole::Host, "aa", "bb"),
+            confirm_mac(&k2, PairRole::Host, "aa", "bb")
+        );
+        assert_ne!(
+            confirm_mac(&k1, PairRole::Host, "aa", "bb"),
+            confirm_mac(&k1, PairRole::Host, "aa", "cc")
+        );
     }
 }

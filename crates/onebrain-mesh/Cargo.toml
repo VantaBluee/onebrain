@@ -12,5 +12,15 @@ onebrain-proto = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-# iroh lands in M2 (mesh & pairing); keeping the dependency out until then
-# keeps M0/M1 builds lean and lets M2 pin the version it actually validates.
+tokio = { workspace = true }
+futures = { workspace = true }
+iroh = { workspace = true }
+iroh-tickets = { workspace = true }
+iroh-mdns-address-lookup = { workspace = true }
+spake2 = { workspace = true }
+toml = { workspace = true }
+hex = { workspace = true }
+getrandom = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
