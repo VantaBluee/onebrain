@@ -141,15 +141,16 @@ fn main() {
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     match target_os.as_str() {
         "macos" => {
+            // Frameworks must go through rustc-link-lib (framework kind):
+            // unlike rustc-link-lib, rustc-link-arg from a library's build
+            // script does NOT propagate to the dependent binary's link.
             println!("cargo:rustc-link-lib=c++");
             for fw in ["Foundation", "Accelerate"] {
-                println!("cargo:rustc-link-arg=-framework");
-                println!("cargo:rustc-link-arg={fw}");
+                println!("cargo:rustc-link-lib=framework={fw}");
             }
             if features.iter().any(|f| f == "metal") {
                 for fw in ["Metal", "MetalKit"] {
-                    println!("cargo:rustc-link-arg=-framework");
-                    println!("cargo:rustc-link-arg={fw}");
+                    println!("cargo:rustc-link-lib=framework={fw}");
                 }
             }
         }
