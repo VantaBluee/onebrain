@@ -37,7 +37,7 @@ jobs:
         shell: bash
     steps:
       - name: Checkout (with vendored llama.cpp submodule)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           submodules: recursive
 
@@ -111,7 +111,7 @@ jobs:
         shell: bash
     steps:
       - name: Checkout (with vendored llama.cpp submodule)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           submodules: recursive
 
@@ -173,7 +173,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install cargo-audit
         uses: taiki-e/install-action@v2
@@ -208,7 +208,7 @@ jobs:
         shell: bash
     steps:
       - name: Checkout (with vendored llama.cpp submodule)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           submodules: recursive
 
