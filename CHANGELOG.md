@@ -7,9 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-M0 (skeleton & CI) in progress.
+M0 (skeleton & CI) complete locally; M1 (excellent single-node) implemented,
+cross-OS CI proof in flight.
 
-### Added
+### Added — M1
+
+- The daemon: `onebrain up/status/stop`, single-instance file lock that a
+  kill -9 releases cleanly, auto-generated API bearer token, engine-host
+  thread, and an always-authenticated internal control API.
+- OpenAI-compatible API (`/v1/chat/completions`, `/v1/completions`,
+  `/v1/models`) with SSE streaming and usage accounting; `/v1/embeddings`
+  responds 501 with a remedy until it lands.
+- Ollama-compatible API (`/api/generate`, `/api/chat`, `/api/tags`,
+  `/api/show`, `/api/ps`, `/api/pull`, `/api/version`) streaming NDJSON by
+  default — point an unmodified Ollama client at the endpoint.
+- Model logistics: embedded registry (Qwen3 0.6B/1.7B/4B + a tiny test
+  model, URLs verified), resumable downloads with BLAKE3 manifests,
+  `onebrain pull/ls/rm`.
+- `onebrain run <model>`: ensures the daemon, downloads if needed, loads,
+  and prints the endpoint + token + example calls.
+- `onebrain doctor` v1: compute devices with memory, daemon state, config
+  validity — every finding with a remedy.
+- Engine: device enumeration, session reset, configurable sampler chains,
+  chat-template rendering with an explicit fallback path.
+- `cargo xtask e2e`: the milestone rehearsal (sandboxed daemon, both
+  dialects streaming, kill -9 recovery, graceful stop) — also runs in CI
+  on all three OSes.
+
+### Fixed
+
+- `onebrain up` on Windows no longer leaks its caller's pipe handles into
+  the detached daemon (captured-output callers would hang until the daemon
+  exited).
+
+### Added — M0
 
 - Rust workspace (edition 2021, rust-version 1.80) with crates
   `onebrain-{proto,mesh,engine,scheduler,models,api,dash}`, `onebraind`,

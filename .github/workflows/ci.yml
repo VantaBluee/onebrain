@@ -76,6 +76,11 @@ jobs:
       - name: Smoke inference (tiny GGUF, CPU)
         run: cargo xtask smoke
 
+      # The M1 DoD rehearsal, per OS: sandboxed daemon, both API dialects
+      # streaming real tokens, kill -9 recovery, graceful stop.
+      - name: End-to-end rehearsal (daemon + both API dialects)
+        run: cargo xtask e2e
+
   # Compile-only proof that the GPU backend features build on every platform
   # that supports them. These must be green per the spec (no continue-on-error).
   gpu-compile:

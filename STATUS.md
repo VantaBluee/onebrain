@@ -41,11 +41,35 @@ Green Actions matrix (macos-14/15, ubuntu-22.04/24.04, windows-2022):
 fmt, clippy, tests, CPU smoke inference with a tiny GGUF on all three OSes;
 `cargo xtask dist` artifacts with `onebrain --version` working per OS.
 
+## M1 — Excellent single-node (implementation complete; CI proof pending)
+
+- [x] Engine: device enumeration, session reset, sampler chains, chat
+      templating (with clean no-template fallback), streaming generate
+- [x] Daemon: single-instance fs lock (kill -9 safe), API token, engine-host
+      thread, internal control API (status/load/shutdown, always-auth'd)
+- [x] OpenAI dialect (`/v1/*`): chat + text completions (SSE streaming),
+      models; embeddings endpoint present (501 until later in M1.x)
+- [x] Ollama dialect (`/api/*`): generate/chat (NDJSON streaming default),
+      tags/show/ps/pull/version
+- [x] Bearer auth everywhere; loopback exemption (configurable off) never
+      applies to internal endpoints
+- [x] Model logistics: embedded registry (URL-verified entries), resumable
+      full-file downloads w/ BLAKE3 manifests, cache ls/rm
+- [x] CLI: up/run/status/stop/pull/ls/rm wired; doctor v1 (devices, daemon
+      state, config findings); hidden `__daemon`
+- [x] `cargo xtask e2e` DoD rehearsal green on Windows: daemon up, load,
+      OpenAI SSE → [DONE], Ollama NDJSON → done:true, kill -9 clean
+      restart, graceful stop, lock release (11/11 steps)
+- [x] Fixed on the way: Windows handle-inheritance leak in `onebrain up`
+      (captured-output callers would hang forever; see up.rs)
+- [ ] e2e green on macOS + Linux via CI (step added to the test job)
+- [ ] Manual: unmodified OpenAI SDK script (scripts/check_openai_sdk.py)
+      against a real model — run per OS before tagging
+- [ ] /v1/embeddings implementation (deferred within M1; endpoint returns a
+      clean 501 with remedy until then)
+
 ## Upcoming
 
-- **M1 — Excellent single-node**: daemon up/stop, backend autodetection,
-  OpenAI + Ollama streaming APIs with bearer auth, registry + resumable
-  downloads, doctor v1.
 - **M2 — Mesh & pairing** (iroh, pair codes, discovery, link prober)
 - **M3 — Distributed inference v1** (pipeline split over authed mesh)
 - M4 scheduler v1 · M5 resilience · M6 model logistics · M7 performance ·
