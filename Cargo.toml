@@ -51,6 +51,11 @@ toml = "0.8"
 blake3 = "1"
 axum = "0.8"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "rustls-native-certs", "stream", "json", "blocking"] }
+iroh = "1"
+iroh-tickets = "1"
+iroh-mdns-address-lookup = "0.5"
+spake2 = "0.4"
+qrcode = { version = "0.14", default-features = false }
 fs4 = "1"
 hex = "0.4"
 getrandom = "0.3"

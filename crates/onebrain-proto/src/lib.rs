@@ -8,6 +8,7 @@
 pub mod capabilities;
 pub mod handshake;
 pub mod message;
+pub mod pair;
 pub mod plan;
 
 /// Human-visible product name. A rebrand changes this constant, the binary
