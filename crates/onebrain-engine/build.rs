@@ -37,8 +37,16 @@ fn main() {
         );
     }
 
+    apply_vendor_patches(&manifest_dir, &vendor);
+
     println!("cargo:rerun-if-changed=shim/ob_shim.c");
     println!("cargo:rerun-if-changed=shim/ob_shim.h");
+    println!(
+        "cargo:rerun-if-changed={}",
+        manifest_dir
+            .join("../../patches/0001-rpc-serve-fd.patch")
+            .display()
+    );
     println!(
         "cargo:rerun-if-changed={}",
         vendor.join("CMakeLists.txt").display()
@@ -65,7 +73,14 @@ fn main() {
         .define("LLAMA_BUILD_IS_DEV", "OFF")
         // ggml's own threadpool keeps linking portable; revisit in the M7
         // performance program if profiling shows it matters.
-        .define("GGML_OPENMP", "OFF");
+        .define("GGML_OPENMP", "OFF")
+        // The RPC backend is the distributed-inference engine substrate
+        // (M3); its socket is never exposed — sessions run over caller-owned
+        // fds bridged to authenticated mesh streams (patches/0001).
+        .define("GGML_RPC", "ON")
+        // RDMA auto-negotiation probes fds with getsockname and drags in
+        // ibverbs; meaningless over bridged sockets.
+        .define("GGML_RPC_RDMA", "OFF");
 
     // -march=native binaries can't be shipped; opt in for local perf runs.
     let native = env::var("OB_GGML_NATIVE")
@@ -190,6 +205,36 @@ fn main() {
         "cargo:rustc-env=OB_ENGINE_BUILD_ID=llama.cpp-{short}+{}+{target}",
         feat.join(",")
     );
+}
+
+/// Apply the maintained vendor patches (patches/*.patch) to the submodule
+/// working tree when not already applied. Idempotence is checked by the
+/// presence of the patched symbol, not git state, so a locally pre-patched
+/// tree (or a re-run) is a no-op.
+fn apply_vendor_patches(manifest_dir: &Path, vendor: &Path) {
+    let header = vendor.join("ggml/include/ggml-rpc.h");
+    let already = std::fs::read_to_string(&header)
+        .map(|s| s.contains("ggml_backend_rpc_serve_fd"))
+        .unwrap_or(false);
+    if already {
+        return;
+    }
+    let patch = manifest_dir.join("../../patches/0001-rpc-serve-fd.patch");
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(vendor)
+        .arg("apply")
+        .arg(&patch)
+        .status();
+    match status {
+        Ok(s) if s.success() => {}
+        other => panic!(
+            "failed to apply vendor patch {} ({other:?}).\n\
+             The vendored llama.cpp tree may be dirty; run \
+             `git -C vendor/llama.cpp checkout -- .` and rebuild.",
+            patch.display()
+        ),
+    }
 }
 
 fn enabled_backends() -> Vec<String> {

@@ -1,0 +1,157 @@
+diff --git a/ggml/include/ggml-rpc.h b/ggml/include/ggml-rpc.h
+index 059e44962..1d1646d84 100644
+--- a/ggml/include/ggml-rpc.h
++++ b/ggml/include/ggml-rpc.h
+@@ -27,6 +27,15 @@ GGML_BACKEND_API void ggml_backend_rpc_get_device_memory(const char * endpoint,
+ GGML_BACKEND_API void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir,
+                                                     size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices);
+ 
++// Serve exactly one RPC session over an already-connected socket owned by
++// the caller (e.g. one end of a socketpair, or a pre-connected loopback
++// pair). Returns when the peer closes the connection or on protocol error;
++// the socket is closed before returning. Unlike ggml_backend_rpc_start_server
++// this never binds or listens, so nothing is reachable from outside the
++// process that created the socket.
++GGML_BACKEND_API void ggml_backend_rpc_serve_fd(long long fd, const char * cache_dir,
++                                                size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices);
++
+ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_rpc_reg(void);
+ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_rpc_add_server(const char * endpoint);
+ 
+diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
+index 69a8a08ae..0e0dbfb4d 100644
+--- a/ggml/src/ggml-rpc/ggml-rpc.cpp
++++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
+@@ -1785,20 +1785,11 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
+     }
+ }
+ 
+-void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir,
+-                                   size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices) {
+-    if (n_devices == 0 || devices == nullptr) {
+-        fprintf(stderr, "Invalid arguments to ggml_backend_rpc_start_server\n");
+-        return;
+-    }
+-    std::vector<ggml_backend_t> backends;
+-    printf("Starting RPC server v%d.%d.%d\n",
+-        RPC_PROTO_MAJOR_VERSION,
+-        RPC_PROTO_MINOR_VERSION,
+-        RPC_PROTO_PATCH_VERSION);
+-    printf("  endpoint       : %s\n", endpoint);
+-    printf("  local cache    : %s\n", cache_dir ? cache_dir : "n/a");
+-    printf("Devices:\n");
++// Initialize one ggml backend per device (applying n_threads where the
++// backend supports it). Returns false and frees nothing on failure; on
++// success the caller owns the backends.
++static bool rpc_init_backends(std::vector<ggml_backend_t> & backends, size_t n_threads,
++                              size_t n_devices, ggml_backend_dev_t * devices) {
+     for (size_t i = 0; i < n_devices; i++) {
+         auto dev = devices[i];
+         size_t free, total;
+@@ -1808,7 +1799,7 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
+         auto backend = ggml_backend_dev_init(dev, nullptr);
+         if (!backend) {
+             fprintf(stderr, "Failed to create backend for device %s\n", dev->iface.get_name(dev));
+-            return;
++            return false;
+         }
+         backends.push_back(backend);
+         ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+@@ -1819,6 +1810,60 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
+             }
+         }
+     }
++    return true;
++}
++
++void ggml_backend_rpc_serve_fd(long long fd, const char * cache_dir,
++                               size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices) {
++    if (n_devices == 0 || devices == nullptr) {
++        fprintf(stderr, "Invalid arguments to ggml_backend_rpc_serve_fd\n");
++        return;
++    }
++    std::vector<ggml_backend_t> backends;
++    printf("Serving RPC v%d.%d.%d over caller-owned socket\n",
++        RPC_PROTO_MAJOR_VERSION,
++        RPC_PROTO_MINOR_VERSION,
++        RPC_PROTO_PATCH_VERSION);
++    printf("  local cache    : %s\n", cache_dir ? cache_dir : "n/a");
++    printf("Devices:\n");
++    if (!rpc_init_backends(backends, n_threads, n_devices, devices)) {
++        for (auto backend : backends) {
++            ggml_backend_free(backend);
++        }
++        return;
++    }
++    if (!rpc_transport_init()) {
++        fprintf(stderr, "Failed to initialize RPC transport\n");
++    } else {
++        auto sock = socket_t::from_fd(fd);
++        if (sock == nullptr) {
++            fprintf(stderr, "Invalid socket passed to ggml_backend_rpc_serve_fd\n");
++        } else {
++            rpc_serve_client(backends, cache_dir, sock);
++        }
++    }
++    for (auto backend : backends) {
++        ggml_backend_free(backend);
++    }
++}
++
++void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir,
++                                   size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices) {
++    if (n_devices == 0 || devices == nullptr) {
++        fprintf(stderr, "Invalid arguments to ggml_backend_rpc_start_server\n");
++        return;
++    }
++    std::vector<ggml_backend_t> backends;
++    printf("Starting RPC server v%d.%d.%d\n",
++        RPC_PROTO_MAJOR_VERSION,
++        RPC_PROTO_MINOR_VERSION,
++        RPC_PROTO_PATCH_VERSION);
++    printf("  endpoint       : %s\n", endpoint);
++    printf("  local cache    : %s\n", cache_dir ? cache_dir : "n/a");
++    printf("Devices:\n");
++    if (!rpc_init_backends(backends, n_threads, n_devices, devices)) {
++        return;
++    }
+ 
+     std::string host;
+     int port;
+diff --git a/ggml/src/ggml-rpc/transport.cpp b/ggml/src/ggml-rpc/transport.cpp
+index 5ec15dc80..1d99d0afe 100644
+--- a/ggml/src/ggml-rpc/transport.cpp
++++ b/ggml/src/ggml-rpc/transport.cpp
+@@ -653,6 +653,16 @@ socket_ptr socket_t::accept() {
+     return socket_ptr(new socket_t(std::make_unique<impl>(client_socket_fd)));
+ }
+ 
++socket_ptr socket_t::from_fd(long long raw_fd) {
++    sockfd_t fd = (sockfd_t) raw_fd;
++    if (!is_valid_fd(fd)) {
++        return nullptr;
++    }
++    // Best-effort: harmless when the fd is not a TCP socket (socketpair).
++    set_no_delay(fd);
++    return socket_ptr(new socket_t(std::make_unique<impl>(fd)));
++}
++
+ socket_ptr socket_t::create_server(const char * host, int port) {
+     auto sockfd = socket(AF_INET, SOCK_STREAM, 0);
+     if (!is_valid_fd(sockfd)) {
+diff --git a/ggml/src/ggml-rpc/transport.h b/ggml/src/ggml-rpc/transport.h
+index 3f747ecff..9aa20450b 100644
+--- a/ggml/src/ggml-rpc/transport.h
++++ b/ggml/src/ggml-rpc/transport.h
+@@ -27,6 +27,11 @@ struct socket_t {
+ 
+     static socket_ptr create_server(const char * host, int port);
+     static socket_ptr connect(const char * host, int port);
++    // Wrap an already-connected socket owned by the caller (e.g. one end of
++    // a socketpair or a pre-connected loopback pair). The socket_t takes
++    // ownership and closes it on destruction. TCP transport only; RDMA
++    // upgrade is never attempted on such sockets.
++    static socket_ptr from_fd(long long raw_fd);
+ 
+ private:
+     struct impl;
