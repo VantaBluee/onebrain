@@ -25,7 +25,7 @@ The value is **capacity, not speed**: OneBrain lets you *run models that don't f
 There are no installers yet — those arrive at M8 (Homebrew, `.msi`, `curl | sh`, `.deb`/`.rpm`). Until then, build from source with a Rust toolchain (1.80+), CMake, and a C/C++ compiler:
 
 ```sh
-git clone --recursive https://github.com/onebrain-ai/onebrain
+git clone --recursive https://github.com/VantaBluee/onebrain
 cd onebrain
 cargo build
 cargo xtask smoke   # downloads a tiny GGUF and runs a CPU smoke inference
