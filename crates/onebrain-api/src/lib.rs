@@ -8,8 +8,8 @@
 
 pub mod auth;
 pub mod backend;
-pub mod openai;
 pub mod ollama;
+pub mod openai;
 pub mod types;
 
 use std::net::SocketAddr;
