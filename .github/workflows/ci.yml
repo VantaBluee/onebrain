@@ -37,7 +37,7 @@ jobs:
         shell: bash
     steps:
       - name: Checkout (with vendored llama.cpp submodule)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           submodules: recursive
 
@@ -68,7 +68,7 @@ jobs:
       # the CPU smoke inference test. Cache the model, keyed on the download
       # URLs (hashing the xtask source that declares them).
       - name: Cache smoke-test model
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: target-smoke
           key: smoke-gguf-${{ hashFiles('xtask/src/smoke.rs') }}
@@ -113,7 +113,7 @@ jobs:
         shell: bash
     steps:
       - name: Checkout (with vendored llama.cpp submodule)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           submodules: recursive
 
@@ -167,7 +167,7 @@ jobs:
         shell: bash
     steps:
       - name: Checkout (with vendored llama.cpp submodule)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           submodules: recursive
 
@@ -233,7 +233,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install cargo-audit
         uses: taiki-e/install-action@v2
@@ -268,7 +268,7 @@ jobs:
         shell: bash
     steps:
       - name: Checkout (with vendored llama.cpp submodule)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           submodules: recursive
 
@@ -288,7 +288,7 @@ jobs:
           "$bin" --version
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: onebrain-${{ matrix.os }}
           path: dist/**

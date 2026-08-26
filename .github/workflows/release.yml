@@ -29,7 +29,7 @@ jobs:
         shell: bash
     steps:
       - name: Checkout (with vendored llama.cpp submodule)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           submodules: recursive
 
@@ -62,7 +62,7 @@ jobs:
           done
 
       - name: Upload archives
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: onebrain-${{ matrix.os }}
           path: |
@@ -77,10 +77,10 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Checkout (gh needs repo context)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Download all dist archives
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
 
