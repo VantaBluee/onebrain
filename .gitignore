@@ -13,6 +13,9 @@
 *.gguf
 /models/
 
+# Local agent/tooling session state
+/.claude/
+
 # Editor/OS noise
 .vscode/
 .idea/
