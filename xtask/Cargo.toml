@@ -1,0 +1,15 @@
+[package]
+name = "xtask"
+description = "Repo automation: dist builds, smoke runs, cluster sim (cargo xtask ...)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.10"
