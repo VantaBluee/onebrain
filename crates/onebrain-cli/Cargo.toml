@@ -14,10 +14,18 @@ path = "src/main.rs"
 [dependencies]
 onebrain-proto = { workspace = true }
 onebrain-engine = { workspace = true }
+onebrain-models = { workspace = true }
 onebraind = { workspace = true }
 clap = { workspace = true }
+reqwest = { workspace = true }
+# Only to drive onebrain-models' async download from the synchronous `pull`
+# command (current-thread runtime); everything else uses reqwest::blocking.
+tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

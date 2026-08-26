@@ -2,6 +2,7 @@
 //! commands light up as their milestones land, and unimplemented ones say
 //! exactly which milestone brings them instead of pretending.
 
+mod client;
 mod commands;
 
 use clap::{Parser, Subcommand};
@@ -59,6 +60,10 @@ enum Command {
     Stop,
     /// Revoke pairing with a peer.
     Unpair { name: String },
+    /// Internal: run the daemon in the foreground (`onebrain up` spawns
+    /// this detached; never invoke it by hand).
+    #[command(name = "__daemon", hide = true)]
+    InternalDaemon,
 }
 
 fn main() {
@@ -71,13 +76,22 @@ fn main() {
 
     let outcome = match cli.command.expect("checked above") {
         Command::Doctor => commands::doctor::run(cli.json),
-        Command::Up => commands::not_yet("up", "M1"),
-        Command::Run { .. } => commands::not_yet("run", "M1"),
-        Command::Status => commands::not_yet("status", "M1"),
-        Command::Pull { .. } => commands::not_yet("pull", "M1"),
-        Command::Ls => commands::not_yet("ls", "M1"),
-        Command::Rm { .. } => commands::not_yet("rm", "M1"),
-        Command::Stop => commands::not_yet("stop", "M1"),
+        Command::Up => commands::up::run(cli.json),
+        Command::Run {
+            model,
+            explain,
+            nodes,
+            ctx,
+        } => commands::run::run(&model, ctx, explain, nodes, cli.json),
+        Command::Status => commands::status::run(cli.json),
+        Command::Pull { reference } => commands::pull::run(&reference, cli.json),
+        Command::Ls => commands::ls::run(cli.json),
+        Command::Rm { reference } => commands::rm::run(&reference, cli.json),
+        Command::Stop => commands::stop::run(cli.json),
+        Command::InternalDaemon => match onebraind::runtime::run_blocking() {
+            Ok(()) => Ok(()),
+            Err(e) => Err(commands::CliError(e.to_string())),
+        },
         Command::Pair { .. } => commands::not_yet("pair", "M2"),
         Command::Unpair { .. } => commands::not_yet("unpair", "M2"),
         Command::Bench => commands::not_yet("bench", "M4"),
