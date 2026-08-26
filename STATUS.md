@@ -68,9 +68,33 @@ fmt, clippy, tests, CPU smoke inference with a tiny GGUF on all three OSes;
 - [ ] /v1/embeddings implementation (deferred within M1; endpoint returns a
       clean 501 with remedy until then)
 
-## Upcoming
+## M2 — Mesh & pairing (implementation complete; CI proof pending)
 
-- **M2 — Mesh & pairing** (iroh, pair codes, discovery, link prober)
+- [x] Device identity: Ed25519 iroh key at `<config_dir>/device-key`,
+      never regenerated silently, never leaves the machine
+- [x] Pairing: 6-digit code through SPAKE2 (code never on the wire) with
+      direction-bound key-confirmation MACs (reflection-proof both ways),
+      120 s window, 3-attempt budget; ticket for cross-network, code-only
+      via mDNS candidates on the LAN
+- [x] Peer store (`peers.toml`), name dedup, `onebrain unpair`
+- [x] Mesh service: accept-by-ALPN, unpaired connections closed (code 1)
+      — the §10 guarantee, asserted by tests; Hello handshake with
+      engine-build judgment; 2 s heartbeats (suspect/down per §5 timings);
+      RTT EWMA + 4 MiB bandwidth probe per link
+- [x] Internal API: pair/start (NDJSON window), pair/join, peers, unpair,
+      status peers_summary; CLI `pair` (code + ticket + terminal QR),
+      `unpair`, `status` peers table
+- [x] `cargo xtask pair-sim`: two sandboxed daemons pair via ticket+code,
+      both report connected with RTT/bandwidth, unpair degrades — 10/10
+      steps green on Windows; netem variant (Linux namespaces, 1 Gbit /
+      0.5 ms shaping) wired into CI
+- [ ] pair-sim green on macOS + Linux via CI; netem leg green
+- [ ] Manual two-machine checklist (incl. real mDNS discovery + daemon
+      restart survival): run before tagging
+- [ ] Windows CI e2e SSE timeout under diagnosis (daemon-log dump now
+      wired into the harness for the next run)
+
+## Upcoming
 - **M3 — Distributed inference v1** (pipeline split over authed mesh)
 - M4 scheduler v1 · M5 resilience · M6 model logistics · M7 performance ·
   M8 product polish. Details in the spec.

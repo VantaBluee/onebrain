@@ -10,6 +10,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 M0 (skeleton & CI) complete locally; M1 (excellent single-node) implemented,
 cross-OS CI proof in flight.
 
+### Added — M2
+
+- Mesh & pairing on iroh: per-device Ed25519 identities, `onebrain pair`
+  with a 6-digit code (authenticated via SPAKE2 with direction-bound
+  confirmation MACs — the code never crosses the wire), ticket + QR for
+  cross-network pairing, mDNS candidate discovery on the LAN.
+- Persistent peer store with human names; `onebrain unpair`; unpaired
+  connection attempts to the mesh are rejected and test-asserted.
+- Per-link telemetry: 2 s heartbeats (suspect at 3 missed, down at 10 s),
+  RTT EWMA, and a bandwidth probe — surfaced in `onebrain status`'s new
+  PEERS table and `/api/internal/peers`.
+- `cargo xtask pair-sim`: two-daemon pairing rehearsal in CI on all three
+  OSes, plus a Linux netem variant (network namespaces shaped to
+  1 Gbit / 0.5 ms) asserting measured bandwidth and RTT land in sane bands.
+
 ### Added — M1
 
 - The daemon: `onebrain up/status/stop`, single-instance file lock that a
