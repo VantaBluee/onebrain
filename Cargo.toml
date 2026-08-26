@@ -1,0 +1,63 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/onebrain-proto",
+    "crates/onebrain-mesh",
+    "crates/onebrain-engine",
+    "crates/onebrain-scheduler",
+    "crates/onebrain-models",
+    "crates/onebrain-api",
+    "crates/onebrain-dash",
+    "crates/onebraind",
+    "crates/onebrain-cli",
+    "xtask",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/onebrain-ai/onebrain"
+rust-version = "1.80"
+# Display name lives in onebrain-proto::PRODUCT_NAME and here; a rebrand
+# touches only those two places plus the binary name in onebrain-cli.
+authors = ["OneBrain contributors"]
+
+[workspace.dependencies]
+# Internal crates
+onebrain-proto = { path = "crates/onebrain-proto" }
+onebrain-mesh = { path = "crates/onebrain-mesh" }
+onebrain-engine = { path = "crates/onebrain-engine" }
+onebrain-scheduler = { path = "crates/onebrain-scheduler" }
+onebrain-models = { path = "crates/onebrain-models" }
+onebrain-api = { path = "crates/onebrain-api" }
+onebrain-dash = { path = "crates/onebrain-dash" }
+onebraind = { path = "crates/onebraind" }
+
+# External
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+postcard = { version = "1", features = ["alloc", "use-std"] }
+directories = "6"
+toml = "0.8"
+blake3 = "1"
+axum = "0.8"
+rust-embed = "8"
+
+# Build-time
+cmake = "0.1"
+
+[profile.release]
+lto = "thin"
+strip = "symbols"
+
+# The engine's C/C++ objects are built by build.rs at their own optimization
+# level; dev builds of the Rust side stay fast.
+[profile.dev.package."*"]
+opt-level = 1

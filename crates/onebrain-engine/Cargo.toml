@@ -1,0 +1,28 @@
+[package]
+name = "onebrain-engine"
+description = "Embedded llama.cpp engine: FFI, backend detection, build-hash identity"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+links = "llama"
+build = "build.rs"
+
+[features]
+default = []
+# GPU backends; CPU is always built. Never gate product features on these —
+# they only change what the engine can accelerate (§1.1 of the product spec).
+metal = []
+cuda = []
+vulkan = []
+rocm = []
+
+[dependencies]
+onebrain-proto = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[build-dependencies]
+cmake = { workspace = true }
+cc = "1"

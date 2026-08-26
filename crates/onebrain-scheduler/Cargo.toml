@@ -1,0 +1,15 @@
+[package]
+name = "onebrain-scheduler"
+description = "Device/link profiling and layer placement planning"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+onebrain-proto = { workspace = true }
+onebrain-mesh = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

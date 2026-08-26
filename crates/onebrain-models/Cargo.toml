@@ -1,0 +1,15 @@
+[package]
+name = "onebrain-models"
+description = "Model registry, GGUF parsing, shard downloads, and integrity"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+onebrain-proto = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+blake3 = { workspace = true }

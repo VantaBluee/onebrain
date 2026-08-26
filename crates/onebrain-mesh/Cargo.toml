@@ -1,0 +1,16 @@
+[package]
+name = "onebrain-mesh"
+description = "Device identity, pairing, discovery, and authenticated transport (iroh)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+onebrain-proto = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+# iroh lands in M2 (mesh & pairing); keeping the dependency out until then
+# keeps M0/M1 builds lean and lets M2 pin the version it actually validates.

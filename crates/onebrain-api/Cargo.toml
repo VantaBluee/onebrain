@@ -1,0 +1,16 @@
+[package]
+name = "onebrain-api"
+description = "HTTP gateway: OpenAI and Ollama compatible APIs with bearer auth"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+onebrain-proto = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+# axum + SSE streaming arrive with M1 (the serving milestone).

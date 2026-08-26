@@ -1,0 +1,21 @@
+[package]
+name = "onebraind"
+description = "Daemon: role logic, supervision, config, single-instance lock"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+onebrain-proto = { workspace = true }
+onebrain-engine = { workspace = true }
+onebrain-mesh = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+directories = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
