@@ -20,6 +20,11 @@ pub struct Config {
     /// Battery percentage below which this node advertises "draining,
     /// deprioritize" and drains out of new plans (§5).
     pub battery_drain_threshold: u8,
+    /// Address the HTTP API gateway binds. Loopback-only in M1; the
+    /// internal-api contract fixes the default port at 11435.
+    pub api_bind: String,
+    /// Context length for the inference session created at model load.
+    pub ctx_len: u32,
 }
 
 impl Default for Config {
@@ -28,6 +33,8 @@ impl Default for Config {
             node_name: None,
             localhost_auth_exempt: true,
             battery_drain_threshold: 25,
+            api_bind: "127.0.0.1:11435".to_string(),
+            ctx_len: 4096,
         }
     }
 }
@@ -74,6 +81,9 @@ mod tests {
         // Localhost exemption is the only auth relaxation that exists.
         assert!(c.localhost_auth_exempt);
         assert_eq!(c.battery_drain_threshold, 25);
+        // The API listens on loopback only in M1 (internal-api contract).
+        assert_eq!(c.api_bind, "127.0.0.1:11435");
+        assert_eq!(c.ctx_len, 4096);
     }
 
     #[test]
@@ -82,10 +92,24 @@ mod tests {
         let path = dir.path().join("config.toml");
         let c = Config {
             node_name: Some("gaming-pc".into()),
+            api_bind: "127.0.0.1:0".into(),
+            ctx_len: 8192,
             ..Default::default()
         };
         c.save(&path).unwrap();
         assert_eq!(Config::load(&path).unwrap(), c);
+    }
+
+    #[test]
+    fn partial_file_fills_new_fields_with_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        // A pre-M1 config file lacks the M1 fields; they must default in.
+        std::fs::write(&path, "localhost_auth_exempt = false\n").unwrap();
+        let c = Config::load(&path).unwrap();
+        assert!(!c.localhost_auth_exempt);
+        assert_eq!(c.api_bind, "127.0.0.1:11435");
+        assert_eq!(c.ctx_len, 4096);
     }
 
     #[test]
