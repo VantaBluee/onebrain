@@ -91,16 +91,48 @@
 //!     it must leave `connected` in the head's peers, and the next plan
 //!     (trigger: a reload) must exclude it while keeping the live worker.
 //!
+//! After the chaos section, the **M6 logistics** proofs run
+//! (docs/logistics.md "DoD hooks"). A counting fake-WAN HTTP server on
+//! loopback serves a synthetic two-layer llama GGUF built in memory (each
+//! layer's FFN tensors are strictly over the RPC protocol's 10 MiB
+//! `SET_TENSOR_HASH` threshold, with all-zero payloads so every big tensor
+//! shares one FNV cache name); `hf:` refs resolve against it through the
+//! TEST-ONLY `OB_HF_BASE_URL` seam in onebrain-models.
+//!
+//! 13. **m6 setup** — A and B restart uncapped (whichever chaos worker
+//!     still runs as C stops for good); the fake-WAN server starts first
+//!     so both daemons inherit the base-URL override.
+//! 14. **zero-WAN (A)** — A pulls the synthetic model via `/api/pull`:
+//!     the server's byte counter grows to EXACTLY the file size, A's
+//!     cached bytes equal the served bytes, and A's grep-stable transfer
+//!     summary reads pure WAN.
+//! 15. **zero-WAN (B)** — B pulls the same reference: the counter is
+//!     UNCHANGED (every byte traveled from A over the mesh blob store —
+//!     also asserted via B's `logistics: fetched` line reading 0 WAN
+//!     bytes), and B's manifest + file bytes are byte-exact vs A's.
+//! 16. **pre-seed** — a forced `--nodes 2` load distributes the model;
+//!     the worker's plan adoption pre-seeds `<data>/rpc-cache/` and its
+//!     log carries `rpc-cache: pre-seeded {N} tensors ({M} bytes) for
+//!     epoch {E}` with the plan's epoch and an over-threshold byte count.
+//! 17. **pre-seed reload** — the same load reaches a NEW epoch and the
+//!     worker logs `rpc-cache: {N} tensors already present`; no second
+//!     pre-seed line ever appears and the WAN counter has still not moved
+//!     (re-plans reuse the bytes on disk, spec §6).
+//!
 //! `--netem` (Linux, root only — SKIP + exit 0 anywhere else): the same
 //! M3/M4 scenario inside the pair-sim network namespaces, shaped to
-//! 1 Gbit / 0.5 ms per direction (chaos skipped, see above).
+//! 1 Gbit / 0.5 ms per direction (chaos and the M6 logistics section
+//! skipped, see the skip note in `scenario`).
 //!
 //! One `[PASS]`/`[FAIL]` checklist line per step; daemon-log tails are
 //! dumped on failure; `OB_E2E_SKIP_BUILD=1` skips the inner build.
 
 use std::ffi::OsStr;
-use std::path::Path;
+use std::net::{TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -576,20 +608,26 @@ fn scenario(
              network namespaces and the chaos scenarios need a third daemon; they run in the \
              default loopback mode on every OS"
         );
+        println!(
+            "[SKIP] m6 logistics under --netem: the fake-WAN server lives in the root \
+             namespace where the namespaced daemons' loopback cannot reach it; the proofs \
+             run in the default loopback mode on every OS"
+        );
         return Ok(());
     }
-    chaos_section(
-        &ChaosEnv {
-            a,
-            b,
-            c,
-            peer_a: &peer_a,
-            peer_b: &peer_b,
-            mesh,
-            model_arg,
-        },
-        dims,
-    )
+    let env = ChaosEnv {
+        a,
+        b,
+        c,
+        peer_a: &peer_a,
+        peer_b: &peer_b,
+        mesh,
+        model_arg,
+    };
+    chaos_section(&env, dims)?;
+
+    // ---- M6 logistics proofs (docs/logistics.md "DoD hooks") ------------
+    logistics_section(&env)
 }
 
 // ---------------------------------------------------------------------------
@@ -621,7 +659,8 @@ const PEER_LOSS_TIMEOUT: Duration = Duration::from_secs(30);
 /// "returns the planning error rather than hanging" assertion.
 const FAST_FAIL_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Everything the chaos section needs from the earlier steps.
+/// Everything the chaos section needs from the earlier steps. Shared with
+/// the M6 logistics section, which runs on the same daemons afterwards.
 struct ChaosEnv<'a> {
     a: &'a Node,
     b: &'a Node,
@@ -1057,6 +1096,708 @@ fn chaos_section(env: &ChaosEnv, dims: &SimModelDims) -> Result<()> {
                     victim.node.label
                 );
             }
+            Ok(())
+        },
+    )?;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// M6 logistics section (docs/logistics.md "DoD hooks")
+// ---------------------------------------------------------------------------
+
+/// Model reference of the M6 proofs: an `hf:` ref both daemons resolve
+/// against the fake-WAN server through the TEST-ONLY `OB_HF_BASE_URL` seam
+/// (crates/onebrain-models/src/registry.rs).
+const M6_MODEL_REF: &str = "hf:onebrain-sim/wan/preseed-sim.gguf";
+/// Cache id the daemon derives from [`M6_MODEL_REF`]
+/// (`hf--<org>--<repo>--<file stem>`) — the entry directory name AND the
+/// wire model key the grep-stable log lines carry.
+const M6_CACHE_ID: &str = "hf--onebrain-sim--wan--preseed-sim";
+/// URL path the `hf:` resolver appends to the base
+/// (`/<org>/<repo>/resolve/main/<file>`).
+const M6_URL_PATH: &str = "/onebrain-sim/wan/resolve/main/preseed-sim.gguf";
+/// On-disk file name inside the cache entry directory.
+const M6_FILE_NAME: &str = "preseed-sim.gguf";
+/// Budget for one `/api/pull` of the ~65 MB synthetic model on loopback.
+const M6_PULL_TIMEOUT: Duration = Duration::from_secs(180);
+/// The worker's pre-seed runs detached from the load stream
+/// (`worker_prepare` is spawned at plan adoption, before the ack); its log
+/// line must land within this after the load returned.
+const M6_LOG_TIMEOUT: Duration = Duration::from_secs(30);
+/// Mirror of `onebrain_engine::rpc_cache::RPC_HASH_THRESHOLD` (xtask
+/// deliberately depends on no workspace crates). Fixed by the vendored RPC
+/// protocol: only payloads STRICTLY larger are ever hash-checked, so only
+/// those are worth pre-seeding.
+const M6_RPC_HASH_THRESHOLD: u64 = 10 * 1024 * 1024;
+
+// The synthetic model's shape: the smallest llama-arch GGUF whose
+// PER-LAYER tensors cross the RPC hash threshold. n_embd stays tiny; the
+// FFN width alone pushes each of gate/up/down over 10 MiB
+// (64 × 41984 × 4 B = 10,747,904 B). Every payload is zero, so all six big
+// tensors share ONE FNV-1a cache file name — which makes the pre-seed
+// asserts independent of WHICH layer the scheduler hands the worker.
+const M6_N_LAYERS: u32 = 2;
+const M6_N_EMBD: u32 = 64;
+const M6_N_HEAD: u32 = 4;
+const M6_N_HEAD_KV: u32 = 2;
+const M6_N_FF: u32 = 41_984;
+/// `<unk>`, `<s>`, `</s>` plus the 256 byte-fallback tokens of a minimal
+/// SPM vocab (enough for llama.cpp to tokenize anything).
+const M6_VOCAB: u32 = 259;
+
+/// GGUF v3 writer for the synthetic model: metadata + tensor infos + a
+/// 32-aligned all-zero data section. Exactly the shapes
+/// [`build_m6_model`] needs (scalar/string/array metadata, F32 tensors).
+struct GgufBuilder {
+    kv_count: u64,
+    kvs: Vec<u8>,
+    tensor_count: u64,
+    infos: Vec<u8>,
+    /// Tensor-data bytes laid out so far (all zero; offsets stay
+    /// 32-aligned because every tensor's byte size is a multiple of 32).
+    data_len: u64,
+}
+
+impl GgufBuilder {
+    fn new() -> GgufBuilder {
+        GgufBuilder {
+            kv_count: 0,
+            kvs: Vec::new(),
+            tensor_count: 0,
+            infos: Vec::new(),
+            data_len: 0,
+        }
+    }
+
+    /// GGUF string: u64 length + raw UTF-8 bytes.
+    fn string_into(out: &mut Vec<u8>, s: &str) {
+        out.extend((s.len() as u64).to_le_bytes());
+        out.extend(s.as_bytes());
+    }
+
+    fn kv_str(&mut self, key: &str, val: &str) {
+        Self::string_into(&mut self.kvs, key);
+        self.kvs.extend(8u32.to_le_bytes()); // string
+        Self::string_into(&mut self.kvs, val);
+        self.kv_count += 1;
+    }
+
+    fn kv_u32(&mut self, key: &str, val: u32) {
+        Self::string_into(&mut self.kvs, key);
+        self.kvs.extend(4u32.to_le_bytes()); // u32
+        self.kvs.extend(val.to_le_bytes());
+        self.kv_count += 1;
+    }
+
+    fn kv_f32(&mut self, key: &str, val: f32) {
+        Self::string_into(&mut self.kvs, key);
+        self.kvs.extend(6u32.to_le_bytes()); // f32
+        self.kvs.extend(val.to_le_bytes());
+        self.kv_count += 1;
+    }
+
+    fn kv_str_array(&mut self, key: &str, vals: &[String]) {
+        Self::string_into(&mut self.kvs, key);
+        self.kvs.extend(9u32.to_le_bytes()); // array
+        self.kvs.extend(8u32.to_le_bytes()); // of string
+        self.kvs.extend((vals.len() as u64).to_le_bytes());
+        for v in vals {
+            Self::string_into(&mut self.kvs, v);
+        }
+        self.kv_count += 1;
+    }
+
+    /// An all-zero f32 array (the synthetic tokenizer scores).
+    fn kv_f32_array_zeroed(&mut self, key: &str, n: u64) {
+        Self::string_into(&mut self.kvs, key);
+        self.kvs.extend(9u32.to_le_bytes()); // array
+        self.kvs.extend(6u32.to_le_bytes()); // of f32
+        self.kvs.extend(n.to_le_bytes());
+        self.kvs
+            .extend(std::iter::repeat(0u8).take((n * 4) as usize));
+        self.kv_count += 1;
+    }
+
+    fn kv_i32_array(&mut self, key: &str, vals: &[i32]) {
+        Self::string_into(&mut self.kvs, key);
+        self.kvs.extend(9u32.to_le_bytes()); // array
+        self.kvs.extend(5u32.to_le_bytes()); // of i32
+        self.kvs.extend((vals.len() as u64).to_le_bytes());
+        for v in vals {
+            self.kvs.extend(v.to_le_bytes());
+        }
+        self.kv_count += 1;
+    }
+
+    /// Declare one F32 tensor laid out right after the previous one. Byte
+    /// sizes must be multiples of 32 so every offset stays aligned without
+    /// padding — that keeps every big payload byte-identical (pure zeros).
+    fn tensor_f32(&mut self, name: &str, dims: &[u64]) {
+        let bytes = dims.iter().product::<u64>() * 4;
+        assert_eq!(
+            bytes % 32,
+            0,
+            "tensor {name} would break the 32-byte alignment"
+        );
+        Self::string_into(&mut self.infos, name);
+        self.infos.extend((dims.len() as u32).to_le_bytes());
+        for d in dims {
+            self.infos.extend(d.to_le_bytes());
+        }
+        self.infos.extend(0u32.to_le_bytes()); // GGML_TYPE_F32
+        self.infos.extend(self.data_len.to_le_bytes());
+        self.tensor_count += 1;
+        self.data_len += bytes;
+    }
+
+    fn build(self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend(0x4655_4747u32.to_le_bytes()); // "GGUF"
+        out.extend(3u32.to_le_bytes());
+        out.extend(self.tensor_count.to_le_bytes());
+        out.extend(self.kv_count.to_le_bytes());
+        out.extend(&self.kvs);
+        out.extend(&self.infos);
+        // Data starts at the header end rounded up to the alignment; the
+        // padding and every payload are zero.
+        let data_offset = (out.len() as u64).div_ceil(32) * 32;
+        out.resize((data_offset + self.data_len) as usize, 0);
+        out
+    }
+}
+
+/// The synthetic GGUF: a real, loadable llama-arch model (all the
+/// metadata and tensors llama.cpp demands, a minimal SPM byte-fallback
+/// vocab) whose weights are all zero — generation is meaningless, but
+/// load, planning, distribution, and the RPC weight flow are fully real.
+fn build_m6_model() -> Vec<u8> {
+    let mut g = GgufBuilder::new();
+    g.kv_str("general.architecture", "llama");
+    g.kv_str("general.name", "onebrain-sim-preseed");
+    g.kv_u32("llama.block_count", M6_N_LAYERS);
+    g.kv_u32("llama.context_length", 4096);
+    g.kv_u32("llama.embedding_length", M6_N_EMBD);
+    g.kv_u32("llama.feed_forward_length", M6_N_FF);
+    g.kv_u32("llama.attention.head_count", M6_N_HEAD);
+    g.kv_u32("llama.attention.head_count_kv", M6_N_HEAD_KV);
+    g.kv_f32("llama.attention.layer_norm_rms_epsilon", 1e-5);
+    // Must equal head_dim for the llama arch or llama.cpp rejects it.
+    g.kv_u32("llama.rope.dimension_count", M6_N_EMBD / M6_N_HEAD);
+    g.kv_str("tokenizer.ggml.model", "llama");
+    let mut tokens: Vec<String> = vec!["<unk>".into(), "<s>".into(), "</s>".into()];
+    tokens.extend((0u32..256).map(|b| format!("<0x{b:02X}>")));
+    // SPM token types: 2 = unknown, 3 = control, 6 = byte.
+    let mut types: Vec<i32> = vec![2, 3, 3];
+    types.extend(std::iter::repeat(6).take(256));
+    g.kv_str_array("tokenizer.ggml.tokens", &tokens);
+    g.kv_f32_array_zeroed("tokenizer.ggml.scores", u64::from(M6_VOCAB));
+    g.kv_i32_array("tokenizer.ggml.token_type", &types);
+    g.kv_u32("tokenizer.ggml.bos_token_id", 1);
+    g.kv_u32("tokenizer.ggml.eos_token_id", 2);
+    g.kv_u32("tokenizer.ggml.unknown_token_id", 0);
+
+    let e = u64::from(M6_N_EMBD);
+    let v = u64::from(M6_VOCAB);
+    let ff = u64::from(M6_N_FF);
+    let kv_dim = u64::from(M6_N_EMBD / M6_N_HEAD * M6_N_HEAD_KV);
+    g.tensor_f32("token_embd.weight", &[e, v]);
+    for i in 0..M6_N_LAYERS {
+        g.tensor_f32(&format!("blk.{i}.attn_norm.weight"), &[e]);
+        g.tensor_f32(&format!("blk.{i}.attn_q.weight"), &[e, e]);
+        g.tensor_f32(&format!("blk.{i}.attn_k.weight"), &[e, kv_dim]);
+        g.tensor_f32(&format!("blk.{i}.attn_v.weight"), &[e, kv_dim]);
+        g.tensor_f32(&format!("blk.{i}.attn_output.weight"), &[e, e]);
+        g.tensor_f32(&format!("blk.{i}.ffn_norm.weight"), &[e]);
+        g.tensor_f32(&format!("blk.{i}.ffn_gate.weight"), &[e, ff]);
+        g.tensor_f32(&format!("blk.{i}.ffn_up.weight"), &[e, ff]);
+        g.tensor_f32(&format!("blk.{i}.ffn_down.weight"), &[ff, e]);
+    }
+    g.tensor_f32("output_norm.weight", &[e]);
+    g.tensor_f32("output.weight", &[e, v]);
+    g.build()
+}
+
+/// The counting fake-WAN model server: plain HTTP/1.1 on a loopback port,
+/// one thread per connection, serving [`M6_URL_PATH`] from memory with
+/// Range support (the downloader resumes with open ranges; the range
+/// fetcher asks for bounded ones). `served` counts BODY bytes actually
+/// written — the zero-WAN proof's counter.
+struct FakeWan {
+    base_url: String,
+    served: Arc<AtomicU64>,
+}
+
+impl FakeWan {
+    fn served(&self) -> u64 {
+        self.served.load(Ordering::SeqCst)
+    }
+}
+
+fn start_fake_wan(body: Arc<Vec<u8>>) -> Result<FakeWan> {
+    let listener = TcpListener::bind("127.0.0.1:0").context("binding the fake-WAN listener")?;
+    let port = listener.local_addr()?.port();
+    let served = Arc::new(AtomicU64::new(0));
+    let counter = Arc::clone(&served);
+    // Detached accept loop: the threads die with the xtask process, and
+    // the daemons are stopped first in cleanup, so nothing dials a dead
+    // server.
+    std::thread::spawn(move || {
+        for conn in listener.incoming() {
+            let Ok(stream) = conn else { continue };
+            let body = Arc::clone(&body);
+            let counter = Arc::clone(&counter);
+            std::thread::spawn(move || {
+                let _ = serve_wan_connection(stream, &body, &counter);
+            });
+        }
+    });
+    Ok(FakeWan {
+        base_url: format!("http://127.0.0.1:{port}"),
+        served,
+    })
+}
+
+/// One keep-alive connection: answer GETs for the model path until EOF.
+fn serve_wan_connection(stream: TcpStream, body: &[u8], served: &AtomicU64) -> std::io::Result<()> {
+    use std::io::{BufRead, Write};
+    let mut reader = std::io::BufReader::new(stream.try_clone()?);
+    let mut writer = stream;
+    loop {
+        let mut head = String::new();
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line)? == 0 {
+                return Ok(()); // client closed the connection
+            }
+            if line.trim_end().is_empty() {
+                break;
+            }
+            head.push_str(&line);
+        }
+        if head.is_empty() {
+            return Ok(());
+        }
+        let total = body.len() as u64;
+        let (status, slice) = match parse_wan_request(&head) {
+            Some(req) if req.method == "GET" && req.path == M6_URL_PATH => match req.range {
+                None => ("200 OK", Some((0u64, total))),
+                Some((start, end)) => {
+                    // HTTP range ends are inclusive; open ranges run to EOF.
+                    let end = end.map_or(total, |e| (e + 1).min(total));
+                    if start >= total || start >= end {
+                        ("416 Range Not Satisfiable", None)
+                    } else {
+                        ("206 Partial Content", Some((start, end)))
+                    }
+                }
+            },
+            Some(req) if req.method == "GET" => ("404 Not Found", None),
+            _ => ("400 Bad Request", None),
+        };
+        match slice {
+            Some((start, end)) => {
+                let payload = &body[start as usize..end as usize];
+                let mut headers = format!(
+                    "HTTP/1.1 {status}\r\nAccept-Ranges: bytes\r\nContent-Length: {}\r\n",
+                    payload.len()
+                );
+                if status.starts_with("206") {
+                    headers.push_str(&format!(
+                        "Content-Range: bytes {}-{}/{total}\r\n",
+                        start,
+                        end - 1
+                    ));
+                }
+                headers.push_str("\r\n");
+                writer.write_all(headers.as_bytes())?;
+                writer.write_all(payload)?;
+                writer.flush()?;
+                served.fetch_add(payload.len() as u64, Ordering::SeqCst);
+            }
+            None => {
+                writer.write_all(
+                    format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\n\r\n").as_bytes(),
+                )?;
+                writer.flush()?;
+            }
+        }
+    }
+}
+
+/// One parsed request head: method, path, and the `Range` header's
+/// `bytes=<start>-[<end>]` (end inclusive, per HTTP).
+struct WanRequest {
+    method: String,
+    path: String,
+    range: Option<(u64, Option<u64>)>,
+}
+
+fn parse_wan_request(head: &str) -> Option<WanRequest> {
+    let mut lines = head.lines();
+    let mut request_line = lines.next()?.split_whitespace();
+    let method = request_line.next()?.to_string();
+    let path = request_line.next()?.to_string();
+    let mut range = None;
+    for line in lines {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if !name.trim().eq_ignore_ascii_case("range") {
+            continue;
+        }
+        let spec = value.trim().strip_prefix("bytes=")?;
+        let (start, end) = spec.split_once('-')?;
+        let start: u64 = start.trim().parse().ok()?;
+        let end = end.trim();
+        let end: Option<u64> = if end.is_empty() {
+            None
+        } else {
+            Some(end.parse().ok()?)
+        };
+        range = Some((start, end));
+    }
+    Some(WanRequest {
+        method,
+        path,
+        range,
+    })
+}
+
+/// `POST /api/pull` (Ollama dialect): download WITHOUT loading — the pull
+/// path the zero-WAN proof measures. Non-streaming: one
+/// `{"status":"success"}` JSON on completion.
+fn api_pull(node: &Node, reference: &str) -> Result<()> {
+    let v = node.post_json(
+        "/api/pull",
+        &json!({ "model": reference, "stream": false }),
+        M6_PULL_TIMEOUT,
+    )?;
+    if v["status"] != "success" {
+        bail!("/api/pull on {} did not succeed: {v}", node.label);
+    }
+    Ok(())
+}
+
+/// A node's cached copy of the synthetic model.
+fn model_file(node: &Node) -> PathBuf {
+    node.home
+        .join("data")
+        .join("models")
+        .join(M6_CACHE_ID)
+        .join(M6_FILE_NAME)
+}
+
+fn manifest_file(node: &Node) -> PathBuf {
+    node.home
+        .join("data")
+        .join("models")
+        .join(M6_CACHE_ID)
+        .join("manifest.json")
+}
+
+/// The node's daemon log (both std streams of `onebrain up` land there;
+/// appended across restarts).
+fn daemon_log(node: &Node) -> String {
+    std::fs::read_to_string(node.home.join("data").join("logs").join("daemon.log"))
+        .unwrap_or_default()
+}
+
+/// Poll the daemon log until a line containing `needle` appears; returns
+/// the LAST (most recent) matching line.
+fn wait_log_line(node: &Node, needle: &str, window: Duration) -> Result<String> {
+    let deadline = Instant::now() + window;
+    loop {
+        if let Some(line) = daemon_log(node).lines().rev().find(|l| l.contains(needle)) {
+            return Ok(line.to_string());
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "{}: no {needle:?} line in the daemon log within {window:?}",
+                node.label
+            );
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// The node's most recent grep-stable transfer summary for the M6 model
+/// (`logistics: fetched {X} bytes p2p, {Y} bytes wan for <id>`), parsed to
+/// `(p2p, wan)`. Polls briefly: the line is written just before the pull
+/// answers, and the file append races the HTTP response.
+fn fetch_summary(node: &Node) -> Result<(u64, u64)> {
+    let needle = format!(" bytes wan for {M6_CACHE_ID}");
+    let line = wait_log_line(node, &needle, Duration::from_secs(5))?;
+    parse_fetch_summary(&line).with_context(|| format!("unparsable transfer summary: {line}"))
+}
+
+/// Parse `… logistics: fetched {X} bytes p2p, {Y} bytes wan for {model}`.
+fn parse_fetch_summary(line: &str) -> Option<(u64, u64)> {
+    let rest = line.split("logistics: fetched ").nth(1)?;
+    let (p2p, rest) = rest.split_once(" bytes p2p, ")?;
+    let (wan, _) = rest.split_once(" bytes wan for ")?;
+    Some((p2p.trim().parse().ok()?, wan.trim().parse().ok()?))
+}
+
+/// Parse `… rpc-cache: pre-seeded {N} tensors ({M} bytes) for epoch {E}`.
+fn parse_preseed_line(line: &str) -> Option<(u64, u64, u64)> {
+    let rest = line.split("rpc-cache: pre-seeded ").nth(1)?;
+    let (tensors, rest) = rest.split_once(" tensors (")?;
+    let (bytes, rest) = rest.split_once(" bytes) for epoch ")?;
+    let epoch: String = rest
+        .trim_start()
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    Some((
+        tensors.trim().parse().ok()?,
+        bytes.trim().parse().ok()?,
+        epoch.parse().ok()?,
+    ))
+}
+
+/// Parse `… rpc-cache: {N} tensors already present` (the pre-seeded line
+/// also starts with `rpc-cache: ` but never matches this shape).
+fn parse_present_line(line: &str) -> Option<u64> {
+    let rest = line.split("rpc-cache: ").nth(1)?;
+    let (n, _) = rest.split_once(" tensors already present")?;
+    n.trim().parse().ok()
+}
+
+/// `onebrain stop` + wait for the status endpoint to go away.
+fn stop_daemon(node: &Node) -> Result<()> {
+    let out = node.onebrain(&["stop"])?;
+    if !out.status.success() {
+        bail!(
+            "`onebrain stop` on {} failed: {}",
+            node.label,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let deadline = Instant::now() + STOP_TIMEOUT;
+    while node.try_status().is_ok() {
+        if Instant::now() >= deadline {
+            bail!(
+                "{} still answering {STOP_TIMEOUT:?} after `onebrain stop`",
+                node.label
+            );
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+    Ok(())
+}
+
+/// The M6 logistics rehearsal (module docs steps 13–17): the zero-WAN pull
+/// proof and the rpc-cache pre-seed proof, on the same paired daemons the
+/// chaos section used. Runs last; non-netem only (the fake-WAN server
+/// lives outside the netem namespaces).
+fn logistics_section(env: &ChaosEnv) -> Result<()> {
+    let (mesh_a, mesh_b, _mesh_c) = env.mesh;
+    let model_bytes = Arc::new(build_m6_model());
+    let file_len = model_bytes.len() as u64;
+
+    let wan = step(
+        "m6 setup: fake-WAN server up; A+B restarted uncapped; C stopped",
+        || {
+            let wan = start_fake_wan(Arc::clone(&model_bytes))?;
+            // TEST-ONLY seam (crates/onebrain-models registry.rs): daemons
+            // spawned from here on resolve `hf:` refs against the fake
+            // server. Set BEFORE the restarts so both daemons inherit it.
+            std::env::set_var("OB_HF_BASE_URL", &wan.base_url);
+            println!(
+                "       fake WAN {}{} ({} bytes)",
+                wan.base_url, M6_URL_PATH, file_len
+            );
+            // Head first (clean epoch teardown while its worker lives),
+            // then drop whichever chaos worker is still up: C for good, B
+            // into a fresh uncapped daemon (the chaos drain left exactly
+            // one of the two running).
+            restart_with(env.a, mesh_a, false, SimKnobs::default())?;
+            if env.c.try_status().is_ok() {
+                stop_daemon(env.c)?;
+            }
+            if env.b.try_status().is_ok() {
+                restart_with(env.b, mesh_b, false, SimKnobs::default())?;
+            } else {
+                start_with(env.b, mesh_b, false, SimKnobs::default())?;
+            }
+            wait_connected(env.a, env.b, env.peer_a, env.peer_b, "after the m6 restart")?;
+            Ok(wan)
+        },
+    )?;
+
+    step(
+        "m6 zero-wan: A pulls the synthetic model over the fake WAN",
+        || {
+            api_pull(env.a, M6_MODEL_REF)?;
+            let served = wan.served();
+            if served != file_len {
+                bail!(
+                    "the fake-WAN server served {served} bytes for A's pull, expected exactly \
+                     the file size {file_len} (0 = the daemon never dialed it; more = bytes \
+                     were re-fetched)"
+                );
+            }
+            let cached = std::fs::read(model_file(env.a))
+                .with_context(|| format!("reading A's cached copy of {M6_CACHE_ID}"))?;
+            if cached != **model_bytes {
+                bail!("A's cached model differs from the bytes the fake WAN served");
+            }
+            let (p2p, wan_bytes) = fetch_summary(env.a)?;
+            if p2p != 0 || wan_bytes != file_len {
+                bail!(
+                    "A's transfer summary says {p2p} B p2p / {wan_bytes} B wan; a cold pull \
+                     with no peer holding the model must be {file_len} B pure WAN"
+                );
+            }
+            Ok(())
+        },
+    )?;
+
+    step(
+        "m6 zero-wan: B's pull moves ZERO new WAN bytes (LAN-first P2P)",
+        || {
+            let before = wan.served();
+            api_pull(env.b, M6_MODEL_REF)?;
+            let after = wan.served();
+            if after != before {
+                bail!(
+                    "the fake-WAN counter moved {before} -> {after} during B's pull; with A \
+                     holding the full model every byte must come over the mesh blob store \
+                     (docs/logistics.md zero-WAN proof)"
+                );
+            }
+            let (p2p, wan_bytes) = fetch_summary(env.b)?;
+            if wan_bytes != 0 {
+                bail!("B's transfer summary reports {wan_bytes} WAN bytes, expected 0");
+            }
+            if p2p < file_len {
+                bail!(
+                    "B's transfer summary reports only {p2p} p2p bytes for the \
+                     {file_len}-byte model; the whole file must have traveled peer-to-peer"
+                );
+            }
+            println!("       B fetched {p2p} bytes p2p, 0 wan; counter frozen at {after}");
+            Ok(())
+        },
+    )?;
+
+    step(
+        "m6 zero-wan: B's manifest and bytes are byte-exact vs A's",
+        || {
+            let read = |node: &Node, who: &str| -> Result<(Vec<u8>, Value)> {
+                let bytes = std::fs::read(model_file(node))
+                    .with_context(|| format!("reading {who}'s cached model file"))?;
+                let manifest: Value = serde_json::from_slice(
+                    &std::fs::read(manifest_file(node))
+                        .with_context(|| format!("reading {who}'s manifest.json"))?,
+                )
+                .with_context(|| format!("{who}'s manifest.json is not JSON"))?;
+                Ok((bytes, manifest))
+            };
+            let (a_bytes, a_manifest) = read(env.a, "A")?;
+            let (b_bytes, b_manifest) = read(env.b, "B")?;
+            if a_bytes != b_bytes {
+                bail!("A's and B's cached model files differ");
+            }
+            for key in ["url", "size_bytes", "blake3"] {
+                if a_manifest[key] != b_manifest[key] || a_manifest[key].is_null() {
+                    bail!(
+                        "manifest field {key:?} differs or is missing: A has {}, B has {}",
+                        a_manifest[key],
+                        b_manifest[key]
+                    );
+                }
+            }
+            Ok(())
+        },
+    )?;
+
+    let body = json!({ "model": M6_MODEL_REF, "nodes": 2, "explain": true });
+    let epoch1 = step(
+        "m6 pre-seed: forced 2-node load; the worker pre-seeds its big tensors",
+        || {
+            let plan = load_model(env.a, &body)?;
+            assert_pipeline(&plan)?;
+            assert_explained(&plan)?;
+            if !assignment_node_ids(&plan)
+                .iter()
+                .any(|id| id == &env.peer_b.id)
+            {
+                bail!("the m6 plan does not shard onto worker B: {plan}");
+            }
+            let epoch = plan_epoch(&plan)?;
+            // worker_prepare runs detached from the load stream, so the
+            // line may trail the load's `ready` — though in practice the
+            // pre-seed (a few local MB of I/O, started at adoption before
+            // the ack) finishes long before the head even begins pushing
+            // weights, which is also why "pre-seeded" and never "already
+            // present" (from the serve session caching pushed payloads)
+            // is the deterministic first-load outcome.
+            let line = wait_log_line(env.b, "rpc-cache: pre-seeded ", M6_LOG_TIMEOUT)?;
+            let (tensors, bytes, logged_epoch) = parse_preseed_line(&line)
+                .with_context(|| format!("unparsable pre-seed line: {line}"))?;
+            if logged_epoch != epoch {
+                bail!(
+                    "pre-seed line names epoch {logged_epoch}, the plan is epoch {epoch}: {line}"
+                );
+            }
+            if tensors == 0 || bytes <= M6_RPC_HASH_THRESHOLD {
+                bail!(
+                    "pre-seed wrote {tensors} tensors / {bytes} bytes; every seeded tensor \
+                     must be over the {M6_RPC_HASH_THRESHOLD}-byte RPC hash threshold or \
+                     SET_TENSOR_HASH could never skip it: {line}"
+                );
+            }
+            println!(
+                "       worker pre-seeded {tensors} cache file(s), {bytes} bytes, epoch {epoch}"
+            );
+            Ok(epoch)
+        },
+    )?;
+
+    step(
+        "m6 pre-seed: reloading the same plan finds the tensors already present",
+        || {
+            let plan = load_model(env.a, &body)?;
+            assert_pipeline(&plan)?;
+            let epoch = plan_epoch(&plan)?;
+            if epoch == epoch1 {
+                bail!("the reload did not reach a new epoch (still {epoch1})");
+            }
+            let line = wait_log_line(env.b, " tensors already present", M6_LOG_TIMEOUT)?;
+            let present = parse_present_line(&line)
+                .with_context(|| format!("unparsable already-present line: {line}"))?;
+            if present == 0 {
+                bail!(
+                    "the worker reports 0 tensors already present — the rpc-cache was empty \
+                     on the re-plan: {line}"
+                );
+            }
+            // The re-plan wrote nothing new and moved no WAN byte: exactly
+            // one pre-seed line ever, counter frozen (spec §6: nothing
+            // re-downloads if the bytes exist locally).
+            let preseed_lines = daemon_log(env.b)
+                .lines()
+                .filter(|l| l.contains("rpc-cache: pre-seeded "))
+                .count();
+            if preseed_lines != 1 {
+                bail!(
+                    "expected exactly one pre-seed line across both loads, found {preseed_lines}"
+                );
+            }
+            if wan.served() != file_len {
+                bail!(
+                    "the fake-WAN counter reads {} after the reloads, expected it frozen at \
+                     {file_len} (re-plans must reuse the bytes on disk)",
+                    wan.served()
+                );
+            }
+            println!(
+                "       reload epoch {epoch}: {present} tensors already present, WAN counter \
+                 frozen"
+            );
             Ok(())
         },
     )?;
@@ -2116,24 +2857,7 @@ fn ollama_streams(node: &Node, model: &str) -> Result<()> {
 /// Stop, rewrite the config with the given knobs, start again, wait
 /// healthy. `SimKnobs::default()` is the uncapped restart of the M3 steps.
 fn restart_with(node: &Node, mesh_port: u16, netem: bool, knobs: SimKnobs) -> Result<()> {
-    let out = node.onebrain(&["stop"])?;
-    if !out.status.success() {
-        bail!(
-            "`onebrain stop` on {} failed: {}",
-            node.label,
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    let deadline = Instant::now() + STOP_TIMEOUT;
-    while node.try_status().is_ok() {
-        if Instant::now() >= deadline {
-            bail!(
-                "{} still answering {STOP_TIMEOUT:?} after `onebrain stop`",
-                node.label
-            );
-        }
-        std::thread::sleep(POLL_INTERVAL);
-    }
+    stop_daemon(node)?;
     start_with(node, mesh_port, netem, knobs)
 }
 
@@ -3213,5 +3937,157 @@ onebrain 4242 user   11u  IPv4 0xdeadbeef      0t0  TCP 10.0.0.5:52001->1.2.3.4:
         assert!(assert_pipeline(&one).is_err());
         assert!(assert_explained(&one).is_err());
         assert!(assert_explained(&serde_json::json!({"explanation": "  "})).is_err());
+    }
+
+    // ---- M6 logistics section --------------------------------------------
+
+    #[test]
+    fn m6_model_is_a_parseable_gguf_with_the_pinned_shape() {
+        let bytes = build_m6_model();
+        let dims = parse_gguf_dims(&bytes, bytes.len() as u64).unwrap();
+        assert_eq!(dims.n_layers, u64::from(M6_N_LAYERS));
+        // kv_rate = 2 (K+V) × n_embd_kv × 2 B (f16); n_embd_kv = 2 KV heads
+        // × head_dim 16 = 32.
+        assert_eq!(dims.kv_rate, 128);
+        // Every FFN tensor is STRICTLY over the RPC hash threshold, so the
+        // worker pre-seeds it and SET_TENSOR_HASH can skip it; sizes are
+        // 32-multiples so the payloads sit back-to-back with no padding —
+        // all zero, hence byte-identical across layers (one FNV name).
+        let ffn_bytes = u64::from(M6_N_EMBD) * u64::from(M6_N_FF) * 4;
+        assert!(ffn_bytes > M6_RPC_HASH_THRESHOLD, "{ffn_bytes}");
+        assert_eq!(ffn_bytes % 32, 0);
+        assert!(dims.total_weight_bytes > 6 * ffn_bytes);
+        // Keep the sim fast: the whole synthetic file stays under 70 MB.
+        assert!(bytes.len() < 70 << 20, "{}", bytes.len());
+        // The data section is pure zeros (weights carry no information).
+        let data_start = bytes.len() as u64 - dims.total_weight_bytes;
+        assert!(bytes[data_start as usize..].iter().all(|b| *b == 0));
+    }
+
+    #[test]
+    fn m6_ref_constants_follow_the_registry_derivation() {
+        // Mirror of onebrain-models::registry's hf: rules (xtask depends on
+        // no workspace crates, so the derivation is pinned here against
+        // drift): URL path `/<org>/<repo>/resolve/main/<file>`, cache id
+        // `hf--<org>--<repo>--<file stem>`.
+        let rest = M6_MODEL_REF.strip_prefix("hf:").unwrap();
+        let mut parts = rest.splitn(3, '/');
+        let (org, repo, file) = (
+            parts.next().unwrap(),
+            parts.next().unwrap(),
+            parts.next().unwrap(),
+        );
+        assert_eq!(M6_URL_PATH, format!("/{org}/{repo}/resolve/main/{file}"));
+        assert_eq!(file, M6_FILE_NAME);
+        let stem = file.strip_suffix(".gguf").unwrap();
+        assert_eq!(M6_CACHE_ID, format!("hf--{org}--{repo}--{stem}"));
+        // The id must survive the registry's sanitize_component unchanged
+        // (alphanumerics plus `.-_`), or the daemon's cache dir would not
+        // match the paths the sim asserts on.
+        assert!(M6_CACHE_ID
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')));
+    }
+
+    #[test]
+    fn m6_wan_request_parsing_handles_ranges() {
+        let full = parse_wan_request("GET /x HTTP/1.1\r\nHost: h\r\n").unwrap();
+        assert_eq!(full.method, "GET");
+        assert_eq!(full.path, "/x");
+        assert_eq!(full.range, None);
+
+        let open = parse_wan_request("GET /x HTTP/1.1\r\nRange: bytes=100-\r\n").unwrap();
+        assert_eq!(open.range, Some((100, None)));
+        // Header names are case-insensitive; bounded ends are inclusive.
+        let bounded = parse_wan_request("GET /x HTTP/1.1\r\nrange: bytes=0-4095\r\n").unwrap();
+        assert_eq!(bounded.range, Some((0, Some(4095))));
+
+        assert!(parse_wan_request("").is_none());
+        assert!(parse_wan_request("GET\r\n").is_none());
+        // A malformed range spec makes the whole request unparsable (400).
+        assert!(parse_wan_request("GET /x HTTP/1.1\r\nRange: bytes=a-b\r\n").is_none());
+    }
+
+    #[test]
+    fn m6_fake_wan_serves_and_counts_body_bytes() {
+        let body: Vec<u8> = (0u32..100_000).map(|i| (i % 251) as u8).collect();
+        let wan = start_fake_wan(Arc::new(body.clone())).unwrap();
+        let client = reqwest::blocking::Client::new();
+        let url = format!("{}{}", wan.base_url, M6_URL_PATH);
+
+        let got = client.get(&url).send().unwrap();
+        assert_eq!(got.status().as_u16(), 200);
+        assert_eq!(got.bytes().unwrap().as_ref(), &body[..]);
+        assert_eq!(wan.served(), body.len() as u64);
+
+        // Bounded range (inclusive end, as the range fetcher sends).
+        let got = client
+            .get(&url)
+            .header("Range", "bytes=10-19")
+            .send()
+            .unwrap();
+        assert_eq!(got.status().as_u16(), 206);
+        assert_eq!(
+            got.headers()
+                .get("content-range")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            format!("bytes 10-19/{}", body.len())
+        );
+        assert_eq!(got.bytes().unwrap().as_ref(), &body[10..20]);
+        assert_eq!(wan.served(), body.len() as u64 + 10);
+
+        // Open-ended resume from near the end.
+        let start = body.len() - 5;
+        let got = client
+            .get(&url)
+            .header("Range", format!("bytes={start}-"))
+            .send()
+            .unwrap();
+        assert_eq!(got.status().as_u16(), 206);
+        assert_eq!(got.bytes().unwrap().as_ref(), &body[start..]);
+
+        // Wrong path: 404, nothing counted.
+        let before = wan.served();
+        let got = client.get(format!("{}/nope", wan.base_url)).send().unwrap();
+        assert_eq!(got.status().as_u16(), 404);
+        assert_eq!(wan.served(), before);
+
+        // Unsatisfiable range: 416, nothing counted.
+        let got = client
+            .get(&url)
+            .header("Range", format!("bytes={}-", body.len()))
+            .send()
+            .unwrap();
+        assert_eq!(got.status().as_u16(), 416);
+        assert_eq!(wan.served(), before);
+    }
+
+    #[test]
+    fn m6_log_line_parsers_match_the_daemon_formats() {
+        // Exact formats from onebraind::logistics (the grep-stable
+        // contract), wrapped in a realistic tracing-fmt prefix.
+        let line = "2026-08-27T00:00:00.000000Z  INFO onebraind::logistics: \
+                    logistics: fetched 123 bytes p2p, 456 bytes wan for hf--o--r--m";
+        assert_eq!(parse_fetch_summary(line), Some((123, 456)));
+        assert_eq!(parse_fetch_summary("no such line"), None);
+
+        let line = "2026-08-27T00:00:00.000000Z  INFO onebraind::logistics: \
+                    rpc-cache: pre-seeded 3 tensors (31536000 bytes) for epoch 17";
+        assert_eq!(parse_preseed_line(line), Some((3, 31_536_000, 17)));
+        assert_eq!(
+            parse_preseed_line("rpc-cache: 3 tensors already present"),
+            None
+        );
+
+        let line = "2026-08-27T00:00:00.000000Z  INFO onebraind::logistics: \
+                    rpc-cache: 3 tensors already present";
+        assert_eq!(parse_present_line(line), Some(3));
+        // The pre-seed line never satisfies the already-present parser.
+        assert_eq!(
+            parse_present_line("rpc-cache: pre-seeded 3 tensors (1 bytes) for epoch 2"),
+            None
+        );
     }
 }
