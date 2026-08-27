@@ -13,6 +13,7 @@ onebrain-engine = { workspace = true }
 onebrain-mesh = { workspace = true }
 onebrain-api = { workspace = true }
 onebrain-models = { workspace = true }
+onebrain-scheduler = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }

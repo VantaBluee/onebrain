@@ -155,12 +155,16 @@ impl DaemonClient {
     }
 
     /// `POST /api/internal/load` — NDJSON progress stream. `on_progress`
-    /// sees every intermediate line (`downloading`, `loading`); the
-    /// terminal line (`ready` or `error`) is returned instead.
+    /// sees every intermediate line (`downloading`, `planning`, `plan`,
+    /// `loading`); the terminal line (`ready` or `error`) is returned
+    /// instead. `nodes`/`explain` pass `--nodes`/`--explain` through per
+    /// docs/distributed.md (M3).
     pub fn load(
         &self,
         model: &str,
         ctx: Option<u32>,
+        nodes: Option<u32>,
+        explain: bool,
         on_progress: impl FnMut(&serde_json::Value),
     ) -> Result<serde_json::Value, ClientError> {
         let mut body = serde_json::json!({ "model": model });
@@ -168,6 +172,12 @@ impl DaemonClient {
             // The daemon may ignore unknown fields in M1; sent anyway for
             // forward compatibility.
             body["ctx"] = n.into();
+        }
+        if let Some(n) = nodes {
+            body["nodes"] = n.into();
+        }
+        if explain {
+            body["explain"] = true.into();
         }
         let url = format!("{}/api/internal/load", self.base_url);
         let resp = self

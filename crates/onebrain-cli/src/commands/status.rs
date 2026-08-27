@@ -1,9 +1,10 @@
-//! `onebrain status`: node, version, engine, loaded model, endpoint, and
-//! API token — or exit 1 with a remedy when the daemon isn't running.
+//! `onebrain status`: node, version, engine, loaded model, active
+//! placement plan (M3), endpoint, and API token — or exit 1 with a remedy
+//! when the daemon isn't running.
 
 use onebraind::paths::AppPaths;
 
-use super::{human_bytes, node_name, CliError};
+use super::{human_bytes, node_name, plan_lines, CliError};
 use crate::client::DaemonClient;
 
 pub fn run(json: bool) -> Result<(), CliError> {
@@ -50,6 +51,13 @@ pub fn run(json: bool) -> Result<(), CliError> {
         .get("model")
         .cloned()
         .unwrap_or(serde_json::Value::Null);
+    // Active placement plan (M3). Tolerate both field spellings and its
+    // absence (a pre-M3 daemon, or nothing loaded) — `null` either way.
+    let plan = status
+        .get("plan")
+        .or_else(|| status.get("active_plan"))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
     let endpoint = client.base_url().to_string();
 
     // Peer list (M2). `null` when the endpoint is unavailable — e.g. a
@@ -72,6 +80,7 @@ pub fn run(json: bool) -> Result<(), CliError> {
                 "uptime_secs": status.get("uptime_secs").cloned().unwrap_or(serde_json::Value::Null),
                 "started_unix": client.state().started_unix,
                 "model": model,
+                "plan": plan,
                 "endpoint": endpoint,
                 "openai_base_url": format!("{endpoint}/v1"),
                 "token": client.token(),
@@ -102,6 +111,15 @@ pub fn run(json: bool) -> Result<(), CliError> {
             println!("model     {name}");
         } else {
             println!("model     {name} ({})", details.join(", "));
+        }
+    }
+    if !plan.is_null() {
+        let mut lines = plan_lines(&plan).into_iter();
+        if let Some(headline) = lines.next() {
+            println!("plan      {headline}");
+        }
+        for line in lines {
+            println!("          {line}");
         }
     }
     println!("endpoint  {endpoint}");

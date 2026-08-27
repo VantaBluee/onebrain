@@ -17,9 +17,11 @@ use onebrain_api::backend::{
     TokenEvent,
 };
 use onebrain_api::ApiError;
+use onebrain_engine::rpc::RemoteServer;
 use onebrain_engine::{FinishReason, Model, ModelParams, SamplerParams, Session, SessionParams};
 use onebrain_models::registry::{ModelRef, Resolved};
 use onebrain_models::{cache, download};
+use onebrain_proto::plan::Epoch;
 use serde::Serialize;
 use tokio::sync::{mpsc, oneshot};
 
@@ -55,6 +57,30 @@ pub enum HostMsg {
         progress: mpsc::UnboundedSender<LoadProgress>,
         resp: oneshot::Sender<Result<LoadedModel, String>>,
     },
+    /// Head side of a distributed plan (docs/distributed.md): register the
+    /// bridged loopback RPC endpoints and load the model split across their
+    /// devices plus (optionally) this node's own. The daemon must have the
+    /// accept-once bridges pumping BEFORE sending this — registration
+    /// connects out synchronously. The loaded model serves generations
+    /// exactly like a solo one.
+    LoadDistributed {
+        /// Local GGUF path (the head holds the full file — ADR 0004).
+        path: PathBuf,
+        /// The reference the user loaded by (accepted as a model name in
+        /// generation requests, like the solo path).
+        reference: String,
+        /// Canonical display name for the loaded model.
+        name: String,
+        ctx_len: u32,
+        /// Bridged loopback endpoints ("127.0.0.1:<port>"), in plan stage
+        /// order (workers first).
+        endpoints: Vec<String>,
+        /// One fraction per device: remote devices in `endpoints` order,
+        /// then the local device when `use_local_device`.
+        tensor_split: Vec<f32>,
+        use_local_device: bool,
+        resp: oneshot::Sender<Result<LoadedModel, String>>,
+    },
     /// Run one generation; all outcomes flow through `job.tx`.
     Generate(GenerateJob),
     /// Ask what is loaded. Answered over a std channel so non-async callers
@@ -64,6 +90,18 @@ pub enum HostMsg {
     Models {
         resp: std_mpsc::SyncSender<Option<LoadedModel>>,
     },
+    /// Worker side of a distributed plan: this node is about to serve a
+    /// pipeline shard for `epoch`. Any locally loaded model is unloaded
+    /// (M3 contract: adopting a plan preempts local models — the memory is
+    /// needed for the shard the head is about to push). The RPC serve
+    /// threads themselves are owned by the daemon's cluster task, not this
+    /// host.
+    ServeShard { epoch: Epoch },
+    /// Drop any loaded model + session (epoch teardown, model swap). The
+    /// reply is sent AFTER the drop completes, so callers can sequence
+    /// teardown (free the model while RPC bridges are still alive, then
+    /// close the bridges — GGML aborts on a torn stream, ADR 0004).
+    Unload { resp: oneshot::Sender<()> },
     /// Drop model + session and exit the thread.
     Shutdown,
 }
@@ -109,13 +147,31 @@ struct ResolvedLocal {
     size_bytes: u64,
 }
 
-/// One pending load request (carried across the host loop's phases).
+/// One pending solo load request (carried across the host loop's phases).
 struct LoadReq {
     reference: String,
     cache_root: PathBuf,
     ctx_len: u32,
     progress: mpsc::UnboundedSender<LoadProgress>,
     resp: oneshot::Sender<Result<LoadedModel, String>>,
+}
+
+/// One pending distributed load request.
+struct DistLoadReq {
+    path: PathBuf,
+    reference: String,
+    name: String,
+    ctx_len: u32,
+    endpoints: Vec<String>,
+    tensor_split: Vec<f32>,
+    use_local_device: bool,
+    resp: oneshot::Sender<Result<LoadedModel, String>>,
+}
+
+/// A load request of either flavor, stashed while the current model drops.
+enum Pending {
+    Solo(LoadReq),
+    Dist(DistLoadReq),
 }
 
 fn host_loop(rx: std_mpsc::Receiver<HostMsg>) {
@@ -125,7 +181,10 @@ fn host_loop(rx: std_mpsc::Receiver<HostMsg>) {
         .build()
         .expect("building the download runtime failed; the system is out of resources");
 
-    let mut pending: Option<LoadReq> = None;
+    let mut pending: Option<Pending> = None;
+    // Worker state: the epoch this node is serving a shard for (informational
+    // — the serve threads live in the daemon's cluster task).
+    let mut serving_shard: Option<u64> = None;
     'outer: loop {
         // Phase 1: nothing loaded — wait for a load request.
         let req = match pending.take() {
@@ -137,9 +196,22 @@ fn host_loop(rx: std_mpsc::Receiver<HostMsg>) {
                         let _ = resp.try_send(None);
                     }
                     Ok(HostMsg::Generate(job)) => {
-                        let _ = job
-                            .tx
-                            .blocking_send(TokenEvent::Error(ApiError::NoModel.to_string()));
+                        let message = match serving_shard {
+                            Some(epoch) => format!(
+                                "{} (this node is serving a pipeline shard for epoch {epoch}; \
+                                 send generations to the cluster head)",
+                                ApiError::NoModel
+                            ),
+                            None => ApiError::NoModel.to_string(),
+                        };
+                        let _ = job.tx.blocking_send(TokenEvent::Error(message));
+                    }
+                    Ok(HostMsg::ServeShard { epoch }) => {
+                        tracing::info!(epoch = epoch.0, "engine host entering shard-serving state");
+                        serving_shard = Some(epoch.0);
+                    }
+                    Ok(HostMsg::Unload { resp }) => {
+                        let _ = resp.send(()); // nothing loaded; trivially done
                     }
                     Ok(HostMsg::Load {
                         reference,
@@ -148,56 +220,132 @@ fn host_loop(rx: std_mpsc::Receiver<HostMsg>) {
                         progress,
                         resp,
                     }) => {
-                        break LoadReq {
+                        break Pending::Solo(LoadReq {
                             reference,
                             cache_root,
                             ctx_len,
                             progress,
                             resp,
-                        }
+                        })
+                    }
+                    Ok(HostMsg::LoadDistributed {
+                        path,
+                        reference,
+                        name,
+                        ctx_len,
+                        endpoints,
+                        tensor_split,
+                        use_local_device,
+                        resp,
+                    }) => {
+                        break Pending::Dist(DistLoadReq {
+                            path,
+                            reference,
+                            name,
+                            ctx_len,
+                            endpoints,
+                            tensor_split,
+                            use_local_device,
+                            resp,
+                        })
                     }
                 }
             },
         };
 
-        // Phase 2: resolve + download + load + session.
-        let LoadReq {
-            reference,
-            cache_root,
-            ctx_len,
-            progress,
-            resp,
-        } = req;
-        let resolved = match ensure_local(&rt, &reference, &cache_root, &progress) {
-            Ok(r) => r,
-            Err(message) => {
+        // Phase 2: obtain a loaded model (solo: resolve + download + load;
+        // distributed: register bridged RPC servers + split load).
+        let (model, info, reference, resp) = match req {
+            Pending::Solo(req) => {
+                let LoadReq {
+                    reference,
+                    cache_root,
+                    ctx_len,
+                    progress,
+                    resp,
+                } = req;
+                let resolved = match ensure_local(&rt, &reference, &cache_root, &progress) {
+                    Ok(r) => r,
+                    Err(message) => {
+                        drop(progress);
+                        let _ = resp.send(Err(message));
+                        continue 'outer;
+                    }
+                };
+                let _ = progress.send(LoadProgress::Loading);
+                // Close the progress stream: everything after this point is
+                // the terminal line, delivered via `resp`.
                 drop(progress);
-                let _ = resp.send(Err(message));
-                continue 'outer;
-            }
-        };
-        let _ = progress.send(LoadProgress::Loading);
-        // Close the progress stream: everything after this point is the
-        // terminal line, delivered via `resp`.
-        drop(progress);
 
-        let model = match Model::load(&resolved.path, &ModelParams::default()) {
-            Ok(m) => m,
-            Err(e) => {
-                let _ = resp.send(Err(e.to_string()));
-                continue 'outer;
+                let model = match Model::load(&resolved.path, &ModelParams::default()) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        let _ = resp.send(Err(e.to_string()));
+                        continue 'outer;
+                    }
+                };
+                let info = LoadedModel {
+                    name: resolved.name,
+                    size_bytes: resolved.size_bytes,
+                    n_layer: model.n_layer(),
+                    n_ctx: ctx_len,
+                };
+                (model, info, reference, resp)
             }
-        };
-        let info = LoadedModel {
-            name: resolved.name,
-            size_bytes: resolved.size_bytes,
-            n_layer: model.n_layer(),
-            n_ctx: ctx_len,
+            Pending::Dist(req) => {
+                let DistLoadReq {
+                    path,
+                    reference,
+                    name,
+                    ctx_len,
+                    endpoints,
+                    tensor_split,
+                    use_local_device,
+                    resp,
+                } = req;
+                let mut servers = Vec::with_capacity(endpoints.len());
+                let mut register_error = None;
+                for endpoint in &endpoints {
+                    match RemoteServer::register(endpoint) {
+                        Ok(server) => servers.push(server),
+                        Err(e) => {
+                            register_error = Some(e.to_string());
+                            break;
+                        }
+                    }
+                }
+                if let Some(message) = register_error {
+                    let _ = resp.send(Err(message));
+                    continue 'outer;
+                }
+                let server_refs: Vec<&RemoteServer> = servers.iter().collect();
+                let model = match Model::load_distributed(
+                    &path,
+                    &server_refs,
+                    &tensor_split,
+                    use_local_device,
+                    &ModelParams::default(),
+                ) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        let _ = resp.send(Err(e.to_string()));
+                        continue 'outer;
+                    }
+                };
+                let size_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                let info = LoadedModel {
+                    name,
+                    size_bytes,
+                    n_layer: model.n_layer(),
+                    n_ctx: ctx_len,
+                };
+                (model, info, reference, resp)
+            }
         };
         let mut session = match Session::new(
             &model,
             &SessionParams {
-                n_ctx: ctx_len,
+                n_ctx: info.n_ctx,
                 n_batch: 512,
                 n_threads: 0,
             },
@@ -211,7 +359,8 @@ fn host_loop(rx: std_mpsc::Receiver<HostMsg>) {
         tracing::info!(model = %info.name, n_layer = info.n_layer, n_ctx = info.n_ctx, "model loaded");
         let _ = resp.send(Ok(info.clone()));
 
-        // Phase 3: serve jobs until another load replaces this model.
+        // Phase 3: serve jobs until another load replaces this model, an
+        // unload tears it down, or a plan turns this node into a worker.
         loop {
             match rx.recv() {
                 Err(_) | Ok(HostMsg::Shutdown) => return,
@@ -219,6 +368,29 @@ fn host_loop(rx: std_mpsc::Receiver<HostMsg>) {
                     let _ = resp.try_send(Some(info.clone()));
                 }
                 Ok(HostMsg::Generate(job)) => run_generation(&mut session, &info, &reference, job),
+                Ok(HostMsg::Unload { resp }) => {
+                    tracing::info!(model = %info.name, "unloading model");
+                    // Drop BEFORE replying: the daemon sequences epoch
+                    // teardown on this reply (free the model while its RPC
+                    // bridges still stand, then close them — ADR 0004).
+                    drop(session);
+                    drop(model);
+                    let _ = resp.send(());
+                    continue 'outer;
+                }
+                Ok(HostMsg::ServeShard { epoch }) => {
+                    // M3 contract: adopting a plan while a local model is
+                    // loaded unloads it — the plan needs this node's memory.
+                    tracing::info!(
+                        model = %info.name,
+                        epoch = epoch.0,
+                        "unloading local model to serve a plan shard"
+                    );
+                    serving_shard = Some(epoch.0);
+                    drop(session);
+                    drop(model);
+                    continue 'outer;
+                }
                 Ok(HostMsg::Load {
                     reference,
                     cache_root,
@@ -227,15 +399,38 @@ fn host_loop(rx: std_mpsc::Receiver<HostMsg>) {
                     resp,
                 }) => {
                     tracing::info!(model = %info.name, next = %reference, "unloading for a new model");
-                    pending = Some(LoadReq {
+                    pending = Some(Pending::Solo(LoadReq {
                         reference,
                         cache_root,
                         ctx_len,
                         progress,
                         resp,
-                    });
+                    }));
                     // Loading a second model unloads the first (contract):
                     // `session` and `model` drop as this scope ends.
+                    continue 'outer;
+                }
+                Ok(HostMsg::LoadDistributed {
+                    path,
+                    reference,
+                    name,
+                    ctx_len,
+                    endpoints,
+                    tensor_split,
+                    use_local_device,
+                    resp,
+                }) => {
+                    tracing::info!(model = %info.name, next = %reference, "unloading for a distributed load");
+                    pending = Some(Pending::Dist(DistLoadReq {
+                        path,
+                        reference,
+                        name,
+                        ctx_len,
+                        endpoints,
+                        tensor_split,
+                        use_local_device,
+                        resp,
+                    }));
                     continue 'outer;
                 }
             }
@@ -293,12 +488,12 @@ fn ensure_local(
 /// Rate-limits download progress events: the first report, then every 1% of
 /// the total (at least 1 MiB), plus the final byte, get through.
 #[derive(Debug, Default)]
-struct ProgressThrottle {
+pub(crate) struct ProgressThrottle {
     last: Option<u64>,
 }
 
 impl ProgressThrottle {
-    fn should_emit(&mut self, completed: u64, total: u64) -> bool {
+    pub(crate) fn should_emit(&mut self, completed: u64, total: u64) -> bool {
         const MIN_STEP: u64 = 1024 * 1024;
         let step = (total / 100).max(MIN_STEP);
         let emit = match self.last {

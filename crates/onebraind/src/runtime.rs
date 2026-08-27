@@ -5,13 +5,14 @@
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use onebrain_api::auth::AuthConfig;
 use onebrain_api::ApiState;
 use onebrain_mesh::{identity, MeshConfig, MeshHandle, MeshService};
 use tokio::sync::Notify;
 
+use crate::cluster::{self, ClusterState};
 use crate::config::Config;
 use crate::engine_host::{DaemonBackend, EngineHost, HostMsg};
 use crate::lock::{self, DaemonLock, RunInfo};
@@ -73,10 +74,25 @@ pub fn run_blocking() -> Result<(), DaemonError> {
         .build()
         .map_err(|source| DaemonError::Runtime { source })?;
 
+    // NodeStatus provider: the schedulable memory this node reports to
+    // peers and budgets for itself — the CPU device's free memory minus the
+    // OS reserve, or the test-only `[debug]` override (docs/distributed.md).
+    let debug_override = config.debug.usable_memory_override_bytes;
+    let bind_addrs = match &config.mesh.bind_addr {
+        Some(addr) => vec![addr.parse().map_err(|e| DaemonError::ConfigParse {
+            path: paths.config_file().display().to_string(),
+            source: Box::new(serde::de::Error::custom(format!(
+                "[mesh] bind_addr {addr:?} is not a socket address: {e}"
+            ))),
+        })?],
+        None => Vec::new(),
+    };
     let mesh_config = MeshConfig {
         enable_mdns: config.mesh.enable_mdns,
         enable_relays: config.mesh.enable_relays,
+        bind_addrs,
         engine_build: onebrain_engine::engine_build_hash().0,
+        node_status: Some(Arc::new(move || cluster::local_node_status(debug_override))),
         ..MeshConfig::default()
     };
     let served = match runtime.block_on(MeshService::spawn(
@@ -86,6 +102,27 @@ pub fn run_blocking() -> Result<(), DaemonError> {
         mesh_config,
     )) {
         Ok(mesh) => {
+            // Cluster task: consumes plan traffic and rpc streams from the
+            // mesh (worker path) and records acks (head path).
+            let cluster = ClusterState::new();
+            let cluster_task = runtime.block_on(async {
+                let ctrl_rx = mesh.incoming_control().await?;
+                let rpc_rx = mesh.incoming_rpc().await?;
+                Ok::<_, onebrain_mesh::MeshError>(cluster::spawn_cluster_task(
+                    mesh.clone(),
+                    host.clone(),
+                    cluster.clone(),
+                    ctrl_rx,
+                    rpc_rx,
+                ))
+            });
+            let cluster_task = match cluster_task {
+                Ok(task) => Some(task),
+                Err(err) => {
+                    tracing::error!(error = %err, "cluster task unavailable; distributed plans are disabled this run");
+                    None
+                }
+            };
             let served = runtime.block_on(serve(
                 &config,
                 token,
@@ -93,19 +130,40 @@ pub fn run_blocking() -> Result<(), DaemonError> {
                 &cache_root,
                 &run_dir,
                 mesh.clone(),
+                cluster.clone(),
+                debug_override,
             ));
+            // Teardown ordering (ADR 0004): free any loaded model FIRST —
+            // a distributed head model sends remote frees over its rpc
+            // bridges, and GGML aborts on a torn stream — then close the
+            // mesh (which ends bridges and worker serve sessions).
+            let (unload_tx, unload_rx) = tokio::sync::oneshot::channel();
+            if host.send(HostMsg::Unload { resp: unload_tx }).is_ok() {
+                let _ = runtime.block_on(async {
+                    tokio::time::timeout(Duration::from_secs(15), unload_rx).await
+                });
+            }
+            cluster.teardown_head_bridges();
             // Close mesh connections and the endpoint before tearing down
             // the rest; peers see a clean close instead of a timeout.
             let _ = runtime.block_on(mesh.shutdown());
+            // The mesh close drops the cluster task's channels; give it a
+            // bounded window to join its worker serve threads.
+            if let Some(task) = cluster_task {
+                let _ = runtime
+                    .block_on(async { tokio::time::timeout(Duration::from_secs(10), task).await });
+            }
             served
         }
         Err(source) => Err(DaemonError::Mesh { source }),
     };
 
     // Teardown in dependency order: stop the engine host (drops Session and
-    // Model), only then free the process-wide engine backend.
+    // Model), stop the runtime (ends any leftover bridge pumps, closing
+    // their sockets), only then free the process-wide engine backend.
     let _ = host.send(HostMsg::Shutdown);
     let _ = host_thread.join();
+    runtime.shutdown_timeout(Duration::from_secs(5));
     onebrain_engine::shutdown();
     lock::remove_run_info(&run_dir);
     drop(lock);
@@ -123,6 +181,7 @@ fn default_node_name() -> String {
         .unwrap_or_else(|| "onebrain-node".to_string())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn serve(
     config: &Config,
     token: String,
@@ -130,6 +189,8 @@ async fn serve(
     cache_root: &Path,
     run_dir: &Path,
     mesh: MeshHandle,
+    cluster: Arc<ClusterState>,
+    usable_memory_override: Option<u64>,
 ) -> Result<(), DaemonError> {
     let product_version: &'static str = env!("CARGO_PKG_VERSION");
     let shutdown = Arc::new(Notify::new());
@@ -168,6 +229,8 @@ async fn serve(
         product_version,
         shutdown: shutdown.clone(),
         mesh,
+        cluster,
+        usable_memory_override,
     });
     let app = onebrain_api::router(api_state).merge(internal_router(internal_state));
 

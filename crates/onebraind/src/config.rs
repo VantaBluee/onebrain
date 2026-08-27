@@ -27,6 +27,21 @@ pub struct Config {
     pub ctx_len: u32,
     /// Mesh transport switches (`[mesh]` table, docs/mesh.md).
     pub mesh: MeshSection,
+    /// Test-only knobs (`[debug]` table, docs/distributed.md).
+    pub debug: DebugSection,
+}
+
+/// The `[debug]` table: test-only knobs for the cluster simulator. Nothing
+/// here changes real resource allocation.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DebugSection {
+    /// TEST-ONLY (docs/distributed.md "Tests / DoD hooks"): when set, this
+    /// value replaces the measured usable memory this node reports in
+    /// `NodeStatus` and budgets for itself as head — so the cluster sim can
+    /// cap nodes without cgroups. It never touches real allocation; the
+    /// engine will still use whatever memory the load actually needs.
+    pub usable_memory_override_bytes: Option<u64>,
 }
 
 /// The `[mesh]` table: switches passed to `onebrain-mesh::MeshConfig`.
@@ -40,6 +55,12 @@ pub struct MeshSection {
     /// Use n0's relay + pkarr infrastructure for dial-by-key across
     /// networks. Off, only direct addresses (tickets, mDNS) can connect.
     pub enable_relays: bool,
+    /// Pin the mesh's UDP socket to a fixed address (e.g.
+    /// "0.0.0.0:4711", or "127.0.0.1:<port>" in tests). Unset = an
+    /// ephemeral port chosen by iroh. Pinning keeps peers' stored
+    /// addresses valid across daemon restarts and simplifies firewall
+    /// rules.
+    pub bind_addr: Option<String>,
 }
 
 impl Default for MeshSection {
@@ -47,6 +68,7 @@ impl Default for MeshSection {
         MeshSection {
             enable_mdns: true,
             enable_relays: true,
+            bind_addr: None,
         }
     }
 }
@@ -60,6 +82,7 @@ impl Default for Config {
             api_bind: "127.0.0.1:11435".to_string(),
             ctx_len: 4096,
             mesh: MeshSection::default(),
+            debug: DebugSection::default(),
         }
     }
 }
@@ -161,6 +184,55 @@ mod tests {
             Config::load(&path),
             Err(DaemonError::ConfigParse { .. })
         ));
+    }
+
+    #[test]
+    fn debug_section_defaults_to_no_override() {
+        let c = Config::default();
+        assert_eq!(c.debug.usable_memory_override_bytes, None);
+        // A config file without a [debug] table parses to the same default.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "ctx_len = 2048\n").unwrap();
+        assert_eq!(Config::load(&path).unwrap().debug, DebugSection::default());
+    }
+
+    #[test]
+    fn debug_override_parses() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[debug]\nusable_memory_override_bytes = 1073741824\n",
+        )
+        .unwrap();
+        let c = Config::load(&path).unwrap();
+        assert_eq!(c.debug.usable_memory_override_bytes, Some(1 << 30));
+    }
+
+    #[test]
+    fn unknown_keys_in_debug_section_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[debug]\nusable_memory_override = 5\n").unwrap();
+        assert!(matches!(
+            Config::load(&path),
+            Err(DaemonError::ConfigParse { .. })
+        ));
+    }
+
+    #[test]
+    fn debug_section_roundtrips_through_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let c = Config {
+            debug: DebugSection {
+                usable_memory_override_bytes: Some(256 * 1024 * 1024),
+            },
+            ..Default::default()
+        };
+        c.save(&path).unwrap();
+        assert_eq!(Config::load(&path).unwrap(), c);
     }
 
     #[test]

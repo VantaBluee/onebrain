@@ -1,12 +1,13 @@
 //! `onebrain run <model>`: ensure the daemon is up, stream the load
-//! progress, then print how to talk to the model (endpoint, OpenAI base
-//! URL, token, example curl).
+//! progress (including the M3 `planning`/`plan` placement lines), then
+//! print how to talk to the model (endpoint, OpenAI base URL, token,
+//! example curl).
 
 use std::io::Write;
 
 use onebraind::paths::AppPaths;
 
-use super::{up, CliError};
+use super::{plan_lines, up, CliError};
 
 pub fn run(
     model: &str,
@@ -15,19 +16,12 @@ pub fn run(
     nodes: Option<u32>,
     json: bool,
 ) -> Result<(), CliError> {
-    if explain || nodes.is_some() {
-        eprintln!(
-            "note: --explain and --nodes engage with distributed inference (milestone M3); \
-             M1 always runs single-node."
-        );
-    }
-
     let paths = AppPaths::resolve()?;
     let outcome = up::ensure_up(&paths)?;
     let client = outcome.client;
 
     let mut progress_line_open = false;
-    let result = client.load(model, ctx, |event| {
+    let result = client.load(model, ctx, nodes, explain, |event| {
         if json {
             // NDJSON pass-through: scripts see exactly what the daemon sent.
             println!("{event}");
@@ -50,6 +44,37 @@ pub fn run(
                 }
                 std::io::stdout().flush().ok();
                 progress_line_open = true;
+            }
+            Some("planning") => {
+                if progress_line_open {
+                    println!();
+                    progress_line_open = false;
+                }
+                println!("planning placement...");
+            }
+            Some("plan") => {
+                if progress_line_open {
+                    println!();
+                    progress_line_open = false;
+                }
+                let plan = event
+                    .get("plan")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                let mut lines = plan_lines(&plan).into_iter();
+                if let Some(headline) = lines.next() {
+                    println!("plan: {headline}");
+                }
+                for line in lines {
+                    println!("  {line}");
+                }
+                // The prose is what `--explain` asked for; without the flag
+                // the summary above suffices.
+                if explain {
+                    if let Some(why) = plan.get("explanation").and_then(|w| w.as_str()) {
+                        println!("why: {why}");
+                    }
+                }
             }
             Some("loading") => {
                 if progress_line_open {

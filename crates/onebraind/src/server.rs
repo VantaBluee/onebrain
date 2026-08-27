@@ -16,11 +16,17 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use onebrain_api::auth::AuthConfig;
+use onebrain_api::ApiError;
 use onebrain_mesh::{MeshError, MeshHandle, PairEvent, PairTarget, PeerState};
+use onebrain_models::registry::{ModelRef, Resolved};
+use onebrain_proto::message::{Envelope, Message};
+use onebrain_proto::plan::{NodeId, Plan, Strategy};
+use onebrain_scheduler::{NodeBudget, PlanInput};
 use tokio::sync::{mpsc, oneshot, Notify};
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::engine_host::{EngineHost, HostMsg, LoadProgress};
+use crate::cluster::{ActivePlanView, ClusterState};
+use crate::engine_host::{EngineHost, HostMsg, LoadProgress, ProgressThrottle};
 
 /// Shared state for the internal router.
 pub struct InternalState {
@@ -37,6 +43,10 @@ pub struct InternalState {
     pub shutdown: Arc<Notify>,
     /// Handle to the mesh service (pairing, peers, link state).
     pub mesh: MeshHandle,
+    /// Cluster-session state: epoch counter, active plan, plan acks.
+    pub cluster: Arc<ClusterState>,
+    /// Test-only `[debug] usable_memory_override_bytes` (docs/distributed.md).
+    pub usable_memory_override: Option<u64>,
 }
 
 /// Build the internal router with its always-on token middleware.
@@ -111,23 +121,296 @@ async fn status(State(state): State<Arc<InternalState>>) -> Json<serde_json::Val
         "uptime_secs": state.started.elapsed().as_secs(),
         "model": model,
         "peers_summary": { "paired": peer_list.len(), "connected": connected },
+        // docs/distributed.md: the active plan (epoch, strategy,
+        // assignments) or null when nothing distributed is active.
+        "plan": state.cluster.active(),
     }))
 }
 
 #[derive(Debug, serde::Deserialize)]
 struct LoadBody {
     model: String,
+    /// `--nodes N`: force solo (1) or distribution across exactly N nodes.
+    #[serde(default)]
+    nodes: Option<u32>,
+    /// `--explain`: include the scheduler's prose in the `plan` line.
+    #[serde(default)]
+    explain: bool,
 }
 
-/// `POST /api/internal/load` — NDJSON stream of download/load progress with
-/// a terminal `ready` or `error` line (contract).
+/// One NDJSON line sender.
+type LineSender = mpsc::Sender<Result<String, std::convert::Infallible>>;
+
+async fn emit(tx: &LineSender, line: serde_json::Value) -> bool {
+    tx.send(Ok(format!("{line}\n"))).await.is_ok()
+}
+
+async fn emit_error(tx: &LineSender, message: String) {
+    let _ = emit(
+        tx,
+        serde_json::json!({ "status": "error", "message": message }),
+    )
+    .await;
+}
+
+fn ndjson_response(line_rx: mpsc::Receiver<Result<String, std::convert::Infallible>>) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/x-ndjson")
+        .body(axum::body::Body::from_stream(ReceiverStream::new(line_rx)))
+        .expect("static response construction cannot fail")
+}
+
+/// `POST /api/internal/load` — NDJSON stream (contract + docs/distributed.md
+/// "Daemon & API"): `downloading…` lines while the head fetches the full
+/// GGUF, then `planning`, `plan` (with `explanation` when `explain` is set),
+/// then `loading` and the terminal `ready`/`error`. A Solo plan runs the
+/// unchanged single-node path; a PipelineParallel plan drives the epoch
+/// lifecycle (proposals → acks → rpc streams → distributed engine load).
 async fn load(State(state): State<Arc<InternalState>>, Json(body): Json<LoadBody>) -> Response {
+    let (line_tx, line_rx) = mpsc::channel::<Result<String, std::convert::Infallible>>(32);
+    tokio::spawn(drive_load(state, body, line_tx));
+    ndjson_response(line_rx)
+}
+
+/// A model reference resolved to a local file (downloaded if needed).
+struct LocalModel {
+    path: PathBuf,
+    name: String,
+    size_bytes: u64,
+}
+
+/// Resolve + download the reference, emitting `downloading` lines. `None`
+/// means an error line was already emitted.
+async fn ensure_local(
+    state: &Arc<InternalState>,
+    reference: &str,
+    tx: &LineSender,
+) -> Option<LocalModel> {
+    let model_ref: ModelRef = match reference.parse() {
+        Ok(r) => r,
+        Err(e) => {
+            emit_error(tx, format!("{e}")).await;
+            return None;
+        }
+    };
+    let resolved = match model_ref.resolve() {
+        Ok(r) => r,
+        Err(e) => {
+            emit_error(tx, format!("{e}")).await;
+            return None;
+        }
+    };
+    match resolved {
+        Resolved::Local(path) => {
+            let meta = match std::fs::metadata(&path) {
+                Ok(m) => m,
+                Err(e) => {
+                    emit_error(
+                        tx,
+                        format!(
+                            "cannot read local model {}: {e}; check the path exists and is \
+                             readable",
+                            path.display()
+                        ),
+                    )
+                    .await;
+                    return None;
+                }
+            };
+            let stem = path
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "model".to_string());
+            Some(LocalModel {
+                name: format!("local:{stem}"),
+                size_bytes: meta.len(),
+                path,
+            })
+        }
+        Resolved::Remote(spec) => {
+            let dest_dir = state.cache_root.join(&spec.cache_key);
+            let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<(u64, u64)>();
+            let mut throttle = ProgressThrottle::default();
+            let download =
+                onebrain_models::download::download(&spec, &dest_dir, move |completed, total| {
+                    if throttle.should_emit(completed, total) {
+                        let _ = progress_tx.send((completed, total));
+                    }
+                });
+            tokio::pin!(download);
+            loop {
+                tokio::select! {
+                    result = &mut download => match result {
+                        Ok(path) => {
+                            let size_bytes =
+                                std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                            return Some(LocalModel {
+                                name: spec.cache_key.clone(),
+                                path,
+                                size_bytes,
+                            });
+                        }
+                        Err(e) => {
+                            emit_error(tx, e.to_string()).await;
+                            return None;
+                        }
+                    },
+                    Some((completed, total)) = progress_rx.recv() => {
+                        // A gone client does not cancel the download: model
+                        // presence is daemon-level state (M1 contract).
+                        let _ = emit(tx, serde_json::json!({
+                            "status": "downloading", "completed": completed, "total": total,
+                        })).await;
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn drive_load(state: Arc<InternalState>, body: LoadBody, tx: LineSender) {
+    // Phase A: the head holds the full GGUF (ADR 0004 head-push weight
+    // flow) — make it local before planning needs its header.
+    let Some(local) = ensure_local(&state, &body.model, &tx).await else {
+        return;
+    };
+
+    // Phase B: plan.
+    let _ = emit(&tx, serde_json::json!({ "status": "planning" })).await;
+    let override_bytes = state.usable_memory_override;
+    let head_status =
+        tokio::task::spawn_blocking(move || crate::cluster::local_node_status(override_bytes))
+            .await;
+    let Ok((head_usable, _devices)) = head_status else {
+        emit_error(
+            &tx,
+            "measuring local memory failed; retry the load".to_string(),
+        )
+        .await;
+        return;
+    };
+    let peers = match state.mesh.peers().await {
+        Ok(p) => p,
+        Err(e) => {
+            emit_error(&tx, e.to_string()).await;
+            return;
+        }
+    };
+    // Workers eligible for this plan: connected peers that reported a
+    // budget via NodeStatus, in the mesh's (name-sorted, deterministic)
+    // order.
+    let workers: Vec<NodeBudget> = peers
+        .iter()
+        .filter(|p| p.state == PeerState::Connected)
+        .filter_map(|p| {
+            p.usable_memory_bytes.map(|bytes| NodeBudget {
+                node: NodeId(p.id.clone()),
+                usable_memory_bytes: bytes,
+            })
+        })
+        .collect();
+    let header_path = local.path.clone();
+    let n_layers =
+        match tokio::task::spawn_blocking(move || crate::cluster::gguf_layer_count(&header_path))
+            .await
+        {
+            Ok(Ok(n)) if n > 0 => n,
+            Ok(Ok(_)) => {
+                emit_error(
+                    &tx,
+                    format!(
+                        "model {} declares zero transformer layers; the file may be corrupt",
+                        local.path.display()
+                    ),
+                )
+                .await;
+                return;
+            }
+            Ok(Err(message)) => {
+                emit_error(&tx, message).await;
+                return;
+            }
+            Err(_) => {
+                emit_error(
+                    &tx,
+                    "reading the model header failed; retry the load".to_string(),
+                )
+                .await;
+                return;
+            }
+        };
+    let own_id = state.mesh.endpoint_id().to_string();
+    let input = PlanInput {
+        head: NodeBudget {
+            node: NodeId(own_id.clone()),
+            usable_memory_bytes: head_usable,
+        },
+        workers,
+        model_bytes: local.size_bytes,
+        n_layers,
+        ctx_len: state.ctx_len,
+        forced_nodes: body.nodes,
+    };
+    let placed = match onebrain_scheduler::plan(&input) {
+        Ok(p) => p,
+        Err(e) => {
+            emit_error(&tx, e.to_string()).await;
+            return;
+        }
+    };
+    let mut plan = placed.plan;
+    plan.model = local.name.clone();
+    let solo = plan.strategy == Strategy::Solo;
+    if !solo {
+        plan.epoch = state.cluster.next_epoch();
+    }
+    let mut plan_json = serde_json::to_value(&plan).unwrap_or_else(|_| serde_json::json!({}));
+    if body.explain {
+        plan_json["explanation"] = serde_json::json!(placed.explanation);
+    }
+    if !emit(
+        &tx,
+        serde_json::json!({ "status": "plan", "plan": plan_json }),
+    )
+    .await
+    {
+        // Client gone before any side effect: abandon quietly.
+        return;
+    }
+
+    if solo {
+        solo_load(&state, &body.model, plan, placed.explanation, &tx).await;
+    } else {
+        distributed_load(
+            &state,
+            body.model,
+            local,
+            plan,
+            placed.tensor_split,
+            placed.explanation,
+            own_id,
+            &tx,
+        )
+        .await;
+    }
+}
+
+/// The unchanged single-node path: the engine host resolves the (already
+/// cached) reference, loads, and answers; progress is forwarded as NDJSON.
+async fn solo_load(
+    state: &Arc<InternalState>,
+    reference: &str,
+    plan: Plan,
+    explanation: String,
+    tx: &LineSender,
+) {
     let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<LoadProgress>();
     let (resp_tx, resp_rx) = oneshot::channel();
     if state
         .host
         .send(HostMsg::Load {
-            reference: body.model,
+            reference: reference.to_string(),
             cache_root: state.cache_root.clone(),
             ctx_len: state.ctx_len,
             progress: progress_tx,
@@ -135,41 +418,173 @@ async fn load(State(state): State<Arc<InternalState>>, Json(body): Json<LoadBody
         })
         .is_err()
     {
-        return onebrain_api::ApiError::ShuttingDown.into_response();
+        emit_error(tx, ApiError::ShuttingDown.to_string()).await;
+        return;
+    }
+    while let Some(event) = progress_rx.recv().await {
+        let line = match event {
+            LoadProgress::Downloading { completed, total } => serde_json::json!({
+                "status": "downloading", "completed": completed, "total": total,
+            }),
+            LoadProgress::Loading => serde_json::json!({ "status": "loading" }),
+        };
+        // A gone client does not cancel the load: model presence is
+        // daemon-level state, not tied to this request (M1 contract).
+        let _ = emit(tx, line).await;
+    }
+    match resp_rx.await {
+        Ok(Ok(model)) => {
+            state.cluster.set_active(Some(ActivePlanView {
+                role: "head",
+                plan,
+                explanation: Some(explanation),
+            }));
+            // Bridges of any replaced distributed plan are stale now — the
+            // host dropped that model during the swap (ADR 0004 ordering:
+            // model freed first, bridges closed after).
+            state.cluster.teardown_head_bridges();
+            let _ = emit(tx, serde_json::json!({ "status": "ready", "model": model })).await;
+        }
+        Ok(Err(message)) => emit_error(tx, message).await,
+        Err(_) => {
+            emit_error(
+                tx,
+                "the engine host exited unexpectedly; restart with `onebrain up`".to_string(),
+            )
+            .await
+        }
+    }
+}
+
+/// The distributed path (docs/distributed.md "Epoch lifecycle"): propose the
+/// plan, collect acks (15 s, typed error naming the node), open one `rpc`
+/// stream + accept-once loopback bridge per worker, then load through the
+/// engine host with the plan's tensor split.
+#[allow(clippy::too_many_arguments)]
+async fn distributed_load(
+    state: &Arc<InternalState>,
+    reference: String,
+    local: LocalModel,
+    plan: Plan,
+    tensor_split: Vec<f32>,
+    explanation: String,
+    own_id: String,
+    tx: &LineSender,
+) {
+    let epoch = plan.epoch;
+    let peers = state.mesh.peers().await.unwrap_or_default();
+    let label_of = |id: &str| {
+        peers
+            .iter()
+            .find(|p| p.id == id)
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| id.chars().take(8).collect())
+    };
+    // Worker assignments in stage order; the device order handed to the
+    // engine must match the plan's tensor_split order (workers…, head).
+    let workers: Vec<(String, String)> = plan
+        .assignments
+        .iter()
+        .filter(|a| a.node.0 != own_id)
+        .map(|a| (a.node.0.clone(), label_of(&a.node.0)))
+        .collect();
+    let use_local_device = plan.assignments.iter().any(|a| a.node.0 == own_id);
+
+    for (id, label) in &workers {
+        let envelope = Envelope::new(Message::PlanProposal(plan.clone()));
+        if let Err(err) = state.mesh.send_control(id, envelope).await {
+            emit_error(
+                tx,
+                format!("could not send the plan to node '{label}': {err}"),
+            )
+            .await;
+            return;
+        }
+    }
+    if let Err(message) = state
+        .cluster
+        .await_acks(epoch.0, &workers, Duration::from_secs(15))
+        .await
+    {
+        emit_error(tx, message).await;
+        return;
     }
 
-    let (line_tx, line_rx) = mpsc::channel::<Result<String, std::convert::Infallible>>(32);
-    tokio::spawn(async move {
-        while let Some(event) = progress_rx.recv().await {
-            let line = match event {
-                LoadProgress::Downloading { completed, total } => serde_json::json!({
-                    "status": "downloading", "completed": completed, "total": total,
-                }),
-                LoadProgress::Loading => serde_json::json!({ "status": "loading" }),
-            };
-            if line_tx.send(Ok(format!("{line}\n"))).await.is_err() {
-                // Client went away. Dropping progress_rx/resp_rx does not
-                // cancel the load: swapping the daemon's model is a daemon-
-                // level state change, not tied to this request's lifetime.
+    let mut endpoints = Vec::with_capacity(workers.len());
+    let mut bridges = Vec::with_capacity(workers.len());
+    for (id, label) in &workers {
+        // The bridge opens one fresh mesh rpc stream per accepted loopback
+        // connection (the RPC client dials the endpoint repeatedly), so it
+        // owns the mesh handle rather than a single pre-opened stream.
+        match crate::cluster::head_bridge(state.mesh.clone(), id.clone(), epoch).await {
+            Ok((endpoint, task)) => {
+                endpoints.push(endpoint);
+                bridges.push(task);
+            }
+            Err(message) => {
+                abort_all(bridges);
+                emit_error(
+                    tx,
+                    format!("could not set up the rpc bridge for node '{label}': {message}"),
+                )
+                .await;
                 return;
             }
         }
-        let terminal = match resp_rx.await {
-            Ok(Ok(model)) => serde_json::json!({ "status": "ready", "model": model }),
-            Ok(Err(message)) => serde_json::json!({ "status": "error", "message": message }),
-            Err(_) => serde_json::json!({
-                "status": "error",
-                "message": "the engine host exited unexpectedly; restart with `onebrain up`",
-            }),
-        };
-        let _ = line_tx.send(Ok(format!("{terminal}\n"))).await;
-    });
+    }
 
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "application/x-ndjson")
-        .body(axum::body::Body::from_stream(ReceiverStream::new(line_rx)))
-        .expect("static response construction cannot fail")
+    let _ = emit(tx, serde_json::json!({ "status": "loading" })).await;
+    let (resp_tx, resp_rx) = oneshot::channel();
+    if state
+        .host
+        .send(HostMsg::LoadDistributed {
+            path: local.path.clone(),
+            reference,
+            name: local.name.clone(),
+            ctx_len: state.ctx_len,
+            endpoints,
+            tensor_split,
+            use_local_device,
+            resp: resp_tx,
+        })
+        .is_err()
+    {
+        abort_all(bridges);
+        emit_error(tx, ApiError::ShuttingDown.to_string()).await;
+        return;
+    }
+    match resp_rx.await {
+        Ok(Ok(model)) => {
+            // Success: the new epoch's bridges replace (and close) any
+            // previous epoch's — its model was already dropped by the host
+            // during the swap (ADR 0004 ordering).
+            state.cluster.replace_head_bridges(bridges);
+            state.cluster.set_active(Some(ActivePlanView {
+                role: "head",
+                plan,
+                explanation: Some(explanation),
+            }));
+            let _ = emit(tx, serde_json::json!({ "status": "ready", "model": model })).await;
+        }
+        Ok(Err(message)) => {
+            abort_all(bridges);
+            emit_error(tx, message).await;
+        }
+        Err(_) => {
+            abort_all(bridges);
+            emit_error(
+                tx,
+                "the engine host exited unexpectedly; restart with `onebrain up`".to_string(),
+            )
+            .await;
+        }
+    }
+}
+
+fn abort_all(tasks: Vec<tokio::task::JoinHandle<()>>) {
+    for task in tasks {
+        task.abort();
+    }
 }
 
 /// `POST /api/internal/shutdown` — acknowledge, then let the runtime's
@@ -355,6 +770,8 @@ mod tests {
             product_version: "test",
             shutdown: shutdown.clone(),
             mesh,
+            cluster: ClusterState::new(),
+            usable_memory_override: None,
         });
         let app = internal_router(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -409,6 +826,8 @@ mod tests {
         // docs/mesh.md: status gains peers_summary; nothing is paired here.
         assert_eq!(body["peers_summary"]["paired"], 0);
         assert_eq!(body["peers_summary"]["connected"], 0);
+        // docs/distributed.md: status reports the active plan (null here).
+        assert!(body["plan"].is_null());
         teardown(host, host_thread);
     }
 
