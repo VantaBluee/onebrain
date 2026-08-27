@@ -2,6 +2,7 @@
 //! windows, peer sessions (Hello, heartbeats, probes), and mDNS discovery.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -9,7 +10,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::StreamExt;
 use iroh::endpoint::{presets, Connection, PathId, RecvStream, SendStream};
-use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey, Watcher};
+use iroh::{Endpoint, EndpointAddr, EndpointId, RelayUrl, SecretKey, TransportAddr, Watcher};
 use iroh_mdns_address_lookup::{DiscoveryEvent, MdnsAddressLookup};
 use iroh_tickets::endpoint::EndpointTicket;
 use tokio::sync::{mpsc, oneshot};
@@ -19,15 +20,15 @@ use tracing::{debug, error, info, warn};
 
 use onebrain_proto::capabilities::Capabilities;
 use onebrain_proto::handshake::{judge, EngineBuildHash, HandshakeVerdict, Hello};
-use onebrain_proto::message::{Envelope, Message};
-use onebrain_proto::plan::Epoch;
+use onebrain_proto::message::{Envelope, Message, StreamHeader, StreamKind};
+use onebrain_proto::plan::{Epoch, NodeId};
 
 use crate::pairing::{
     self, generate_code, read_frame, stream_err, truncate_for_display, validate_code, write_frame,
     PairOutcome,
 };
 use crate::store::PeerStore;
-use crate::{MeshConfig, MeshError, PairTarget, PeerState, PeerStatus};
+use crate::{MeshConfig, MeshError, NodeStatusFn, PairTarget, PeerState, PeerStatus};
 
 /// ALPN for pairing exchanges. Accepted from ANY endpoint while (and only
 /// while) a pairing window is open.
@@ -46,8 +47,19 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 const PAIR_ATTEMPTS: u32 = 3;
 const PAIR_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(60);
 const HELLO_TIMEOUT: Duration = Duration::from_secs(15);
-const REDIAL_DELAY: Duration = Duration::from_secs(5);
 const ADDR_WAIT: Duration = Duration::from_secs(10);
+/// Cadence of the reconnect loop: one pass every 2–4 s (3 s ± 1 s jitter, so
+/// two daemons restarted together do not dial in lockstep).
+const RECONNECT_TICK_BASE_MS: u64 = 2_000;
+const RECONNECT_TICK_JITTER_MS: u64 = 2_000;
+/// Per-peer redial backoff: first failure waits 3 s, then doubles to a 30 s
+/// cap so logs stay quiet while a peer is away. Reset on success or when a
+/// new address is learned (mDNS, pairing).
+const RECONNECT_BACKOFF_BASE: Duration = Duration::from_secs(3);
+const RECONNECT_BACKOFF_CAP: Duration = Duration::from_secs(30);
+/// Bound on a single outbound mesh dial, so a peer that stays dark cannot
+/// pin its `dialing` slot forever.
+const DIAL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A newly paired (or requested) peer: id + final (deduplicated) name.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -71,6 +83,54 @@ pub enum PairEvent {
     /// The window closed early (attempt budget exhausted or a store
     /// failure). Terminal.
     Failed(String),
+}
+
+/// A non-heartbeat [`Envelope`] received on a peer's `Control` stream
+/// (PlanProposal, PlanAck, NodeStatus, Draining, …). The `peer` is the
+/// authenticated endpoint id of the sender, which the accept path guarantees
+/// is in the peer store.
+#[derive(Debug)]
+pub struct ControlMessage {
+    /// Authenticated sender (endpoint id, hex).
+    pub peer: NodeId,
+    /// The received envelope.
+    pub envelope: Envelope,
+}
+
+/// An accepted `rpc` bi-stream, delivered to the daemon for bridging into a
+/// local GGML RPC session. The mesh validates the sender is a paired peer
+/// (sessions only exist for store members); the *epoch* is validated by the
+/// consumer — the daemon knows the active epoch, the mesh does not — which
+/// refuses stale streams with [`IncomingRpcStream::refuse`] (close code 4,
+/// `bad-epoch`).
+pub struct IncomingRpcStream {
+    /// Authenticated sender (endpoint id, hex).
+    pub peer: NodeId,
+    /// Epoch declared in the stream's header.
+    pub epoch: Epoch,
+    /// Send half toward the peer.
+    pub send: SendStream,
+    /// Receive half from the peer (header already consumed).
+    pub recv: RecvStream,
+}
+
+impl std::fmt::Debug for IncomingRpcStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IncomingRpcStream")
+            .field("peer", &self.peer)
+            .field("epoch", &self.epoch)
+            .finish_non_exhaustive()
+    }
+}
+
+impl IncomingRpcStream {
+    /// Refuse the stream: reset/stop both halves with QUIC application error
+    /// `code` (`4` = `bad-epoch` per the close-code list in
+    /// `onebrain_proto::message`).
+    pub fn refuse(mut self, code: u32) {
+        let _ = self.send.reset(code.into());
+        let _ = self.recv.stop(code.into());
+    }
 }
 
 /// An open pairing window, as returned by [`MeshHandle::pair_start`].
@@ -117,6 +177,23 @@ enum Internal {
         name: String,
         reply: oneshot::Sender<Result<f64, MeshError>>,
     },
+    TakeRpc {
+        reply: oneshot::Sender<Option<mpsc::Receiver<IncomingRpcStream>>>,
+    },
+    TakeControl {
+        reply: oneshot::Sender<Option<mpsc::Receiver<ControlMessage>>>,
+    },
+    SendControl {
+        peer: String,
+        envelope: Envelope,
+        reply: oneshot::Sender<Result<(), MeshError>>,
+    },
+    OpenStream {
+        peer: String,
+        kind: StreamKind,
+        epoch: Epoch,
+        reply: oneshot::Sender<Result<(SendStream, RecvStream), MeshError>>,
+    },
     Shutdown {
         reply: oneshot::Sender<()>,
     },
@@ -126,6 +203,10 @@ enum Internal {
     PairHostDone {
         window_id: u64,
         result: Result<PairOutcome, MeshError>,
+        /// Remote addressing observed on the pairing connection (the
+        /// joiner's source address as seen by the host), persisted on
+        /// success so the host can redial the joiner after a restart.
+        observed: Addressing,
     },
     WindowTimeout {
         window_id: u64,
@@ -144,7 +225,6 @@ enum Internal {
     SessionEnded {
         peer: EndpointId,
         stable_id: usize,
-        incompatible: bool,
     },
     Discovered {
         peer: EndpointId,
@@ -153,6 +233,21 @@ enum Internal {
     DiscoveryExpired {
         peer: EndpointId,
     },
+    /// One pass of the reconnect loop (sent every 2–4 s by the ticker).
+    ReconnectTick,
+}
+
+/// Last-known addressing for a peer: direct socket addresses plus an
+/// optional relay URL — the persistable projection of an `EndpointAddr`.
+type Addressing = (Vec<SocketAddr>, Option<String>);
+
+/// Per-peer redial backoff state. Absent entry = dial immediately.
+#[derive(Debug, Clone, Copy)]
+struct Backoff {
+    /// Earliest instant the next dial attempt may start.
+    next_at: Instant,
+    /// Delay to schedule after the NEXT failure (doubles up to the cap).
+    delay: Duration,
 }
 
 /// Live per-peer link state, shared between session tasks and the service.
@@ -163,6 +258,9 @@ struct Live {
     bandwidth_mbps: Option<f64>,
     loss: Option<f32>,
     last_seen_unix: Option<u64>,
+    /// From the peer's last `NodeStatus`; cached here so reading a budget is
+    /// never a network round trip.
+    usable_memory_bytes: Option<u64>,
 }
 
 type LiveMap = Arc<StdMutex<HashMap<EndpointId, Live>>>;
@@ -207,8 +305,18 @@ struct Service {
     dialing: HashSet<EndpointId>,
     discovered: HashMap<EndpointId, EndpointAddr>,
     known_addrs: HashMap<EndpointId, EndpointAddr>,
+    /// Per-peer redial backoff, driven by [`Internal::ReconnectTick`].
+    reconnect: HashMap<EndpointId, Backoff>,
     /// Background accept + mDNS loops; aborted on drop.
     background: JoinSet<()>,
+    /// Sender side of the incoming-rpc-stream channel (cloned into sessions).
+    rpc_tx: mpsc::Sender<IncomingRpcStream>,
+    /// Receiver side, held until a daemon task takes it via `incoming_rpc`.
+    rpc_rx: Option<mpsc::Receiver<IncomingRpcStream>>,
+    /// Sender side of the incoming-control-message channel.
+    ctrl_tx: mpsc::Sender<ControlMessage>,
+    /// Receiver side, held until taken via `incoming_control`.
+    ctrl_rx: Option<mpsc::Receiver<ControlMessage>>,
 }
 
 impl MeshService {
@@ -248,6 +356,7 @@ impl MeshService {
         let store = PeerStore::new(peer_store_path);
         let mut background = JoinSet::new();
         background.spawn(accept_loop(ep.clone(), store.clone(), tx.clone()));
+        background.spawn(reconnect_ticker(tx.clone()));
 
         if config.enable_mdns {
             match MdnsAddressLookup::builder().build(ep.id()) {
@@ -262,6 +371,8 @@ impl MeshService {
             }
         }
 
+        let (rpc_tx, rpc_rx) = mpsc::channel(16);
+        let (ctrl_tx, ctrl_rx) = mpsc::channel(64);
         let service = Service {
             ep,
             store,
@@ -276,10 +387,16 @@ impl MeshService {
             dialing: HashSet::new(),
             discovered: HashMap::new(),
             known_addrs: HashMap::new(),
+            reconnect: HashMap::new(),
             background,
+            rpc_tx,
+            rpc_rx: Some(rpc_rx),
+            ctrl_tx,
+            ctrl_rx: Some(ctrl_rx),
         };
-        // Lazily connect to already-paired peers as they become reachable;
-        // kick one dial attempt per stored peer at startup.
+        // Kick one dial attempt per stored peer at startup (using the
+        // addressing persisted in the peer store); the reconnect ticker
+        // keeps retrying with backoff until sessions are up.
         let startup_peers: Vec<EndpointId> = service
             .store
             .load()
@@ -349,6 +466,58 @@ impl MeshHandle {
             .await?
     }
 
+    /// Take the receiver of accepted `rpc` streams. Single consumer: a
+    /// second call fails with [`MeshError::ConsumerTaken`]. The mesh
+    /// delivers every `rpc` stream from paired peers; the consumer checks
+    /// the epoch and refuses stale streams with close code 4.
+    pub async fn incoming_rpc(&self) -> Result<mpsc::Receiver<IncomingRpcStream>, MeshError> {
+        self.request(|reply| Internal::TakeRpc { reply })
+            .await?
+            .ok_or(MeshError::ConsumerTaken { what: "rpc" })
+    }
+
+    /// Take the receiver of non-heartbeat control [`Envelope`]s (plan
+    /// traffic, node status). Single consumer, like [`Self::incoming_rpc`].
+    pub async fn incoming_control(&self) -> Result<mpsc::Receiver<ControlMessage>, MeshError> {
+        self.request(|reply| Internal::TakeControl { reply })
+            .await?
+            .ok_or(MeshError::ConsumerTaken { what: "control" })
+    }
+
+    /// Send one [`Envelope`] to a peer (by name or endpoint id) on a fresh
+    /// short-lived `Control` stream. Returns once the frame is written and
+    /// the stream finished; QUIC delivers it reliably while the session
+    /// lives. Errors if the peer is unknown or has no live session.
+    pub async fn send_control(&self, peer: &str, envelope: Envelope) -> Result<(), MeshError> {
+        let peer = peer.to_string();
+        self.request(|reply| Internal::SendControl {
+            peer,
+            envelope,
+            reply,
+        })
+        .await?
+    }
+
+    /// Open a typed bi-stream to a peer (by name or endpoint id): the
+    /// `StreamHeader { kind, epoch }` frame is written before the pair is
+    /// returned. The head uses `StreamKind::Rpc` streams to tunnel GGML RPC
+    /// sessions to workers.
+    pub async fn open_stream(
+        &self,
+        peer: &str,
+        kind: StreamKind,
+        epoch: Epoch,
+    ) -> Result<(SendStream, RecvStream), MeshError> {
+        let peer = peer.to_string();
+        self.request(|reply| Internal::OpenStream {
+            peer,
+            kind,
+            epoch,
+            reply,
+        })
+        .await?
+    }
+
     /// Stop the service: close every mesh connection and the endpoint.
     /// Idempotent — succeeds if the service is already gone.
     pub async fn shutdown(&self) -> Result<(), MeshError> {
@@ -392,6 +561,41 @@ impl Service {
                     let _ = reply.send(self.unpair(&name));
                 }
                 Internal::Probe { name, reply } => self.probe(&name, reply),
+                Internal::TakeRpc { reply } => {
+                    let _ = reply.send(self.rpc_rx.take());
+                }
+                Internal::TakeControl { reply } => {
+                    let _ = reply.send(self.ctrl_rx.take());
+                }
+                Internal::SendControl {
+                    peer,
+                    envelope,
+                    reply,
+                } => match self.resolve_conn(&peer) {
+                    Ok(conn) => {
+                        tokio::spawn(async move {
+                            let _ = reply.send(send_control_stream(&conn, &envelope).await);
+                        });
+                    }
+                    Err(err) => {
+                        let _ = reply.send(Err(err));
+                    }
+                },
+                Internal::OpenStream {
+                    peer,
+                    kind,
+                    epoch,
+                    reply,
+                } => match self.resolve_conn(&peer) {
+                    Ok(conn) => {
+                        tokio::spawn(async move {
+                            let _ = reply.send(open_typed_stream(&conn, kind, epoch).await);
+                        });
+                    }
+                    Err(err) => {
+                        let _ = reply.send(Err(err));
+                    }
+                },
                 Internal::Shutdown { reply } => {
                     self.shutdown().await;
                     let _ = reply.send(());
@@ -399,9 +603,11 @@ impl Service {
                 }
                 Internal::IncomingPair(conn) => self.incoming_pair(conn),
                 Internal::IncomingMesh(conn) => self.adopt_conn(conn, false),
-                Internal::PairHostDone { window_id, result } => {
-                    self.pair_host_done(window_id, result)
-                }
+                Internal::PairHostDone {
+                    window_id,
+                    result,
+                    observed,
+                } => self.pair_host_done(window_id, result, observed),
                 Internal::WindowTimeout { window_id } => {
                     if let Some(window) = &self.window {
                         if window.id == window_id {
@@ -413,21 +619,19 @@ impl Service {
                 }
                 Internal::JoinedPeer { peer, addr } => {
                     self.known_addrs.insert(peer, addr);
+                    // A fresh address was learned: forget any backoff.
+                    self.reconnect.remove(&peer);
                     self.ensure_session(peer);
                 }
                 Internal::DialDone { peer, conn } => {
                     self.dialing.remove(&peer);
                     match conn {
                         Some(conn) => self.adopt_conn(conn, true),
-                        None => self.schedule_redial(peer),
+                        None => self.note_dial_failure(peer),
                     }
                 }
                 Internal::TryDial { peer } => self.ensure_session(peer),
-                Internal::SessionEnded {
-                    peer,
-                    stable_id,
-                    incompatible,
-                } => {
+                Internal::SessionEnded { peer, stable_id } => {
                     let matches_current = self
                         .sessions
                         .get(&peer)
@@ -435,9 +639,9 @@ impl Service {
                     if matches_current {
                         self.sessions.remove(&peer);
                     }
-                    if !incompatible {
-                        self.schedule_redial(peer);
-                    }
+                    // Compatible peers are redialed by the next reconnect
+                    // tick (at most ~4 s away); incompatible peers are
+                    // skipped by `ensure_session` via their live state.
                 }
                 Internal::Discovered { peer, addr } => {
                     if peer != self.ep.id() {
@@ -445,6 +649,9 @@ impl Service {
                         self.discovered.insert(peer, addr.clone());
                         if self.store.contains(&peer.to_string()).unwrap_or(false) {
                             self.known_addrs.insert(peer, addr);
+                            // A fresh address was learned: forget any
+                            // backoff and dial right away.
+                            self.reconnect.remove(&peer);
                             self.ensure_session(peer);
                         }
                     }
@@ -452,6 +659,7 @@ impl Service {
                 Internal::DiscoveryExpired { peer } => {
                     self.discovered.remove(&peer);
                 }
+                Internal::ReconnectTick => self.reconnect_tick(),
             }
         }
         // All handles and background senders gone; close down quietly.
@@ -538,12 +746,27 @@ impl Service {
                     secs: budget.as_secs(),
                 }),
             };
+            // The host never dials during pairing, so the joiner's observed
+            // source address is the only addressing it can learn here.
+            // Capture it before the close tears the paths down.
+            let observed = conn_addressing(&conn);
             conn.close(0u32.into(), b"pair-done");
-            let _ = tx.send(Internal::PairHostDone { window_id, result }).await;
+            let _ = tx
+                .send(Internal::PairHostDone {
+                    window_id,
+                    result,
+                    observed,
+                })
+                .await;
         });
     }
 
-    fn pair_host_done(&mut self, window_id: u64, result: Result<PairOutcome, MeshError>) {
+    fn pair_host_done(
+        &mut self,
+        window_id: u64,
+        result: Result<PairOutcome, MeshError>,
+        observed: Addressing,
+    ) {
         let Some(window) = &mut self.window else {
             return;
         };
@@ -555,6 +778,13 @@ impl Service {
                 let id_str = outcome.peer_id.to_string();
                 match self.store.add(&id_str, &outcome.node_name) {
                     Ok(name) => {
+                        let (direct, relay) = observed;
+                        if let Err(err) = self.store.update_addrs(&id_str, direct, relay) {
+                            warn!(
+                                peer = %outcome.peer_id.fmt_short(),
+                                "could not persist peer addressing: {err}"
+                            );
+                        }
                         info!(
                             peer = %outcome.peer_id.fmt_short(),
                             name,
@@ -565,6 +795,7 @@ impl Service {
                             .events
                             .try_send(PairEvent::Paired(PeerInfo { id: id_str, name }));
                         self.window = None;
+                        self.reconnect.remove(&outcome.peer_id);
                         self.ensure_session(outcome.peer_id);
                     }
                     Err(err) => {
@@ -645,6 +876,7 @@ impl Service {
                 bandwidth_mbps: entry.bandwidth_mbps,
                 loss: entry.loss,
                 last_seen_unix: entry.last_seen_unix,
+                usable_memory_bytes: entry.usable_memory_bytes,
             });
         }
         out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -661,6 +893,7 @@ impl Service {
             self.live.lock().expect("live map poisoned").remove(&peer);
             self.known_addrs.remove(&peer);
             self.dialing.remove(&peer);
+            self.reconnect.remove(&peer);
         }
         info!(name, "unpaired peer");
         Ok(())
@@ -710,6 +943,46 @@ impl Service {
         });
     }
 
+    /// Resolve a peer reference (store name, or endpoint id hex) to its live
+    /// mesh connection. Unknown references list the known names; known peers
+    /// without a live session report `NotConnected`.
+    fn resolve_conn(&self, peer_ref: &str) -> Result<Connection, MeshError> {
+        if let Ok(id) = EndpointId::from_str(peer_ref) {
+            if let Some(session) = self.sessions.get(&id) {
+                return Ok(session.conn.clone());
+            }
+            let name = self
+                .store
+                .load()
+                .ok()
+                .and_then(|peers| peers.get(peer_ref).map(|r| r.name.clone()))
+                .unwrap_or_else(|| peer_ref.to_string());
+            return Err(MeshError::NotConnected { name });
+        }
+        let stored = self.store.load()?;
+        match stored.iter().find(|(_, r)| r.name == peer_ref) {
+            Some((id_str, _)) => {
+                let session = EndpointId::from_str(id_str)
+                    .ok()
+                    .and_then(|id| self.sessions.get(&id));
+                match session {
+                    Some(session) => Ok(session.conn.clone()),
+                    None => Err(MeshError::NotConnected {
+                        name: peer_ref.to_string(),
+                    }),
+                }
+            }
+            None => {
+                let mut known: Vec<String> = stored.into_values().map(|r| r.name).collect();
+                known.sort();
+                Err(MeshError::UnknownPeerName {
+                    name: peer_ref.to_string(),
+                    known,
+                })
+            }
+        }
+    }
+
     async fn shutdown(&mut self) {
         for (_, session) in self.sessions.drain() {
             session.runner.abort();
@@ -720,15 +993,27 @@ impl Service {
         info!("mesh service stopped");
     }
 
-    /// Lazily establish a mesh session with a paired peer.
+    /// Lazily establish a mesh session with a paired peer, dialing an
+    /// `EndpointAddr` assembled from the store's last-known addressing
+    /// merged with any live in-memory hints (pairing exchange, mDNS) — plus
+    /// whatever discovery services the endpoint itself runs.
     fn ensure_session(&mut self, peer: EndpointId) {
         if peer == self.ep.id() || self.sessions.contains_key(&peer) || self.dialing.contains(&peer)
         {
             return;
         }
-        if !self.store.contains(&peer.to_string()).unwrap_or(false) {
-            return;
-        }
+        // Fresh store read: honors concurrent unpair, and picks up
+        // addressing persisted by session tasks since the last dial.
+        let record = match self.store.load() {
+            Ok(mut stored) => match stored.remove(&peer.to_string()) {
+                Some(record) => record,
+                None => return,
+            },
+            Err(err) => {
+                debug!(peer = %peer.fmt_short(), "peer store unreadable; not dialing: {err}");
+                return;
+            }
+        };
         let incompatible = self
             .live
             .lock()
@@ -739,20 +1024,33 @@ impl Service {
         if incompatible {
             return;
         }
-        let addr = self
-            .known_addrs
-            .get(&peer)
-            .or_else(|| self.discovered.get(&peer))
-            .cloned()
-            .unwrap_or_else(|| EndpointAddr::new(peer));
+        let mut addr = EndpointAddr::new(peer)
+            .with_addrs(record.direct_addrs.iter().map(|sa| TransportAddr::Ip(*sa)));
+        if let Some(url) = record
+            .relay_url
+            .as_deref()
+            .and_then(|raw| raw.parse::<RelayUrl>().ok())
+        {
+            addr = addr.with_relay_url(url);
+        }
+        if let Some(hint) = self.known_addrs.get(&peer) {
+            addr = addr.with_addrs(hint.addrs.iter().cloned());
+        }
+        if let Some(hint) = self.discovered.get(&peer) {
+            addr = addr.with_addrs(hint.addrs.iter().cloned());
+        }
         self.dialing.insert(peer);
         let ep = self.ep.clone();
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            let conn = match ep.connect(addr, ALPN_MESH).await {
-                Ok(conn) => Some(conn),
-                Err(err) => {
+            let conn = match timeout(DIAL_TIMEOUT, ep.connect(addr, ALPN_MESH)).await {
+                Ok(Ok(conn)) => Some(conn),
+                Ok(Err(err)) => {
                     debug!(peer = %peer.fmt_short(), "mesh dial failed: {err}");
+                    None
+                }
+                Err(_) => {
+                    debug!(peer = %peer.fmt_short(), "mesh dial timed out after {DIAL_TIMEOUT:?}");
                     None
                 }
             };
@@ -760,12 +1058,43 @@ impl Service {
         });
     }
 
-    fn schedule_redial(&self, peer: EndpointId) {
-        let tx = self.tx.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(REDIAL_DELAY).await;
-            let _ = tx.send(Internal::TryDial { peer }).await;
+    /// A dial came back empty: schedule the next attempt with exponential
+    /// backoff (3 s doubling to a 30 s cap) so an absent peer stays quiet.
+    fn note_dial_failure(&mut self, peer: EndpointId) {
+        let now = Instant::now();
+        let entry = self.reconnect.entry(peer).or_insert(Backoff {
+            next_at: now,
+            delay: RECONNECT_BACKOFF_BASE,
         });
+        entry.next_at = now + entry.delay;
+        entry.delay = (entry.delay * 2).min(RECONNECT_BACKOFF_CAP);
+    }
+
+    /// One pass of the reconnect loop: redial every stored peer that has no
+    /// live session and whose backoff window has elapsed. This is what
+    /// reconnects paired daemons after restarts — peer addresses come from
+    /// the store, not from any process memory.
+    fn reconnect_tick(&mut self) {
+        let stored = match self.store.load() {
+            Ok(stored) => stored,
+            Err(err) => {
+                debug!("reconnect pass skipped, peer store unreadable: {err}");
+                return;
+            }
+        };
+        let now = Instant::now();
+        for id_str in stored.keys() {
+            let Ok(peer) = EndpointId::from_str(id_str) else {
+                continue;
+            };
+            if self.sessions.contains_key(&peer) || self.dialing.contains(&peer) {
+                continue;
+            }
+            if self.reconnect.get(&peer).is_some_and(|b| now < b.next_at) {
+                continue;
+            }
+            self.ensure_session(peer);
+        }
     }
 
     /// Adopt a mesh connection (incoming or dialed), breaking simultaneous-
@@ -777,6 +1106,9 @@ impl Service {
             conn.close(0u32.into(), b"self-connection");
             return;
         }
+        // A connection arrived (either direction): the peer is reachable,
+        // so its redial backoff resets.
+        self.reconnect.remove(&peer);
         if let Some(existing) = self.sessions.get(&peer) {
             if existing.runner.is_finished() {
                 // Stale entry; its SessionEnded event is still queued.
@@ -807,6 +1139,10 @@ impl Service {
             hello: self.local_hello(),
             live: self.live.clone(),
             tx: self.tx.clone(),
+            store: self.store.clone(),
+            node_status: self.cfg.node_status.clone(),
+            rpc_tx: self.rpc_tx.clone(),
+            ctrl_tx: self.ctrl_tx.clone(),
         };
         let runner = tokio::spawn(session_runner(ctx));
         self.sessions.insert(
@@ -867,6 +1203,17 @@ fn persist_join(
 ) -> Result<(PeerInfo, EndpointId, EndpointAddr), MeshError> {
     let id_str = outcome.peer_id.to_string();
     let name = store.add(&id_str, &outcome.node_name)?;
+    // The joiner knows the host's addressing from the ticket (or the mDNS
+    // candidate) it just dialed successfully; persist it for redialing
+    // after a restart.
+    let direct: Vec<SocketAddr> = addr.ip_addrs().copied().collect();
+    let relay = addr.relay_urls().next().map(|url| url.to_string());
+    if let Err(err) = store.update_addrs(&id_str, direct, relay) {
+        warn!(
+            peer = %outcome.peer_id.fmt_short(),
+            "could not persist peer addressing: {err}"
+        );
+    }
     info!(
         peer = %outcome.peer_id.fmt_short(),
         name,
@@ -986,6 +1333,21 @@ async fn accept_loop(ep: Endpoint, store: PeerStore, tx: mpsc::Sender<Internal>)
     }
 }
 
+/// Drive the reconnect loop: one [`Internal::ReconnectTick`] every 2–4 s
+/// (3 s ± 1 s uniform jitter). The service task decides per peer whether a
+/// dial actually happens (live session, in-flight dial, backoff).
+async fn reconnect_ticker(tx: mpsc::Sender<Internal>) {
+    loop {
+        let jitter_ms = getrandom::u32()
+            .map(|v| u64::from(v) % RECONNECT_TICK_JITTER_MS)
+            .unwrap_or(RECONNECT_TICK_JITTER_MS / 2);
+        tokio::time::sleep(Duration::from_millis(RECONNECT_TICK_BASE_MS + jitter_ms)).await;
+        if tx.send(Internal::ReconnectTick).await.is_err() {
+            return;
+        }
+    }
+}
+
 /// Forward mDNS discovery events into the service task, maintaining the
 /// live candidate set for code-only pairing.
 async fn mdns_loop(mdns: MdnsAddressLookup, tx: mpsc::Sender<Internal>) {
@@ -1014,6 +1376,32 @@ struct SessionCtx {
     hello: Hello,
     live: LiveMap,
     tx: mpsc::Sender<Internal>,
+    store: PeerStore,
+    node_status: Option<NodeStatusFn>,
+    rpc_tx: mpsc::Sender<IncomingRpcStream>,
+    ctrl_tx: mpsc::Sender<ControlMessage>,
+}
+
+/// The remote transport addresses of a connection's live QUIC paths, split
+/// into direct socket addresses and (at most one) relay URL. Available on
+/// BOTH the dial and accept side: the accept side observes the peer's
+/// source address, which is redialable as long as the peer pins its bind
+/// port (or sits behind a stable NAT binding).
+fn conn_addressing(conn: &Connection) -> Addressing {
+    let mut direct = Vec::new();
+    let mut relay = None;
+    for path in conn.paths().iter() {
+        match path.remote_addr() {
+            TransportAddr::Ip(addr) => direct.push(*addr),
+            TransportAddr::Relay(url) => relay = Some(url.to_string()),
+            // `TransportAddr` is non-exhaustive (custom transports); those
+            // are not persistable.
+            _ => {}
+        }
+    }
+    direct.sort();
+    direct.dedup();
+    (direct, relay)
 }
 
 enum SessionEnd {
@@ -1026,7 +1414,6 @@ async fn session_runner(ctx: SessionCtx) {
     let stable_id = ctx.conn.stable_id();
     let peer = ctx.peer;
     let end = run_session(&ctx).await;
-    let incompatible = matches!(end, SessionEnd::Incompatible);
     set_live(&ctx.live, peer, |l| match end {
         SessionEnd::Incompatible => l.state = Some(PeerState::Incompatible),
         SessionEnd::Established => l.state = Some(PeerState::Down),
@@ -1034,11 +1421,7 @@ async fn session_runner(ctx: SessionCtx) {
     });
     let _ = ctx
         .tx
-        .send(Internal::SessionEnded {
-            peer,
-            stable_id,
-            incompatible,
-        })
+        .send(Internal::SessionEnded { peer, stable_id })
         .await;
 }
 
@@ -1091,13 +1474,39 @@ async fn run_session(ctx: &SessionCtx) -> SessionEnd {
     } else {
         debug!(peer = %ctx.peer.fmt_short(), "mesh session established");
     }
+    // Persist the peer's observed addressing (remote side of the live QUIC
+    // paths) so this daemon can redial it after either side restarts.
+    // Deliberately BEFORE the live state flips to Connected: anyone who
+    // observes `Connected` knows the store is already fresh.
+    let (direct, relay) = conn_addressing(&ctx.conn);
+    if direct.is_empty() && relay.is_none() {
+        debug!(
+            peer = %ctx.peer.fmt_short(),
+            "session exposes no persistable remote addresses"
+        );
+    } else {
+        match ctx.store.update_addrs(&ctx.peer.to_string(), direct, relay) {
+            Ok(true) => debug!(peer = %ctx.peer.fmt_short(), "stored peer addressing updated"),
+            Ok(false) => {}
+            Err(err) => warn!(
+                peer = %ctx.peer.fmt_short(),
+                "could not persist peer addressing: {err}"
+            ),
+        }
+    }
     set_live(&ctx.live, ctx.peer, |l| {
         l.state = Some(PeerState::Connected);
         l.last_seen_unix = Some(unix_now());
     });
 
     let mut workers = JoinSet::new();
-    workers.spawn(echo_acceptor(ctx.conn.clone()));
+    workers.spawn(stream_acceptor(
+        ctx.conn.clone(),
+        ctx.peer,
+        ctx.live.clone(),
+        ctx.rpc_tx.clone(),
+        ctx.ctrl_tx.clone(),
+    ));
     workers.spawn(uni_drainer(ctx.conn.clone()));
     {
         // One bandwidth probe on connect (repeatable via `probe()`).
@@ -1108,6 +1517,26 @@ async fn run_session(ctx: &SessionCtx) -> SessionEnd {
             match run_probe(&conn).await {
                 Ok(mbps) => set_live(&live, peer, |l| l.bandwidth_mbps = Some(mbps)),
                 Err(err) => debug!(peer = %peer.fmt_short(), "bandwidth probe failed: {err}"),
+            }
+        });
+    }
+    if let Some(provider) = ctx.node_status.clone() {
+        // Report this node's schedulable memory right after the handshake so
+        // the peer can budget it into placement plans (docs/distributed.md).
+        let conn = ctx.conn.clone();
+        let peer = ctx.peer;
+        workers.spawn(async move {
+            let (usable_memory_bytes, devices) = provider();
+            let envelope = Envelope::new(Message::NodeStatus {
+                usable_memory_bytes,
+                devices,
+            });
+            match send_control_stream(&conn, &envelope).await {
+                Ok(()) => debug!(
+                    peer = %peer.fmt_short(),
+                    usable_memory_bytes, "sent NodeStatus"
+                ),
+                Err(err) => debug!(peer = %peer.fmt_short(), "NodeStatus send failed: {err}"),
             }
         });
     }
@@ -1123,22 +1552,71 @@ async fn run_session(ctx: &SessionCtx) -> SessionEnd {
     SessionEnd::Established
 }
 
+/// The header every locally opened control stream starts with. Control
+/// streams are not epoch-scoped; receivers ignore the epoch (contract in
+/// `onebrain_proto::message`).
+fn control_header() -> StreamHeader {
+    StreamHeader {
+        kind: StreamKind::Control,
+        epoch: Epoch(0),
+    }
+}
+
+/// Write one envelope on a fresh short-lived `Control` stream: header,
+/// envelope, FIN. QUIC delivers the buffered frames reliably for as long as
+/// the connection lives.
+async fn send_control_stream(conn: &Connection, envelope: &Envelope) -> Result<(), MeshError> {
+    let (mut tx, _rx) = conn.open_bi().await.map_err(stream_err)?;
+    write_frame(&mut tx, &control_header()).await?;
+    write_frame(&mut tx, envelope).await?;
+    tx.finish().map_err(stream_err)?;
+    Ok(())
+}
+
+/// Open a typed bi-stream and write its `StreamHeader` before handing the
+/// halves to the caller.
+async fn open_typed_stream(
+    conn: &Connection,
+    kind: StreamKind,
+    epoch: Epoch,
+) -> Result<(SendStream, RecvStream), MeshError> {
+    let (mut tx, rx) = conn.open_bi().await.map_err(stream_err)?;
+    write_frame(&mut tx, &StreamHeader { kind, epoch }).await?;
+    Ok((tx, rx))
+}
+
 /// Exchange `Hello`s on the connection's first bi stream (opened by the
-/// dialer). Returns the peer's `Hello`.
+/// dialer). The stream starts with a `Control` header like every mesh
+/// bi-stream. Returns the peer's `Hello`.
 async fn exchange_hello(conn: &Connection, dialer: bool, ours: &Hello) -> Result<Hello, MeshError> {
     let envelope = Envelope::new(Message::Hello(ours.clone()));
     if dialer {
         let (mut tx, mut rx) = conn.open_bi().await.map_err(stream_err)?;
+        write_frame(&mut tx, &control_header()).await?;
         write_frame(&mut tx, &envelope).await?;
         let theirs = expect_hello(read_frame::<Envelope>(&mut rx).await?)?;
         let _ = tx.finish();
         Ok(theirs)
     } else {
         let (mut tx, mut rx) = conn.accept_bi().await.map_err(stream_err)?;
+        expect_control_header(read_frame::<StreamHeader>(&mut rx).await?)?;
         let theirs = expect_hello(read_frame::<Envelope>(&mut rx).await?)?;
         write_frame(&mut tx, &envelope).await?;
         let _ = tx.finish();
         Ok(theirs)
+    }
+}
+
+fn expect_control_header(header: StreamHeader) -> Result<(), MeshError> {
+    if header.kind == StreamKind::Control {
+        Ok(())
+    } else {
+        Err(MeshError::Stream {
+            detail: format!(
+                "expected a Control stream header on the hello stream, got {:?}",
+                header.kind
+            ),
+        })
     }
 }
 
@@ -1162,6 +1640,12 @@ async fn run_heartbeat(conn: &Connection, live: &LiveMap, peer: EndpointId) {
             return;
         }
     };
+    // Type the stream (M3): heartbeat wire content is unchanged after the
+    // header — the peer's control handler echoes heartbeats exactly as
+    // before.
+    if write_frame(&mut tx, &control_header()).await.is_err() {
+        return;
+    }
     let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
     let mut pending: VecDeque<Instant> = VecDeque::new();
     let mut history: VecDeque<bool> = VecDeque::with_capacity(LOSS_WINDOW);
@@ -1230,36 +1714,123 @@ fn loss_fraction(history: &VecDeque<bool>) -> f32 {
     missed as f32 / history.len() as f32
 }
 
-/// Accept the peer's heartbeat streams and echo every frame back.
-async fn echo_acceptor(conn: Connection) {
-    let mut echoes = JoinSet::new();
+/// Accept the peer's bi-streams and dispatch them by their `StreamHeader`
+/// kind: `Control` streams run the envelope loop (heartbeat echo + control
+/// message delivery), `Rpc` streams are handed to the daemon's consumer, and
+/// `Probe` is reserved (drained).
+async fn stream_acceptor(
+    conn: Connection,
+    peer: EndpointId,
+    live: LiveMap,
+    rpc_tx: mpsc::Sender<IncomingRpcStream>,
+    ctrl_tx: mpsc::Sender<ControlMessage>,
+) {
+    let mut handlers = JoinSet::new();
     loop {
         match conn.accept_bi().await {
             Ok((tx, rx)) => {
-                echoes.spawn(echo_stream(tx, rx));
+                handlers.spawn(handle_stream(
+                    peer,
+                    tx,
+                    rx,
+                    live.clone(),
+                    rpc_tx.clone(),
+                    ctrl_tx.clone(),
+                ));
             }
             Err(_) => break,
         }
-        while echoes.try_join_next().is_some() {}
+        while handlers.try_join_next().is_some() {}
     }
-    echoes.abort_all();
+    handlers.abort_all();
 }
 
-async fn echo_stream(mut tx: SendStream, mut rx: RecvStream) {
+async fn handle_stream(
+    peer: EndpointId,
+    tx: SendStream,
+    mut rx: RecvStream,
+    live: LiveMap,
+    rpc_tx: mpsc::Sender<IncomingRpcStream>,
+    ctrl_tx: mpsc::Sender<ControlMessage>,
+) {
+    let header = match read_frame::<StreamHeader>(&mut rx).await {
+        Ok(header) => header,
+        Err(err) => {
+            debug!(peer = %peer.fmt_short(), "mesh stream without a valid header: {err}");
+            return;
+        }
+    };
+    match header.kind {
+        StreamKind::Control => control_stream(peer, tx, rx, live, ctrl_tx).await,
+        StreamKind::Rpc => {
+            let incoming = IncomingRpcStream {
+                peer: NodeId(peer.to_string()),
+                epoch: header.epoch,
+                send: tx,
+                recv: rx,
+            };
+            if let Err(returned) = rpc_tx.send(incoming).await {
+                // No daemon consumer (or it is gone): refuse rather than
+                // leaving the head's bridge hanging. Code 4 — the receiving
+                // side cannot have an active epoch without a consumer.
+                warn!(
+                    peer = %peer.fmt_short(),
+                    epoch = header.epoch.0,
+                    "no rpc consumer registered; refusing rpc stream"
+                );
+                returned.0.refuse(4);
+            }
+        }
+        StreamKind::Probe => {
+            // Reserved for the M4 link prober; drain so the peer's writes
+            // complete.
+            let mut rx = rx;
+            let mut buf = vec![0u8; 64 * 1024];
+            while let Ok(Some(_)) = rx.read(&mut buf).await {}
+        }
+    }
+}
+
+/// The `Control` envelope loop: heartbeats are echoed back unchanged (the
+/// pre-M3 wire behavior), `NodeStatus` is cached into the live map, and
+/// every non-heartbeat envelope is forwarded to the daemon's control
+/// consumer.
+async fn control_stream(
+    peer: EndpointId,
+    mut tx: SendStream,
+    mut rx: RecvStream,
+    live: LiveMap,
+    ctrl_tx: mpsc::Sender<ControlMessage>,
+) {
     loop {
         match read_frame::<Envelope>(&mut rx).await {
-            Ok(envelope) => match envelope.message {
-                Message::Heartbeat { .. } => {
+            Ok(envelope) => {
+                if matches!(envelope.message, Message::Heartbeat { .. }) {
                     if write_frame(&mut tx, &envelope).await.is_err() {
                         return;
                     }
+                    continue;
                 }
-                other => {
-                    debug!("unexpected message on echo stream: {other:?}");
-                    return;
+                if let Message::NodeStatus {
+                    usable_memory_bytes,
+                    ..
+                } = &envelope.message
+                {
+                    let usable = *usable_memory_bytes;
+                    set_live(&live, peer, |l| l.usable_memory_bytes = Some(usable));
                 }
-            },
-            Err(_) => return,
+                let message = ControlMessage {
+                    peer: NodeId(peer.to_string()),
+                    envelope,
+                };
+                if ctrl_tx.send(message).await.is_err() {
+                    debug!(
+                        peer = %peer.fmt_short(),
+                        "control message dropped: no consumer registered"
+                    );
+                }
+            }
+            Err(_) => return, // EOF (short-lived control stream) or error.
         }
     }
 }

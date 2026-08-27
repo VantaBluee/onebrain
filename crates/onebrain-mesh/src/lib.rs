@@ -9,22 +9,64 @@
 //! (`onebrain/mesh/1`) closes connections from endpoints that are not in the
 //! peer store with error code 1 (`unpaired`) — the §10 guarantee.
 //!
-//! Application close codes used on mesh connections:
-//! - `0` — normal close (duplicate connection, shutdown, pairing done).
-//! - `1` — `unpaired`: the remote endpoint is not in the peer store.
-//! - `2` — `no-pairing-window`: pair ALPN connection outside an open window.
-//! - `3` — `incompatible`: the `Hello` handshake judged the peers
-//!   incompatible (protocol or engine build mismatch).
+//! Application close codes used on mesh connections and streams are listed
+//! authoritatively in `onebrain_proto::message` (0 normal, 1 unpaired,
+//! 2 no-pairing-window, 3 incompatible, 4 bad-epoch).
+//!
+//! # Typed streams (M3)
+//!
+//! Every mesh bi-stream starts with a postcard
+//! [`onebrain_proto::message::StreamHeader`] frame declaring its
+//! [`StreamKind`] and epoch. `Control` streams carry length-prefixed
+//! [`Envelope`]s (Hello, heartbeats — wire content unchanged after the
+//! header — and plan traffic); `Rpc` streams carry one opaque tunneled GGML
+//! RPC session and are delivered to the daemon via
+//! [`MeshHandle::incoming_rpc`]; `Probe` is reserved. Control messages other
+//! than heartbeats flow to [`MeshHandle::incoming_control`]; sending uses
+//! [`MeshHandle::send_control`], which opens a short-lived `Control` stream
+//! per message (the persistent heartbeat stream stays heartbeat-only).
+//!
+//! # Reconnection across restarts (M2 DoD)
+//!
+//! The peer store (`peers.toml`) persists each peer's last-known
+//! addressing — `direct_addrs` (socket addresses) and an optional
+//! `relay_url` — alongside its name. It is written:
+//!
+//! - at pairing time: the joiner stores the host's addresses from the
+//!   ticket (or mDNS candidate) it dialed; the host stores the joiner's
+//!   observed source address from the pairing connection's QUIC paths;
+//! - on every established mesh session, on BOTH the dial and accept side,
+//!   from the remote addresses of the connection's live QUIC paths
+//!   (`Connection::paths()`), refreshed before the peer is reported
+//!   `Connected`.
+//!
+//! A reconnect loop in the service task runs every ~3 s (2–4 s, jittered):
+//! each stored peer with no live session is redialed with an
+//! `EndpointAddr` assembled from the persisted addressing plus any live
+//! mDNS/pairing hints. Dial failures are debug-level and back off per peer
+//! (3 s doubling to a 30 s cap); the backoff resets when a connection is
+//! established in either direction or a new address is learned. The
+//! duplicate-session tiebreak is unchanged: on simultaneous connect, the
+//! connection dialed by the lower endpoint id survives.
+//!
+//! Hermetic mode (mDNS and relays disabled) therefore reconnects purely
+//! from the stored direct addresses: this works as long as peers rebind
+//! the same UDP port across restarts (pin it via [`MeshConfig::bind_addrs`])
+//! or keep a stable NAT binding. Stores written before these fields existed
+//! load fine — the addressing simply starts empty and fills in on the next
+//! pairing or session.
 //!
 //! Entry point: [`MeshService::spawn`] returns a [`MeshHandle`] whose async
 //! methods (`pair_start`, `pair_join`, `peers`, `unpair`, `probe`,
-//! `shutdown`) drive the service task.
+//! `open_stream`, `send_control`, `shutdown`) drive the service task.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use onebrain_proto::message::DeviceBrief;
 use onebrain_proto::plan::NodeId;
 
 pub mod identity;
@@ -32,7 +74,17 @@ mod pairing;
 mod service;
 pub mod store;
 
-pub use service::{MeshHandle, MeshService, PairEvent, PairWindow, PeerInfo, ALPN_MESH, ALPN_PAIR};
+pub use iroh::endpoint::{RecvStream, SendStream};
+pub use service::{
+    ControlMessage, IncomingRpcStream, MeshHandle, MeshService, PairEvent, PairWindow, PeerInfo,
+    ALPN_MESH, ALPN_PAIR,
+};
+
+/// Provider for this node's `NodeStatus` message: returns
+/// `(usable_memory_bytes, devices)`. Called once per established mesh
+/// session, right after a compatible `Hello`, so peers learn this node's
+/// schedulable memory (measured free minus OS reserve — never total RAM).
+pub type NodeStatusFn = Arc<dyn Fn() -> (u64, Vec<DeviceBrief>) + Send + Sync>;
 
 /// Errors from the mesh service. Every user-facing variant carries a one-line
 /// remedy in its message (§12 of the product spec).
@@ -186,10 +238,19 @@ pub enum MeshError {
     /// The mesh service task is gone.
     #[error("the mesh service has stopped; restart the daemon (`onebrain up`)")]
     ServiceStopped,
+    /// `incoming_rpc`/`incoming_control` called twice.
+    #[error(
+        "the incoming {what} receiver was already taken; only one daemon task may consume \
+         mesh {what} traffic — restart the daemon if this recurs"
+    )]
+    ConsumerTaken {
+        /// Which receiver ("rpc" or "control").
+        what: &'static str,
+    },
 }
 
 /// Configuration for [`MeshService::spawn`].
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct MeshConfig {
     /// Advertise and discover peers on the LAN via mDNS (default `true`).
     pub enable_mdns: bool,
@@ -205,8 +266,29 @@ pub struct MeshConfig {
     /// shrinkable so tests do not sleep two minutes.
     pub pair_window: Duration,
     /// Explicit UDP bind addresses. Empty (default) uses iroh's defaults
-    /// (all interfaces). Tests bind `127.0.0.1:0` for hermetic loopback runs.
+    /// (all interfaces). Tests bind `127.0.0.1:0` for hermetic loopback
+    /// runs. Pinning a fixed port here keeps the addresses persisted in
+    /// peers' stores valid across daemon restarts, which is what lets
+    /// hermetic (no-mDNS, no-relay) deployments reconnect automatically.
     pub bind_addrs: Vec<std::net::SocketAddr>,
+    /// When set, a `NodeStatus` message built from this provider is sent on
+    /// every established mesh session (after a compatible `Hello`), so peers
+    /// can budget this node into placement plans. `None` (default) sends
+    /// nothing — used by tests and non-daemon embedders.
+    pub node_status: Option<NodeStatusFn>,
+}
+
+impl std::fmt::Debug for MeshConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MeshConfig")
+            .field("enable_mdns", &self.enable_mdns)
+            .field("enable_relays", &self.enable_relays)
+            .field("engine_build", &self.engine_build)
+            .field("pair_window", &self.pair_window)
+            .field("bind_addrs", &self.bind_addrs)
+            .field("node_status", &self.node_status.as_ref().map(|_| "<fn>"))
+            .finish()
+    }
 }
 
 impl Default for MeshConfig {
@@ -217,6 +299,7 @@ impl Default for MeshConfig {
             engine_build: "dev".to_string(),
             pair_window: Duration::from_secs(120),
             bind_addrs: Vec::new(),
+            node_status: None,
         }
     }
 }
@@ -268,6 +351,10 @@ pub struct PeerStatus {
     pub loss: Option<f32>,
     /// Unix timestamp of the last heartbeat echo.
     pub last_seen_unix: Option<u64>,
+    /// Schedulable memory the peer reported in its last `NodeStatus`
+    /// (measured free minus OS reserve — never total RAM). `None` until the
+    /// peer sends one; retains the last value across reconnects.
+    pub usable_memory_bytes: Option<u64>,
 }
 
 /// Measured quality of a link between two nodes. Populated by the prober;

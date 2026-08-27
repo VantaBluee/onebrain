@@ -1,18 +1,23 @@
 //! Persistent peer store: `<config_dir>/peers.toml`.
 //!
-//! Format per the M2 contract:
+//! Format per the M2 contract, extended with last-known addressing so
+//! paired daemons can redial each other after a restart:
 //!
 //! ```toml
 //! [peers.<endpoint_id>]
 //! name = "gaming-pc"
 //! added_unix = 1789000000
+//! direct_addrs = ["192.168.1.9:4567"]   # optional, absent in old stores
+//! relay_url = "https://relay.example/"  # optional, absent in old stores
 //! ```
 //!
 //! Names default to the peer's introduced `node_name`, deduplicated with
 //! `-2`, `-3` suffixes. The store is re-read from disk on every mesh accept,
-//! so `unpair` takes effect without a restart.
+//! so `unpair` takes effect without a restart. The addressing fields are
+//! serde-defaulted: stores written before they existed load fine.
 
 use std::collections::BTreeMap;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -27,6 +32,16 @@ pub struct PeerRecord {
     pub name: String,
     /// Unix timestamp of when the pairing completed.
     pub added_unix: u64,
+    /// Last-known direct socket addresses, refreshed at pairing time and on
+    /// every established mesh session. Used to redial the peer after a
+    /// daemon restart. Empty for stores written before this field existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub direct_addrs: Vec<SocketAddr>,
+    /// Last-known relay URL, if the peer was ever reached via a relay.
+    /// Stored as a string so a hand-edited value can never make the whole
+    /// store unreadable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_url: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -103,10 +118,47 @@ impl PeerStore {
             PeerRecord {
                 name: name.clone(),
                 added_unix,
+                direct_addrs: Vec::new(),
+                relay_url: None,
             },
         );
         self.save(&peers)?;
         Ok(name)
+    }
+
+    /// Record a peer's last-known addressing and persist. An unknown id is a
+    /// no-op returning `false`: the peer may have been unpaired concurrently
+    /// and an address update must never resurrect it. A non-empty
+    /// `direct_addrs` REPLACES the stored set (stale ports from before a
+    /// peer restart must not accumulate); an empty set keeps what is stored.
+    /// `Some` relay replaces, `None` keeps. Returns whether the file
+    /// changed.
+    pub fn update_addrs(
+        &self,
+        endpoint_id: &str,
+        direct_addrs: Vec<SocketAddr>,
+        relay_url: Option<String>,
+    ) -> Result<bool, MeshError> {
+        let mut peers = self.load()?;
+        let Some(record) = peers.get_mut(endpoint_id) else {
+            return Ok(false);
+        };
+        let mut direct = direct_addrs;
+        direct.sort();
+        direct.dedup();
+        let mut changed = false;
+        if !direct.is_empty() && record.direct_addrs != direct {
+            record.direct_addrs = direct;
+            changed = true;
+        }
+        if relay_url.is_some() && record.relay_url != relay_url {
+            record.relay_url = relay_url;
+            changed = true;
+        }
+        if changed {
+            self.save(&peers)?;
+        }
+        Ok(changed)
     }
 
     /// Remove a peer by name and persist. Returns the removed endpoint id.
@@ -236,6 +288,75 @@ mod tests {
             }
             other => panic!("unexpected error: {other}"),
         }
+    }
+
+    #[test]
+    fn store_addresses_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(&dir);
+        s.add("aaaa", "laptop").unwrap();
+
+        let addrs: Vec<SocketAddr> = vec![
+            "192.168.1.9:4567".parse().unwrap(),
+            "127.0.0.1:4567".parse().unwrap(),
+        ];
+        assert!(s
+            .update_addrs(
+                "aaaa",
+                addrs.clone(),
+                Some("https://relay.example/".to_string()),
+            )
+            .unwrap());
+
+        let peers = s.load().unwrap();
+        let mut expect = addrs;
+        expect.sort();
+        assert_eq!(peers["aaaa"].direct_addrs, expect);
+        assert_eq!(
+            peers["aaaa"].relay_url.as_deref(),
+            Some("https://relay.example/")
+        );
+
+        // Re-writing identical addressing is a no-op.
+        assert!(!s
+            .update_addrs("aaaa", peers["aaaa"].direct_addrs.clone(), None)
+            .unwrap());
+        // An empty direct set keeps the stored addresses (a relay-only
+        // session must not erase the last-known direct route).
+        assert!(!s.update_addrs("aaaa", Vec::new(), None).unwrap());
+        assert_eq!(s.load().unwrap()["aaaa"].direct_addrs.len(), 2);
+        // New addressing replaces the old set outright.
+        let fresh: Vec<SocketAddr> = vec!["127.0.0.1:9999".parse().unwrap()];
+        assert!(s.update_addrs("aaaa", fresh.clone(), None).unwrap());
+        assert_eq!(s.load().unwrap()["aaaa"].direct_addrs, fresh);
+        // Unknown ids never resurrect an unpaired peer.
+        assert!(!s
+            .update_addrs("bbbb", vec!["127.0.0.1:1".parse().unwrap()], None)
+            .unwrap());
+        assert!(!s.load().unwrap().contains_key("bbbb"));
+    }
+
+    #[test]
+    fn legacy_entry_without_addressing_loads_and_upgrades() {
+        let dir = tempfile::tempdir().unwrap();
+        // A store written before the addressing fields existed.
+        std::fs::write(
+            dir.path().join("peers.toml"),
+            "[peers.aaaa]\nname = \"gaming-pc\"\nadded_unix = 1789000000\n",
+        )
+        .unwrap();
+        let s = store(&dir);
+        let peers = s.load().unwrap();
+        assert_eq!(peers["aaaa"].name, "gaming-pc");
+        assert!(peers["aaaa"].direct_addrs.is_empty());
+        assert!(peers["aaaa"].relay_url.is_none());
+
+        // The legacy entry upgrades in place.
+        let addr: SocketAddr = "127.0.0.1:4567".parse().unwrap();
+        assert!(s.update_addrs("aaaa", vec![addr], None).unwrap());
+        let peers = s.load().unwrap();
+        assert_eq!(peers["aaaa"].direct_addrs, vec![addr]);
+        assert_eq!(peers["aaaa"].name, "gaming-pc");
     }
 
     #[test]

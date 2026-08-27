@@ -19,6 +19,19 @@ fn loopback() -> SocketAddr {
     SocketAddr::from((Ipv4Addr::LOCALHOST, 0))
 }
 
+/// Pick a currently-free loopback UDP port by binding then dropping a std
+/// socket. Used so a "restarted" service can rebind the SAME port, keeping
+/// the addresses persisted in its peer's store valid.
+fn reserve_udp_port() -> u16 {
+    let socket = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind a probe socket");
+    let port = socket
+        .local_addr()
+        .expect("probe socket has an addr")
+        .port();
+    drop(socket);
+    port
+}
+
 fn test_config(pair_window: Duration) -> MeshConfig {
     MeshConfig {
         enable_mdns: false,
@@ -26,6 +39,7 @@ fn test_config(pair_window: Duration) -> MeshConfig {
         engine_build: "test-build".to_string(),
         pair_window,
         bind_addrs: vec![loopback()],
+        node_status: None,
     }
 }
 
@@ -39,6 +53,18 @@ async fn spawn_node(dir: &TempDir, name: &str, pair_window: Duration) -> MeshHan
     )
     .await
     .expect("mesh service spawns")
+}
+
+/// Like [`spawn_node`], but pinned to a fixed loopback port so the node
+/// keeps the same dialable address across "restarts" (re-spawns from the
+/// same directory: same device key, same peer store).
+async fn spawn_node_at(dir: &TempDir, name: &str, port: u16) -> MeshHandle {
+    let key = identity::load_or_create(dir.path()).expect("device key");
+    let mut config = test_config(Duration::from_secs(120));
+    config.bind_addrs = vec![SocketAddr::from((Ipv4Addr::LOCALHOST, port))];
+    MeshService::spawn(key, dir.path().join("peers.toml"), name.to_string(), config)
+        .await
+        .expect("mesh service spawns")
 }
 
 /// Poll `peers()` until the single peer satisfies `pred`, panicking with the
@@ -258,4 +284,71 @@ async fn unpaired_mesh_connect_is_rejected() {
 
     stranger.close().await;
     host.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn restart_reconnects_without_repairing() {
+    let a_dir = TempDir::new().unwrap();
+    let b_dir = TempDir::new().unwrap();
+    // Pinned ports: with mDNS and relays off, the ONLY way a restarted
+    // service can be found is through the addresses its peer persisted, so
+    // those addresses must stay valid across the restart.
+    let port_a = reserve_udp_port();
+    let port_b = reserve_udp_port();
+    let a = spawn_node_at(&a_dir, "node-a", port_a).await;
+    let b = spawn_node_at(&b_dir, "node-b", port_b).await;
+
+    let window = a.pair_start().await.expect("window opens");
+    b.pair_join(
+        PairTarget::Ticket(window.ticket.clone()),
+        Some(window.code.clone()),
+    )
+    .await
+    .expect("pairing succeeds");
+    wait_for_peer(
+        &a,
+        "b connected after pairing",
+        Duration::from_secs(20),
+        |p| p.state == PeerState::Connected,
+    )
+    .await;
+    wait_for_peer(
+        &b,
+        "a connected after pairing",
+        Duration::from_secs(20),
+        |p| p.state == PeerState::Connected,
+    )
+    .await;
+
+    // Full restart of BOTH sides: shut down, drop, respawn from the same
+    // dirs (same device keys, same peer stores) on the same ports. No pair
+    // call afterwards - the reconnect loop must re-form the link from the
+    // persisted addressing alone (the M2 DoD "survive daemon restarts").
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
+    drop(a);
+    drop(b);
+    // Give the OS a beat to release the UDP ports (Windows lags here).
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let a = spawn_node_at(&a_dir, "node-a", port_a).await;
+    let b = spawn_node_at(&b_dir, "node-b", port_b).await;
+
+    wait_for_peer(
+        &a,
+        "b reconnected after restart",
+        Duration::from_secs(30),
+        |p| p.state == PeerState::Connected,
+    )
+    .await;
+    wait_for_peer(
+        &b,
+        "a reconnected after restart",
+        Duration::from_secs(30),
+        |p| p.state == PeerState::Connected,
+    )
+    .await;
+
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
 }
