@@ -9,7 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use onebraind::paths::AppPaths;
 
-use super::{human_bytes, node_name, up, CliError};
+use super::{age_text, human_bytes, node_name, up, CliError};
 
 pub fn run(json: bool) -> Result<(), CliError> {
     let paths = AppPaths::resolve()?;
@@ -119,20 +119,6 @@ fn num(obj: &serde_json::Value, key: &str) -> String {
         .unwrap_or_else(|| "-".to_string())
 }
 
-/// How old a profile is, for humans: `just now` under 10 s, then coarse
-/// single-unit steps (`45s ago`, `12m ago`, `3h ago`, `2d ago`). A
-/// `measured_unix` in the future (clock skew) reads as `just now`.
-fn age_text(measured_unix: u64, now_unix: u64) -> String {
-    let secs = now_unix.saturating_sub(measured_unix);
-    match secs {
-        0..=9 => "just now".to_string(),
-        10..=59 => format!("{secs}s ago"),
-        60..=3599 => format!("{}m ago", secs / 60),
-        3600..=86399 => format!("{}h ago", secs / 3600),
-        _ => format!("{}d ago", secs / 86400),
-    }
-}
-
 /// Render an aligned table (two-space indent, two spaces between columns,
 /// no trailing whitespace): `right[i]` right-aligns column `i`. The same
 /// conventions as `onebrain status`'s peers table.
@@ -238,22 +224,6 @@ links\n\
         assert_eq!(row[3], "12.5");
         let row = link_row(&json!({ "peer": "pc", "loss": 0.0 }));
         assert_eq!(row[3], "0.0");
-    }
-
-    #[test]
-    fn age_text_steps_through_units() {
-        assert_eq!(age_text(1000, 1000), "just now");
-        assert_eq!(age_text(1000, 1009), "just now");
-        assert_eq!(age_text(1000, 1010), "10s ago");
-        assert_eq!(age_text(1000, 1059), "59s ago");
-        assert_eq!(age_text(1000, 1060), "1m ago");
-        assert_eq!(age_text(1000, 1000 + 3599), "59m ago");
-        assert_eq!(age_text(1000, 1000 + 3600), "1h ago");
-        assert_eq!(age_text(1000, 1000 + 86399), "23h ago");
-        assert_eq!(age_text(1000, 1000 + 86400), "1d ago");
-        assert_eq!(age_text(1000, 1000 + 7 * 86400), "7d ago");
-        // Clock skew (measurement "in the future") degrades to just-now.
-        assert_eq!(age_text(2000, 1000), "just now");
     }
 
     #[test]

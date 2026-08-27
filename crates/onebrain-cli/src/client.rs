@@ -306,6 +306,27 @@ impl DaemonClient {
         Self::success_json(resp)
     }
 
+    /// `POST /api/internal/models/pin` (or `/unpin`) — set or clear the
+    /// cache pin flag for one model (docs/logistics.md "LRU GC + pinning").
+    /// `id` is the CACHE id exactly as `onebrain ls` prints it — the
+    /// daemon's manifest writes key off that directory name.
+    pub fn set_model_pin(&self, id: &str, pinned: bool) -> Result<serde_json::Value, ClientError> {
+        let verb = if pinned { "pin" } else { "unpin" };
+        let url = format!("{}/api/internal/models/{verb}", self.base_url);
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(&self.token)
+            .json(&serde_json::json!({ "model": id }))
+            .timeout(Duration::from_secs(10))
+            .send()
+            .map_err(|e| ClientError::Unreachable {
+                url: url.clone(),
+                detail: e.to_string(),
+            })?;
+        Self::success_json(resp)
+    }
+
     /// Read an NDJSON body line by line: events whose `status` is in
     /// `terminal` are returned, everything else goes to `on_event`.
     /// Malformed lines (keep-alives) are tolerated.

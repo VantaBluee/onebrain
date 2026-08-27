@@ -2,6 +2,7 @@ pub mod bench;
 pub mod doctor;
 pub mod ls;
 pub mod pair;
+pub mod pin;
 pub mod pull;
 pub mod rm;
 pub mod run;
@@ -55,6 +56,21 @@ pub fn human_bytes(bytes: u64) -> String {
         format!("{value:.1} {}", UNITS[unit])
     } else {
         format!("{value:.0} {}", UNITS[unit])
+    }
+}
+
+/// How old a timestamp is, for humans: `just now` under 10 s, then coarse
+/// single-unit steps (`45s ago`, `12m ago`, `3h ago`, `2d ago`). A moment
+/// in the future (clock skew) reads as `just now`. Shared by `bench`
+/// (profile age) and `ls` (model last-used age).
+pub fn age_text(then_unix: u64, now_unix: u64) -> String {
+    let secs = now_unix.saturating_sub(then_unix);
+    match secs {
+        0..=9 => "just now".to_string(),
+        10..=59 => format!("{secs}s ago"),
+        60..=3599 => format!("{}m ago", secs / 60),
+        3600..=86399 => format!("{}h ago", secs / 3600),
+        _ => format!("{}d ago", secs / 86400),
     }
 }
 
@@ -148,6 +164,22 @@ mod tests {
         assert_eq!(human_bytes(2_000_000_000_000), "2.0 TB");
         // TB is the cap: never panics, just grows the number.
         assert_eq!(human_bytes(u64::MAX), "18446744 TB");
+    }
+
+    #[test]
+    fn age_text_steps_through_units() {
+        assert_eq!(age_text(1000, 1000), "just now");
+        assert_eq!(age_text(1000, 1009), "just now");
+        assert_eq!(age_text(1000, 1010), "10s ago");
+        assert_eq!(age_text(1000, 1059), "59s ago");
+        assert_eq!(age_text(1000, 1060), "1m ago");
+        assert_eq!(age_text(1000, 1000 + 3599), "59m ago");
+        assert_eq!(age_text(1000, 1000 + 3600), "1h ago");
+        assert_eq!(age_text(1000, 1000 + 86399), "23h ago");
+        assert_eq!(age_text(1000, 1000 + 86400), "1d ago");
+        assert_eq!(age_text(1000, 1000 + 7 * 86400), "7d ago");
+        // Clock skew (a timestamp "in the future") degrades to just-now.
+        assert_eq!(age_text(2000, 1000), "just now");
     }
 
     #[test]

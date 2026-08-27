@@ -59,6 +59,10 @@ enum Command {
     Ls,
     /// Remove a cached model.
     Rm { reference: String },
+    /// Protect a cached model from automatic cache eviction.
+    Pin { model: String },
+    /// Make a pinned model evictable again.
+    Unpin { model: String },
     /// Re-profile this node and its links; print the report.
     Bench,
     /// Diagnose GPU/driver/firewall/version problems with remedies.
@@ -94,6 +98,8 @@ fn main() {
         Command::Pull { reference } => commands::pull::run(&reference, cli.json),
         Command::Ls => commands::ls::run(cli.json),
         Command::Rm { reference } => commands::rm::run(&reference, cli.json),
+        Command::Pin { model } => commands::pin::run(&model, true, cli.json),
+        Command::Unpin { model } => commands::pin::run(&model, false, cli.json),
         Command::Stop => commands::stop::run(cli.json),
         Command::InternalDaemon => match onebraind::runtime::run_blocking() {
             Ok(()) => Ok(()),
@@ -109,5 +115,42 @@ fn main() {
     if let Err(err) = outcome {
         eprintln!("error: {err}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    /// clap's own consistency check: conflicting flags, bad defaults and
+    /// the like fail here instead of at the first user's `--help`.
+    #[test]
+    fn cli_definition_is_valid() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn pin_and_unpin_parse_their_model_argument() {
+        let cli = Cli::try_parse_from(["onebrain", "pin", "qwen3-4b"]).unwrap();
+        match cli.command {
+            Some(Command::Pin { model }) => assert_eq!(model, "qwen3-4b"),
+            _ => panic!("expected Pin"),
+        }
+        let cli = Cli::try_parse_from(["onebrain", "unpin", "glm-4.5-air"]).unwrap();
+        match cli.command {
+            Some(Command::Unpin { model }) => assert_eq!(model, "glm-4.5-air"),
+            _ => panic!("expected Unpin"),
+        }
+        // The model argument is mandatory — a bare `pin` is a usage error.
+        assert!(Cli::try_parse_from(["onebrain", "pin"]).is_err());
+    }
+
+    #[test]
+    fn global_json_flag_reaches_subcommands() {
+        let cli = Cli::try_parse_from(["onebrain", "pin", "m", "--json"]).unwrap();
+        assert!(cli.json);
+        let cli = Cli::try_parse_from(["onebrain", "ls"]).unwrap();
+        assert!(!cli.json);
     }
 }
