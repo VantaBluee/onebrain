@@ -125,10 +125,47 @@ fmt, clippy, tests, CPU smoke inference with a tiny GGUF on all three OSes;
 - [ ] Shard-only weight fetch deferred to M6 by design (ADR 0004: GGML RPC
       is head-push; M6 pre-seeds worker tensor caches for transfer economy)
 
+## M4 — Scheduler v1 (CI proof met 2026-08-27: run 33049383364 green)
+
+- [x] Measured device profiles: engine microbench (prefill/decode medians),
+      disk read, persisted profile.toml, shared via NodeStatus (proto v2)
+- [x] KV budgeting from real GGUF metadata at the requested ctx — proven
+      live in the sim: ctx 2048 auto-solos, ctx 16384 forces distribution,
+      every assignment shrinks
+- [x] Memory-and-compute scoring (asymmetric split within ±1 layer of
+      prediction, sim-asserted with decode_tps_override 100/50)
+- [x] Boundary-on-fastest-link stage ordering (exact ≤8, RTTs in --explain)
+- [x] Additional-node rule (≥5% predicted gain or infeasible-without) —
+      unit-tested inclusion/exclusion
+- [x] `onebrain bench`: node + links report, internal endpoint, --json
+- [x] CI green on all three OSes (run 33049383364)
+
+## M5 — Resilience (implementation landed; integration gate in progress)
+
+- [x] Vendor patch 0002: RPC client failures become error returns (18
+      RPC_STATUS_ASSERT sites converted; dead-socket registry; documented
+      residual aborts unreachable in our flows) — torn-bridge engine test
+      proves Decode error + clean model free, no aborts
+- [x] Proto v3: NodeStatus.draining; scheduler excludes draining nodes
+      unless infeasible without them; mesh peer-events stream + Draining
+      peer state
+- [x] Daemon supervisor: one transparent retry via prefix re-prefill into
+      the same client stream; death/drain epoch teardown; lazy rejoin
+      re-plan; worker drain notice on stop (3 s grace)
+- [x] Power: SleepInhibitor + BatteryProbe per OS (Windows/macOS/Linux),
+      battery policy pure-tested, doctor + status surfacing, inhibitor
+      watcher in the runtime
+- [x] Chaos sim green locally (all 4 scenarios: kill mid-generation → same
+      stream completes byte-identical to control; no-fallback typed error
+      with node + MB figures, daemon stays healthy; rejoin → new epoch;
+      drain → excluded from next plan). Confirm-before-send added to the
+      engine loop en route: a token streams only after its own decode
+      succeeds, so a dying node can never leak a corrupted token.
+- [ ] Chaos sim green in CI (rides the M5 push)
+
 ## Upcoming
-- **M4 — Scheduler v1** (contract drafted: docs/scheduler-v1.md) ·
-  M5 resilience · M6 model logistics · M7 performance · M8 product polish.
-  Details in the spec.
+- M6 model logistics · M7 performance · M8 product polish. Details in the
+  spec.
 
 ## Dev environment notes (this machine: Windows 11)
 

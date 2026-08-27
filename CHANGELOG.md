@@ -10,6 +10,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 M0 (skeleton & CI) complete locally; M1 (excellent single-node) implemented,
 cross-OS CI proof in flight.
 
+### Added — M5
+
+- A lost node no longer kills anything: RPC transport failures became
+  error returns (vendor patch `0002`, with a dead-socket registry), the
+  daemon fails the in-flight request internally, re-plans without the dead
+  node, and transparently retries once by re-prefilling the prompt plus
+  everything already generated — the client's stream simply continues, and
+  greedy output stays byte-identical to an uninterrupted run
+  (chaos-sim-proven). When the survivors can't hold the model, the stream
+  ends with a typed error naming the lost node and both memory figures.
+- The engine only streams a token after its own decode succeeds
+  (confirm-before-send), so a dying node can never leak a corrupted token
+  into the output or the retry prefix.
+- Node lifecycle: peers rejoining trigger a lazy re-plan to a new epoch;
+  `onebrain stop` on a worker sends a polite drain notice the head honors.
+- Laptop realities: sleep is inhibited while a model is active or a shard
+  is being served (per-OS implementations), and a battery discharging
+  below the configured threshold advertises "draining" — such nodes join
+  new plans only when nothing fits without them.
+
 ### Added — M4
 
 - Scheduler v1: placement now budgets KV cache from the model's real GGUF
