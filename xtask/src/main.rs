@@ -3,6 +3,7 @@
 mod dist;
 mod e2e;
 mod pair_sim;
+mod sim;
 mod smoke;
 
 use anyhow::Result;
@@ -35,8 +36,17 @@ enum Command {
         #[arg(long)]
         netem: bool,
     },
-    /// Spawn a simulated multi-node cluster on this host (arrives in M3).
-    Sim,
+    /// Run the M3 distributed-inference rehearsal: two memory-capped
+    /// daemons auto-distribute a tiny model (PipelineParallel), greedy
+    /// tokens match an uncapped solo run byte-for-byte, a socket scan
+    /// proves loopback-only listeners, and `--nodes 2` forces distribution.
+    Sim {
+        /// Linux + root only: run the daemons inside netem-shaped network
+        /// namespaces (1 Gbit / 0.5 ms per direction, the pair-sim
+        /// machinery). Prints SKIP and exits 0 elsewhere.
+        #[arg(long)]
+        netem: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -45,10 +55,7 @@ fn main() -> Result<()> {
         Command::Smoke => smoke::run(),
         Command::E2e => e2e::run(),
         Command::PairSim { netem } => pair_sim::run(netem),
-        Command::Sim => anyhow::bail!(
-            "the cluster simulator arrives with milestone M3 (distributed inference); \
-             see STATUS.md for progress"
-        ),
+        Command::Sim { netem } => sim::run(netem),
     }
 }
 

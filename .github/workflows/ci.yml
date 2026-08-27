@@ -99,6 +99,16 @@ jobs:
         env:
           OB_E2E_SKIP_BUILD: "1"
 
+      # The M3 DoD rehearsal, per OS: two memory-capped daemons auto-engage
+      # PipelineParallel on the tiny GGUF (already cached in target-smoke by
+      # the smoke step), greedy tokens match an uncapped solo run
+      # byte-for-byte, a socket scan proves loopback-only listeners, and
+      # --nodes 2 forces distribution.
+      - name: Cluster-sim rehearsal (distributed inference)
+        run: cargo xtask sim
+        env:
+          OB_E2E_SKIP_BUILD: "1"
+
   # M2 netem leg (docs/mesh.md): the pair-sim scenario with each daemon in
   # its own network namespace, the veth pair between them shaped by tc netem
   # to 1 Gbit / 0.5 ms per direction; asserts the probed bandwidth lands in
@@ -133,10 +143,24 @@ jobs:
           cargo build --workspace --exclude xtask
           cargo build -p xtask
 
+      # The cluster sim needs the tiny GGUF; restore it from the same cache
+      # the test job populates (keyed on the URLs declared in smoke.rs) so a
+      # cache hit avoids downloading as root.
+      - name: Cache smoke-test model
+        uses: actions/cache@v4
+        with:
+          path: target-smoke
+          key: smoke-gguf-${{ hashFiles('xtask/src/smoke.rs') }}
+
       # OB_E2E_SKIP_BUILD is essential here: an inner build under sudo
       # would write root-owned artifacts into the runner-owned cache.
       - name: Pair-sim under netem (1 Gbit / 0.5 ms namespaces)
         run: sudo -E env PATH=$PATH OB_E2E_SKIP_BUILD=1 cargo xtask pair-sim --netem
+
+      # M3 netem leg (docs/distributed.md): the cluster-sim scenario with
+      # each daemon in its own namespace at 1 Gbit / 0.5 ms.
+      - name: Cluster sim under netem (1 Gbit / 0.5 ms namespaces)
+        run: sudo -E env PATH=$PATH OB_E2E_SKIP_BUILD=1 cargo xtask sim --netem
 
   # Compile-only proof that the GPU backend features build on every platform
   # that supports them. These must be green per the spec (no continue-on-error).
@@ -187,6 +211,13 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.name }}
+
+      # MSBuild's FileTracker still enforces MAX_PATH; the Vulkan shader
+      # generator's ExternalProject nests deep enough inside cargo's OUT_DIR
+      # to blow past 260 chars (FTK1011). A short target dir fixes it.
+      - name: Shorten target dir (Windows path-length limit)
+        if: runner.os == 'Windows'
+        run: echo "CARGO_TARGET_DIR=D:\t" >> "$GITHUB_ENV"
 
       - name: Install Vulkan SDK (Linux, LunarG apt repo)
         if: matrix.vulkan && runner.os == 'Linux'

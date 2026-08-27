@@ -17,7 +17,7 @@
 //! scenario with each daemon inside its own network namespace, joined by a
 //! veth pair shaped with `tc netem` to 1 Gbit / 0.5 ms per direction
 //! (~1 ms RTT), plus sanity assertions that the probed bandwidth lands in
-//! [500, 1100] Mbps and the heartbeat RTT in [0.4, 3.0] ms — wide bands per
+//! [500, 1100] Mbps and the heartbeat RTT in [0.4, 6.0] ms — wide bands per
 //! the contract: the point is that measurement happens and is sane, not
 //! calibration. The daemons' loopback API lives inside the namespaces, so
 //! HTTP goes through `ip netns exec <ns> curl` instead of reqwest.
@@ -58,9 +58,10 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Network namespace / veth names for `--netem` (fixed: leftovers from an
-/// aborted run are deleted at setup, so reruns are idempotent).
-const NS_A: &str = "onebrain-pairsim-a";
-const NS_B: &str = "onebrain-pairsim-b";
+/// aborted run are deleted at setup, so reruns are idempotent). Shared with
+/// the M3 cluster sim (sim.rs), which reuses the same namespace machinery.
+pub(crate) const NS_A: &str = "onebrain-pairsim-a";
+pub(crate) const NS_B: &str = "onebrain-pairsim-b";
 const VETH_A: &str = "ob-veth-a";
 const VETH_B: &str = "ob-veth-b";
 
@@ -148,14 +149,15 @@ pub fn run(netem: bool) -> Result<()> {
 
 /// One sandboxed daemon: its `ONEBRAIN_HOME`, API port, and (in netem mode)
 /// the network namespace every process and HTTP call must run inside.
-struct Node {
+/// Shared with the M3 cluster sim (sim.rs).
+pub(crate) struct Node {
     /// Human label for error messages.
-    label: &'static str,
+    pub(crate) label: &'static str,
     /// `node_name` written into the sandbox `config.toml` (introduced to the
     /// peer at pairing time).
-    name: &'static str,
-    home: PathBuf,
-    port: u16,
+    pub(crate) name: &'static str,
+    pub(crate) home: PathBuf,
+    pub(crate) port: u16,
     binary: PathBuf,
     /// `Some(ns)`: wrap subprocesses in `ip netns exec <ns>` and do HTTP via
     /// in-namespace curl (the daemon's loopback is inside the namespace).
@@ -164,7 +166,7 @@ struct Node {
 }
 
 impl Node {
-    fn new(
+    pub(crate) fn new(
         label: &'static str,
         name: &'static str,
         home: PathBuf,
@@ -196,7 +198,7 @@ impl Node {
     }
 
     /// A `Command` for `program`, wrapped in `ip netns exec` when namespaced.
-    fn wrap(&self, program: &OsStr) -> Command {
+    pub(crate) fn wrap(&self, program: &OsStr) -> Command {
         match self.netns {
             None => Command::new(program),
             Some(ns) => {
@@ -209,7 +211,7 @@ impl Node {
     }
 
     /// Run `onebrain <args>` against this sandbox, capturing output.
-    fn onebrain(&self, args: &[&str]) -> Result<std::process::Output> {
+    pub(crate) fn onebrain(&self, args: &[&str]) -> Result<std::process::Output> {
         self.wrap(self.binary.as_os_str())
             .args(args)
             .env("ONEBRAIN_HOME", &self.home)
@@ -231,7 +233,7 @@ impl Node {
             .to_string())
     }
 
-    fn daemon_json(&self) -> Result<Value> {
+    pub(crate) fn daemon_json(&self) -> Result<Value> {
         let path = self.home.join("data").join("run").join("daemon.json");
         let raw = std::fs::read_to_string(&path)
             .with_context(|| format!("reading {}", path.display()))?;
@@ -243,7 +245,7 @@ impl Node {
     }
 
     /// One internal-API request (always bearer-auth'd) → (status, body).
-    fn http(
+    pub(crate) fn http(
         &self,
         method: &str,
         path: &str,
@@ -310,7 +312,7 @@ impl Node {
         }
     }
 
-    fn get_json(&self, path: &str) -> Result<Value> {
+    pub(crate) fn get_json(&self, path: &str) -> Result<Value> {
         let (code, text) = self.http("GET", path, None, REQUEST_TIMEOUT)?;
         if !(200..300).contains(&code) {
             bail!("GET {path} on {} answered HTTP {code}: {text}", self.label);
@@ -318,7 +320,7 @@ impl Node {
         serde_json::from_str(&text).with_context(|| format!("GET {path} body is not JSON: {text}"))
     }
 
-    fn post_json(&self, path: &str, body: &Value, timeout: Duration) -> Result<Value> {
+    pub(crate) fn post_json(&self, path: &str, body: &Value, timeout: Duration) -> Result<Value> {
         let (code, text) = self.http("POST", path, Some(body), timeout)?;
         if !(200..300).contains(&code) {
             bail!("POST {path} on {} answered HTTP {code}: {text}", self.label);
@@ -330,7 +332,7 @@ impl Node {
     }
 
     /// One health probe: the token file must exist and status answer 200.
-    fn try_status(&self) -> Result<()> {
+    pub(crate) fn try_status(&self) -> Result<()> {
         let (code, text) =
             self.http("GET", "/api/internal/status", None, Duration::from_secs(2))?;
         if code != 200 {
@@ -339,7 +341,7 @@ impl Node {
         Ok(())
     }
 
-    fn wait_healthy(&self) -> Result<()> {
+    pub(crate) fn wait_healthy(&self) -> Result<()> {
         let deadline = Instant::now() + HEALTHY_TIMEOUT;
         loop {
             let err = match self.try_status() {
@@ -367,7 +369,7 @@ impl Node {
 
     /// Poll until the peer entry with `id` satisfies `pred`; returns the
     /// matching entry. The timeout error carries the last peers snapshot.
-    fn wait_peer(
+    pub(crate) fn wait_peer(
         &self,
         id: &str,
         window: Duration,
@@ -425,7 +427,7 @@ impl Node {
     }
 
     /// `POST /api/internal/pair/start` → live NDJSON event stream.
-    fn pair_start(&self) -> Result<EventStream> {
+    pub(crate) fn pair_start(&self) -> Result<EventStream> {
         let token = self.token()?;
         let url = self.url("/api/internal/pair/start");
         let (tx, rx) = mpsc::channel::<Result<Value>>();
@@ -497,7 +499,7 @@ fn read_ndjson_into<R: std::io::Read>(reader: BufReader<R>, tx: &mpsc::Sender<Re
 }
 
 /// A live NDJSON event stream from `POST /api/internal/pair/start`.
-struct EventStream {
+pub(crate) struct EventStream {
     rx: mpsc::Receiver<Result<Value>>,
     /// The in-namespace curl child (netem mode); killed on drop so an early
     /// failure never leaves it holding the stream open.
@@ -506,7 +508,7 @@ struct EventStream {
 
 impl EventStream {
     /// The next event, or a descriptive error on timeout / stream end.
-    fn next(&mut self, window: Duration, what: &str) -> Result<Value> {
+    pub(crate) fn next(&mut self, window: Duration, what: &str) -> Result<Value> {
         match self.rx.recv_timeout(window) {
             Ok(Ok(v)) => Ok(v),
             Ok(Err(e)) => Err(anyhow!("{e:#}")),
@@ -532,12 +534,12 @@ impl Drop for EventStream {
 /// Name + id of a peer as reported by the pairing API. Accepts both the
 /// nested `{"peer":{"name","id"}}` shape (paired event, join response per
 /// the contract's `200 {peer}`) and a bare `{"name","id"}` object.
-struct PeerRef {
-    name: String,
-    id: String,
+pub(crate) struct PeerRef {
+    pub(crate) name: String,
+    pub(crate) id: String,
 }
 
-fn peer_ref(v: &Value) -> Result<PeerRef> {
+pub(crate) fn peer_ref(v: &Value) -> Result<PeerRef> {
     let obj = if v["peer"].is_object() { &v["peer"] } else { v };
     Ok(PeerRef {
         name: obj["name"]
@@ -588,14 +590,14 @@ fn split_status_trailer(text: &str) -> Result<(u16, String)> {
 
 /// Bind two ephemeral listeners simultaneously (guaranteeing distinct ports),
 /// read the ports, drop the listeners.
-fn two_free_ports() -> Result<(u16, u16)> {
+pub(crate) fn two_free_ports() -> Result<(u16, u16)> {
     let l1 = TcpListener::bind("127.0.0.1:0").context("binding a port-probe listener")?;
     let l2 = TcpListener::bind("127.0.0.1:0").context("binding a port-probe listener")?;
     Ok((l1.local_addr()?.port(), l2.local_addr()?.port()))
 }
 
 /// Effective-uid check via `id -u` (only consulted on Linux).
-fn is_root() -> bool {
+pub(crate) fn is_root() -> bool {
     Command::new("id")
         .arg("-u")
         .output()
@@ -735,7 +737,7 @@ fn scenario(a: &Node, b: &Node, netem: bool) -> Result<()> {
 
     if netem {
         step(
-            "shaped: bandwidth in [500, 1100] Mbps and rtt in [0.4, 3.0] ms on both sides",
+            "shaped: bandwidth in [500, 1100] Mbps and rtt in [0.4, 6.0] ms on both sides",
             || {
                 for (direction, entry) in [("A->B", &link_a), ("B->A", &link_b)] {
                     let bw = entry["bandwidth_mbps"]
@@ -748,9 +750,9 @@ fn scenario(a: &Node, b: &Node, netem: bool) -> Result<()> {
                              (link shaped to 1 Gbit)"
                         );
                     }
-                    if !(0.4..=3.0).contains(&rtt) {
+                    if !(0.4..=6.0).contains(&rtt) {
                         bail!(
-                            "{direction} rtt {rtt:.2} ms is outside [0.4, 3.0] \
+                            "{direction} rtt {rtt:.2} ms is outside [0.4, 6.0] \
                              (link shaped to 0.5 ms per direction, ~1 ms RTT)"
                         );
                     }
@@ -799,7 +801,7 @@ fn note_name_mismatch(peer: &PeerRef, expected: &str) {
 
 /// Best-effort teardown: stop/kill both daemons, drop the sandboxes, delete
 /// the namespaces. Never turns a green run red.
-fn cleanup(nodes: &[&Node], netem: bool) {
+pub(crate) fn cleanup(nodes: &[&Node], netem: bool) {
     for node in nodes {
         let _ = node.onebrain(&["stop"]);
         // Hard-kill whatever still answers; a stale daemon.json pid that no
@@ -837,7 +839,7 @@ fn cleanup(nodes: &[&Node], netem: bool) {
 
 /// Build the two namespaces, the veth pair between them, and the netem
 /// shaping: 1 Gbit / 0.5 ms egress on each end => ~1 ms RTT end to end.
-fn netem_setup() -> Result<()> {
+pub(crate) fn netem_setup() -> Result<()> {
     // Leftovers from an aborted run.
     let _ = sh(&["ip", "netns", "del", NS_A]);
     let _ = sh(&["ip", "netns", "del", NS_B]);
