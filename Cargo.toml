@@ -18,7 +18,8 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/VantaBluee/onebrain"
-rust-version = "1.80"
+# Floor set by iroh-blobs 0.103 (M6 P2P weight sharing); CI builds on stable.
+rust-version = "1.91"
 # Display name lives in onebrain-proto::PRODUCT_NAME and here; a rebrand
 # touches only those two places plus the binary name in onebrain-cli.
 authors = ["OneBrain contributors"]

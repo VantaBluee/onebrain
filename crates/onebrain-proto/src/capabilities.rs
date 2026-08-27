@@ -26,8 +26,10 @@ impl Capabilities {
     /// The capabilities this build of OneBrain implements.
     pub fn current() -> Self {
         // Bits light up as milestones land so that mixed-version clusters
-        // degrade gracefully. M3: pipeline-parallel inference.
-        Capabilities(Self::PIPELINE_PARALLEL)
+        // degrade gracefully. M3: pipeline-parallel inference. M6: P2P
+        // weight-range sharing over blobs (`RangeQuery`/`RangeInventory`
+        // plus the mesh blobs provider, docs/logistics.md).
+        Capabilities(Self::PIPELINE_PARALLEL | Self::BLOB_SHARING)
     }
 
     pub fn supports(&self, bit: u64) -> bool {

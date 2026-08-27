@@ -30,7 +30,13 @@ pub const PRODUCT_NAME: &str = "OneBrain";
 /// - `3` — M5: `NodeStatus` gained `draining` in place (battery drain
 ///   policy, docs/resilience.md) — the same build-hash-gate justification
 ///   as version 2.
-pub const PROTO_VERSION: u16 = 3;
+/// - `4` — M6: new `RangeQuery`/`RangeInventory` message kinds for P2P
+///   weight-range sharing (docs/logistics.md). New kinds normally ride
+///   their capability bit alone (`BLOB_SHARING`, lit as of this build);
+///   the version bump is mandated by the M6 logistics contract so genuinely
+///   mixed builds refuse with a truthful message instead of silently
+///   degrading the zero-WAN guarantee.
+pub const PROTO_VERSION: u16 = 4;
 
 /// Errors produced while encoding or decoding protocol messages.
 #[derive(Debug, thiserror::Error)]

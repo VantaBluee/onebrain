@@ -39,7 +39,7 @@ fn test_config(pair_window: Duration) -> MeshConfig {
         engine_build: "test-build".to_string(),
         pair_window,
         bind_addrs: vec![loopback()],
-        node_status: None,
+        ..MeshConfig::default()
     }
 }
 

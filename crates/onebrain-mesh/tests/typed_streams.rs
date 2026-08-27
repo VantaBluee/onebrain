@@ -54,6 +54,7 @@ async fn spawn_node(dir: &TempDir, name: &str, usable: Option<u64>) -> MeshHandl
             pair_window: Duration::from_secs(120),
             bind_addrs: vec![loopback()],
             node_status,
+            ..MeshConfig::default()
         },
     )
     .await

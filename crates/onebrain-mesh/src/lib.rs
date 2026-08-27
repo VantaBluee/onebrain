@@ -36,6 +36,18 @@
 //! daemon needs its epoch). The daemon's failure lifecycle keys off this
 //! stream (docs/resilience.md).
 //!
+//! # P2P blob sharing (M6)
+//!
+//! The service hosts an iroh-blobs provider on the SAME endpoint under
+//! [`ALPN_BLOBS`] — no new sockets, and the accept path enforces the same
+//! §10 rule as the mesh ALPN (unknown endpoint ids closed with code 1,
+//! `unpaired`). The daemon feeds range files via [`MeshHandle::share_blob`]
+//! (BLAKE3 of the file = the blob address = the range manifest hash), asks a
+//! peer what it holds with [`MeshHandle::range_query`] (a
+//! `RangeQuery`/`RangeInventory` exchange on a short-lived control stream,
+//! answered from the peer's configured [`RangeInventorySource`]), and pulls
+//! bytes with [`MeshHandle::fetch_blob`]. See `docs/logistics.md`.
+//!
 //! # Reconnection across restarts (M2 DoD)
 //!
 //! The peer store (`peers.toml`) persists each peer's last-known
@@ -79,11 +91,13 @@ use serde::{Deserialize, Serialize};
 use onebrain_proto::message::DeviceBrief;
 use onebrain_proto::plan::NodeId;
 
+mod blobs;
 pub mod identity;
 mod pairing;
 mod service;
 pub mod store;
 
+pub use blobs::{PeerRangeInventory, RangeEntry, RangeInventorySource, ALPN_BLOBS};
 pub use iroh::endpoint::{RecvStream, SendStream};
 pub use service::{
     ControlMessage, IncomingRpcStream, MeshHandle, MeshService, PairEvent, PairWindow, PeerEvent,
@@ -281,6 +295,23 @@ pub enum MeshError {
         /// Which receiver ("rpc", "control", or "peer-events").
         what: &'static str,
     },
+    /// The local blob store failed (open, import, or export).
+    #[error(
+        "blob store error: {detail}; check free disk space and permissions on the data directory"
+    )]
+    BlobStore {
+        /// What went wrong.
+        detail: String,
+    },
+    /// A blob transfer from a peer failed (dial, or mid-stream).
+    #[error(
+        "blob fetch failed: {detail}; check that the peer is online and still holds the data, \
+         then retry — the downloader falls back to the WAN for missing ranges"
+    )]
+    BlobFetch {
+        /// What went wrong.
+        detail: String,
+    },
 }
 
 /// Configuration for [`MeshService::spawn`].
@@ -310,6 +341,16 @@ pub struct MeshConfig {
     /// can budget this node into placement plans. `None` (default) sends
     /// nothing — used by tests and non-daemon embedders.
     pub node_status: Option<NodeStatusFn>,
+    /// Directory for the on-disk blob store backing P2P weight-range
+    /// sharing (M6). `None` (default) uses an in-memory store: sharing and
+    /// fetching still work (tests), but nothing survives a restart and
+    /// shared files are copied into RAM — the daemon should point this at
+    /// `<data_dir>/blobs` when it wires up range sharing.
+    pub blobs_dir: Option<std::path::PathBuf>,
+    /// Answers peers' `RangeQuery` control messages. `None` (default)
+    /// replies with an empty inventory ("this node has no ranges"), which
+    /// keeps non-sharing embedders honest on the wire.
+    pub range_source: Option<Arc<dyn RangeInventorySource>>,
 }
 
 impl std::fmt::Debug for MeshConfig {
@@ -321,6 +362,8 @@ impl std::fmt::Debug for MeshConfig {
             .field("pair_window", &self.pair_window)
             .field("bind_addrs", &self.bind_addrs)
             .field("node_status", &self.node_status.as_ref().map(|_| "<fn>"))
+            .field("blobs_dir", &self.blobs_dir)
+            .field("range_source", &self.range_source.as_ref().map(|_| "<dyn>"))
             .finish()
     }
 }
@@ -334,6 +377,8 @@ impl Default for MeshConfig {
             pair_window: Duration::from_secs(120),
             bind_addrs: Vec::new(),
             node_status: None,
+            blobs_dir: None,
+            range_source: None,
         }
     }
 }

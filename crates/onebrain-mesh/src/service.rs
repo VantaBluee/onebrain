@@ -10,7 +10,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::StreamExt;
 use iroh::endpoint::{presets, Connection, PathId, RecvStream, SendStream};
+use iroh::protocol::ProtocolHandler;
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayUrl, SecretKey, TransportAddr, Watcher};
+use iroh_blobs::BlobsProtocol;
 use iroh_mdns_address_lookup::{DiscoveryEvent, MdnsAddressLookup};
 use iroh_tickets::endpoint::EndpointTicket;
 use tokio::sync::{mpsc, oneshot};
@@ -23,11 +25,12 @@ use onebrain_proto::handshake::{judge, EngineBuildHash, HandshakeVerdict, Hello}
 use onebrain_proto::message::{Envelope, Message, StreamHeader, StreamKind};
 use onebrain_proto::plan::{Epoch, NodeId};
 
+use crate::blobs::{BlobStore, PeerRangeInventory, RangeInventorySource, ALPN_BLOBS};
 use crate::pairing::{
     self, generate_code, read_frame, stream_err, truncate_for_display, validate_code, write_frame,
     PairOutcome,
 };
-use crate::store::PeerStore;
+use crate::store::{PeerRecord, PeerStore};
 use crate::{MeshConfig, MeshError, NodeStatusFn, PairTarget, PeerState, PeerStatus};
 
 /// ALPN for pairing exchanges. Accepted from ANY endpoint while (and only
@@ -60,6 +63,10 @@ const RECONNECT_BACKOFF_CAP: Duration = Duration::from_secs(30);
 /// Bound on a single outbound mesh dial, so a peer that stays dark cannot
 /// pin its `dialing` slot forever.
 const DIAL_TIMEOUT: Duration = Duration::from_secs(30);
+/// Bound on waiting for a peer's `RangeInventory` reply. Inventory building
+/// is a manifest read on the peer, so anything slower means the link or the
+/// peer is in trouble and the downloader should fall back to the WAN.
+const RANGE_QUERY_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// A newly paired (or requested) peer: id + final (deduplicated) name.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -212,6 +219,21 @@ enum Internal {
         kind: StreamKind,
         epoch: Epoch,
         reply: oneshot::Sender<Result<(SendStream, RecvStream), MeshError>>,
+    },
+    ShareBlob {
+        path: PathBuf,
+        reply: oneshot::Sender<Result<[u8; 32], MeshError>>,
+    },
+    FetchBlob {
+        peer: String,
+        hash: [u8; 32],
+        target: PathBuf,
+        reply: oneshot::Sender<Result<u64, MeshError>>,
+    },
+    RangeQuery {
+        peer: String,
+        model: String,
+        reply: oneshot::Sender<Result<PeerRangeInventory, MeshError>>,
     },
     Shutdown {
         reply: oneshot::Sender<()>,
@@ -394,6 +416,9 @@ struct Service {
     event_tx: mpsc::Sender<PeerEvent>,
     /// Receiver side, held until taken via `peer_events`.
     event_rx: Option<mpsc::Receiver<PeerEvent>>,
+    /// Blob store backing P2P range sharing (M6); its provider protocol is
+    /// served by the accept loop on [`ALPN_BLOBS`] for paired peers only.
+    blobs: BlobStore,
 }
 
 impl MeshService {
@@ -411,7 +436,13 @@ impl MeshService {
             Endpoint::builder(presets::Minimal)
         }
         .secret_key(secret_key)
-        .alpns(vec![ALPN_PAIR.to_vec(), ALPN_MESH.to_vec()]);
+        .alpns(vec![
+            ALPN_PAIR.to_vec(),
+            ALPN_MESH.to_vec(),
+            // The M6 blobs provider rides the SAME endpoint (spec §10: no
+            // new sockets); its accepts are gated on the peer store below.
+            ALPN_BLOBS.to_vec(),
+        ]);
         if !config.bind_addrs.is_empty() {
             builder = builder.clear_ip_transports();
             for addr in &config.bind_addrs {
@@ -431,8 +462,14 @@ impl MeshService {
 
         let (tx, rx) = mpsc::channel(64);
         let store = PeerStore::new(peer_store_path);
+        let blobs = BlobStore::open(config.blobs_dir.as_ref()).await?;
         let mut background = JoinSet::new();
-        background.spawn(accept_loop(ep.clone(), store.clone(), tx.clone()));
+        background.spawn(accept_loop(
+            ep.clone(),
+            store.clone(),
+            tx.clone(),
+            blobs.protocol(),
+        ));
         background.spawn(reconnect_ticker(tx.clone()));
 
         if config.enable_mdns {
@@ -473,6 +510,7 @@ impl MeshService {
             ctrl_rx: Some(ctrl_rx),
             event_tx,
             event_rx: Some(event_rx),
+            blobs,
         };
         // Kick one dial attempt per stored peer at startup (using the
         // addressing persisted in the peer store); the reconnect ticker
@@ -612,6 +650,58 @@ impl MeshHandle {
         .await?
     }
 
+    /// Share one file over the blobs provider (M6): import it into the blob
+    /// store — referenced in place on an on-disk store, so no bytes are
+    /// duplicated — and return its BLAKE3 hash, which is the address paired
+    /// peers fetch it by. The daemon feeds every cached range file through
+    /// here; the returned hash MUST equal the range manifest's blake3 (the
+    /// blob-sharing tests prove the identity).
+    pub async fn share_blob(&self, path: impl Into<PathBuf>) -> Result<[u8; 32], MeshError> {
+        let path = path.into();
+        self.request(|reply| Internal::ShareBlob { path, reply })
+            .await?
+    }
+
+    /// Fetch blob `hash` from a paired peer (by name or endpoint id) into
+    /// `target`, verified against the hash en route (iroh-blobs streams
+    /// bao-verified chunks). Returns the bytes read from the network — `0`
+    /// means the blob was already complete in the local store (the file is
+    /// still written). The fetched blob stays locally providable, so ranges
+    /// spread peer-to-peer without extra WAN traffic (spec §6).
+    pub async fn fetch_blob(
+        &self,
+        peer: &str,
+        hash: [u8; 32],
+        target: impl Into<PathBuf>,
+    ) -> Result<u64, MeshError> {
+        let peer = peer.to_string();
+        let target = target.into();
+        self.request(|reply| Internal::FetchBlob {
+            peer,
+            hash,
+            target,
+            reply,
+        })
+        .await?
+    }
+
+    /// Ask a connected peer which byte ranges of `model` it can serve over
+    /// blobs (M6). The exchange rides one short-lived `Control` stream —
+    /// query out, inventory back on the same stream (like a heartbeat
+    /// echo), so replies never mix into the daemon's control consumer. An
+    /// empty [`PeerRangeInventory::ranges`] means the peer has none and the
+    /// downloader should use the WAN for this model.
+    pub async fn range_query(
+        &self,
+        peer: &str,
+        model: &str,
+    ) -> Result<PeerRangeInventory, MeshError> {
+        let peer = peer.to_string();
+        let model = model.to_string();
+        self.request(|reply| Internal::RangeQuery { peer, model, reply })
+            .await?
+    }
+
     /// Stop the service: close every mesh connection and the endpoint.
     /// Idempotent — succeeds if the service is already gone.
     pub async fn shutdown(&self) -> Result<(), MeshError> {
@@ -687,6 +777,43 @@ impl Service {
                     Ok(conn) => {
                         tokio::spawn(async move {
                             let _ = reply.send(open_typed_stream(&conn, kind, epoch).await);
+                        });
+                    }
+                    Err(err) => {
+                        let _ = reply.send(Err(err));
+                    }
+                },
+                Internal::ShareBlob { path, reply } => {
+                    let blobs = self.blobs.clone();
+                    tokio::spawn(async move {
+                        let _ = reply.send(blobs.share_file(path).await);
+                    });
+                }
+                Internal::FetchBlob {
+                    peer,
+                    hash,
+                    target,
+                    reply,
+                } => match self.resolve_peer(&peer) {
+                    Ok((id, record)) => {
+                        // A fresh connection on the blobs ALPN (the remote
+                        // dispatches providers by ALPN), dialed with the
+                        // same assembled addressing a mesh session uses.
+                        let addr = self.assemble_addr(id, &record);
+                        let ep = self.ep.clone();
+                        let blobs = self.blobs.clone();
+                        tokio::spawn(async move {
+                            let _ = reply.send(blobs.fetch_into(&ep, addr, hash, target).await);
+                        });
+                    }
+                    Err(err) => {
+                        let _ = reply.send(Err(err));
+                    }
+                },
+                Internal::RangeQuery { peer, model, reply } => match self.resolve_conn(&peer) {
+                    Ok(conn) => {
+                        tokio::spawn(async move {
+                            let _ = reply.send(range_query_exchange(&conn, model).await);
                         });
                     }
                     Err(err) => {
@@ -1044,6 +1171,51 @@ impl Service {
         });
     }
 
+    /// Resolve a peer reference (store name, or endpoint id hex) to its
+    /// endpoint id and store record. Only paired peers resolve — this is
+    /// what keeps outbound blob fetches inside the paired set even when the
+    /// caller passes a raw endpoint id.
+    fn resolve_peer(&self, peer_ref: &str) -> Result<(EndpointId, PeerRecord), MeshError> {
+        let stored = self.store.load()?;
+        if let Ok(id) = EndpointId::from_str(peer_ref) {
+            if let Some(record) = stored.get(&id.to_string()) {
+                return Ok((id, record.clone()));
+            }
+        } else if let Some((id_str, record)) = stored.iter().find(|(_, r)| r.name == peer_ref) {
+            if let Ok(id) = EndpointId::from_str(id_str) {
+                return Ok((id, record.clone()));
+            }
+        }
+        let mut known: Vec<String> = stored.into_values().map(|r| r.name).collect();
+        known.sort();
+        Err(MeshError::UnknownPeerName {
+            name: peer_ref.to_string(),
+            known,
+        })
+    }
+
+    /// Assemble the best-known dialable address for a peer: the store's
+    /// persisted addressing merged with any live in-memory hints (pairing
+    /// exchange, mDNS) — plus whatever discovery the endpoint itself runs.
+    fn assemble_addr(&self, peer: EndpointId, record: &PeerRecord) -> EndpointAddr {
+        let mut addr = EndpointAddr::new(peer)
+            .with_addrs(record.direct_addrs.iter().map(|sa| TransportAddr::Ip(*sa)));
+        if let Some(url) = record
+            .relay_url
+            .as_deref()
+            .and_then(|raw| raw.parse::<RelayUrl>().ok())
+        {
+            addr = addr.with_relay_url(url);
+        }
+        if let Some(hint) = self.known_addrs.get(&peer) {
+            addr = addr.with_addrs(hint.addrs.iter().cloned());
+        }
+        if let Some(hint) = self.discovered.get(&peer) {
+            addr = addr.with_addrs(hint.addrs.iter().cloned());
+        }
+        addr
+    }
+
     /// Resolve a peer reference (store name, or endpoint id hex) to its live
     /// mesh connection. Unknown references list the known names; known peers
     /// without a live session report `NotConnected`.
@@ -1090,6 +1262,9 @@ impl Service {
             session.conn.close(0u32.into(), b"shutdown");
         }
         self.background.abort_all();
+        // Flush the blob store before the endpoint goes away (an on-disk
+        // store persists its db; in-memory is a no-op).
+        self.blobs.shutdown().await;
         self.ep.close().await;
         info!("mesh service stopped");
     }
@@ -1125,21 +1300,7 @@ impl Service {
         if incompatible {
             return;
         }
-        let mut addr = EndpointAddr::new(peer)
-            .with_addrs(record.direct_addrs.iter().map(|sa| TransportAddr::Ip(*sa)));
-        if let Some(url) = record
-            .relay_url
-            .as_deref()
-            .and_then(|raw| raw.parse::<RelayUrl>().ok())
-        {
-            addr = addr.with_relay_url(url);
-        }
-        if let Some(hint) = self.known_addrs.get(&peer) {
-            addr = addr.with_addrs(hint.addrs.iter().cloned());
-        }
-        if let Some(hint) = self.discovered.get(&peer) {
-            addr = addr.with_addrs(hint.addrs.iter().cloned());
-        }
+        let addr = self.assemble_addr(peer, &record);
         self.dialing.insert(peer);
         let ep = self.ep.clone();
         let tx = self.tx.clone();
@@ -1256,6 +1417,7 @@ impl Service {
             rpc_tx: self.rpc_tx.clone(),
             ctrl_tx: self.ctrl_tx.clone(),
             event_tx: self.event_tx.clone(),
+            range_source: self.cfg.range_source.clone(),
         };
         let runner = tokio::spawn(session_runner(ctx));
         self.sessions.insert(
@@ -1392,13 +1554,20 @@ async fn wait_for_local_addrs(ep: &Endpoint) {
 }
 
 /// Accept loop: complete handshakes off the service task and dispatch by
-/// ALPN. Mesh accepts from ids missing from the peer store (re-read on
-/// EVERY accept) are closed with code 1 (`unpaired`) — the §10 guarantee.
-async fn accept_loop(ep: Endpoint, store: PeerStore, tx: mpsc::Sender<Internal>) {
+/// ALPN. Mesh AND blobs accepts from ids missing from the peer store
+/// (re-read on EVERY accept) are closed with code 1 (`unpaired`) — the §10
+/// guarantee.
+async fn accept_loop(
+    ep: Endpoint,
+    store: PeerStore,
+    tx: mpsc::Sender<Internal>,
+    blobs: BlobsProtocol,
+) {
     let mut handshakes = JoinSet::new();
     while let Some(incoming) = ep.accept().await {
         let store = store.clone();
         let tx = tx.clone();
+        let blobs = blobs.clone();
         handshakes.spawn(async move {
             let accepting = match incoming.accept() {
                 Ok(accepting) => accepting,
@@ -1434,6 +1603,37 @@ async fn accept_loop(ep: Endpoint, store: PeerStore, tx: mpsc::Sender<Internal>)
                         warn!(
                             peer = %remote.fmt_short(),
                             "peer store unreadable ({err}); rejecting mesh connection"
+                        );
+                        conn.close(1u32.into(), b"unpaired");
+                    }
+                }
+            } else if alpn == ALPN_BLOBS {
+                // Same §10 gate as the mesh ALPN: only store-listed peers
+                // may talk to the blobs provider. The check re-reads the
+                // store, so unpair takes effect immediately here too.
+                let remote = conn.remote_id();
+                match store.contains(&remote.to_string()) {
+                    Ok(true) => {
+                        // Serve the whole provider session on this task; it
+                        // ends when the peer closes (or the endpoint does).
+                        if let Err(err) = blobs.accept(conn).await {
+                            debug!(
+                                peer = %remote.fmt_short(),
+                                "blobs provider session ended with error: {err}"
+                            );
+                        }
+                    }
+                    Ok(false) => {
+                        warn!(
+                            peer = %remote.fmt_short(),
+                            "rejecting blobs connection from unpaired endpoint"
+                        );
+                        conn.close(1u32.into(), b"unpaired");
+                    }
+                    Err(err) => {
+                        warn!(
+                            peer = %remote.fmt_short(),
+                            "peer store unreadable ({err}); rejecting blobs connection"
                         );
                         conn.close(1u32.into(), b"unpaired");
                     }
@@ -1497,6 +1697,8 @@ struct SessionCtx {
     rpc_tx: mpsc::Sender<IncomingRpcStream>,
     ctrl_tx: mpsc::Sender<ControlMessage>,
     event_tx: mpsc::Sender<PeerEvent>,
+    /// Answers this peer's `RangeQuery`s; `None` replies "no ranges".
+    range_source: Option<Arc<dyn RangeInventorySource>>,
 }
 
 /// The remote transport addresses of a connection's live QUIC paths, split
@@ -1644,6 +1846,7 @@ async fn run_session(ctx: &SessionCtx) -> SessionEnd {
             rpc_tx: ctx.rpc_tx.clone(),
             ctrl_tx: ctx.ctrl_tx.clone(),
             event_tx: ctx.event_tx.clone(),
+            range_source: ctx.range_source.clone(),
         },
     ));
     workers.spawn(uni_drainer(ctx.conn.clone()));
@@ -1727,6 +1930,37 @@ async fn open_typed_stream(
     let (mut tx, rx) = conn.open_bi().await.map_err(stream_err)?;
     write_frame(&mut tx, &StreamHeader { kind, epoch }).await?;
     Ok((tx, rx))
+}
+
+/// One `RangeQuery` → `RangeInventory` exchange on a fresh short-lived
+/// `Control` stream. The peer's control loop answers on the SAME stream
+/// (like a heartbeat echo), which gives request/response correlation for
+/// free — no matching replies out of the shared control consumer.
+async fn range_query_exchange(
+    conn: &Connection,
+    model: String,
+) -> Result<PeerRangeInventory, MeshError> {
+    let (mut tx, mut rx) = conn.open_bi().await.map_err(stream_err)?;
+    write_frame(&mut tx, &control_header()).await?;
+    write_frame(&mut tx, &Envelope::new(Message::RangeQuery { model })).await?;
+    let _ = tx.finish();
+    let envelope = match timeout(RANGE_QUERY_TIMEOUT, read_frame::<Envelope>(&mut rx)).await {
+        Ok(result) => result?,
+        Err(_) => {
+            return Err(MeshError::Timeout {
+                what: "range query",
+                secs: RANGE_QUERY_TIMEOUT.as_secs(),
+            })
+        }
+    };
+    match envelope.message {
+        Message::RangeInventory {
+            total_size, ranges, ..
+        } => Ok(PeerRangeInventory { total_size, ranges }),
+        other => Err(MeshError::Stream {
+            detail: format!("expected RangeInventory as the query reply, got {other:?}"),
+        }),
+    }
 }
 
 /// Exchange `Hello`s on the connection's first bi stream (opened by the
@@ -1880,6 +2114,8 @@ struct StreamPeerCtx {
     rpc_tx: mpsc::Sender<IncomingRpcStream>,
     ctrl_tx: mpsc::Sender<ControlMessage>,
     event_tx: mpsc::Sender<PeerEvent>,
+    /// Answers the peer's `RangeQuery`s; `None` replies "no ranges".
+    range_source: Option<Arc<dyn RangeInventorySource>>,
 }
 
 /// Accept the peer's bi-streams and dispatch them by their `StreamHeader`
@@ -1953,6 +2189,41 @@ async fn control_stream(ctx: StreamPeerCtx, mut tx: SendStream, mut rx: RecvStre
             Ok(envelope) => {
                 if matches!(envelope.message, Message::Heartbeat { .. }) {
                     if write_frame(&mut tx, &envelope).await.is_err() {
+                        return;
+                    }
+                    continue;
+                }
+                if let Message::RangeQuery { model } = &envelope.message {
+                    // Answered in-mesh on the SAME stream (like a heartbeat
+                    // echo) from the configured inventory source; the query
+                    // never reaches the daemon's control consumer. Missing
+                    // source or unknown model = the wire contract's "peer
+                    // has none" (empty ranges).
+                    let inventory = match ctx.range_source.clone() {
+                        Some(source) => {
+                            let model = model.clone();
+                            // Off the runtime: sources may read a manifest
+                            // from disk.
+                            tokio::task::spawn_blocking(move || source.inventory(&model))
+                                .await
+                                .ok()
+                                .flatten()
+                        }
+                        None => None,
+                    };
+                    let (total_size, ranges) = inventory.unwrap_or((0, Vec::new()));
+                    debug!(
+                        peer = %peer.fmt_short(),
+                        model,
+                        ranges = ranges.len(),
+                        "answering range query"
+                    );
+                    let reply = Envelope::new(Message::RangeInventory {
+                        model: model.clone(),
+                        total_size,
+                        ranges,
+                    });
+                    if write_frame(&mut tx, &reply).await.is_err() {
                         return;
                     }
                     continue;

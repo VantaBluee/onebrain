@@ -122,6 +122,35 @@ pub enum Message {
         #[serde(default)]
         draining: bool,
     },
+    /// Ask a peer which byte ranges of `model` it can serve over the blobs
+    /// ALPN (M6 P2P weight sharing, docs/logistics.md). Appended as a NEW
+    /// message kind (postcard keeps earlier variant tags stable) and gated
+    /// on the `BLOB_SHARING` capability bit; `PROTO_VERSION` 4 accompanies
+    /// it per the M6 logistics contract. The peer answers on the SAME
+    /// control stream with [`Message::RangeInventory`] — the mesh handles
+    /// the exchange like a heartbeat echo, so requesters never have to
+    /// correlate replies out of the shared control-consumer firehose.
+    RangeQuery {
+        /// Model reference exactly as it appears in the range manifest
+        /// (`ranges.json`) — a cache key both sides derive the same way.
+        model: String,
+    },
+    /// Reply to [`Message::RangeQuery`]: every byte range of `model` the
+    /// sender can serve over blobs. Empty `ranges` = the peer has none (the
+    /// downloader then falls back to WAN for the whole file). Introduced
+    /// with `PROTO_VERSION` 4 / `BLOB_SHARING` alongside `RangeQuery`.
+    RangeInventory {
+        /// The queried model reference, echoed back.
+        model: String,
+        /// Total size in bytes of the complete model file, so the receiver
+        /// can sanity-check range bounds against its own manifest. `0` when
+        /// the peer has nothing.
+        total_size: u64,
+        /// `(start, end, blake3)` per available range — exclusive `end`,
+        /// hash of the range's bytes. Each hash doubles as the iroh-blobs
+        /// blob address (both are plain BLAKE3 of content).
+        ranges: Vec<(u64, u64, [u8; 32])>,
+    },
 }
 
 /// Wire envelope: message plus the sender's view of the active epoch.
@@ -245,6 +274,71 @@ mod tests {
                 assert!(!draining, "draining defaults to false");
             }
             other => panic!("expected NodeStatus, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn range_query_roundtrip() {
+        let env = Envelope::new(Message::RangeQuery {
+            model: "blake3:abc123".into(),
+        });
+        let bytes = crate::encode(&env).unwrap();
+        let back: Envelope = crate::decode(&bytes).unwrap();
+        match back.message {
+            Message::RangeQuery { model } => assert_eq!(model, "blake3:abc123"),
+            other => panic!("expected RangeQuery, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn range_inventory_roundtrip() {
+        // Non-trivial hashes: every byte position must survive the wire —
+        // a truncated hash would address the wrong blob.
+        let h1: [u8; 32] = core::array::from_fn(|i| i as u8);
+        let h2: [u8; 32] = core::array::from_fn(|i| 255 - i as u8);
+        let env = Envelope::new(Message::RangeInventory {
+            model: "blake3:abc123".into(),
+            total_size: 7 << 30,
+            ranges: vec![(0, 4096, h1), (4096, 7 << 30, h2)],
+        });
+        let bytes = crate::encode(&env).unwrap();
+        let back: Envelope = crate::decode(&bytes).unwrap();
+        match back.message {
+            Message::RangeInventory {
+                model,
+                total_size,
+                ranges,
+            } => {
+                assert_eq!(model, "blake3:abc123");
+                assert_eq!(total_size, 7 << 30);
+                assert_eq!(ranges, vec![(0, 4096, h1), (4096, 7 << 30, h2)]);
+            }
+            other => panic!("expected RangeInventory, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn range_inventory_roundtrip_empty_means_peer_has_none() {
+        // The contract's "empty ranges = peer has none" case must encode
+        // and decode cleanly (the downloader treats it as all-WAN).
+        let env = Envelope::new(Message::RangeInventory {
+            model: "blake3:missing".into(),
+            total_size: 0,
+            ranges: Vec::new(),
+        });
+        let bytes = crate::encode(&env).unwrap();
+        let back: Envelope = crate::decode(&bytes).unwrap();
+        match back.message {
+            Message::RangeInventory {
+                model,
+                total_size,
+                ranges,
+            } => {
+                assert_eq!(model, "blake3:missing");
+                assert_eq!(total_size, 0);
+                assert!(ranges.is_empty());
+            }
+            other => panic!("expected RangeInventory, got {other:?}"),
         }
     }
 
