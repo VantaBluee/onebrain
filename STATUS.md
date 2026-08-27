@@ -140,7 +140,7 @@ fmt, clippy, tests, CPU smoke inference with a tiny GGUF on all three OSes;
 - [x] `onebrain bench`: node + links report, internal endpoint, --json
 - [x] CI green on all three OSes (run 33049383364)
 
-## M5 — Resilience (implementation landed; integration gate in progress)
+## M5 — Resilience (CI proof met 2026-08-27: run 33059990436 green)
 
 - [x] Vendor patch 0002: RPC client failures become error returns (18
       RPC_STATUS_ASSERT sites converted; dead-socket registry; documented
@@ -161,11 +161,55 @@ fmt, clippy, tests, CPU smoke inference with a tiny GGUF on all three OSes;
       drain → excluded from next plan). Confirm-before-send added to the
       engine loop en route: a token streams only after its own decode
       succeeds, so a dying node can never leak a corrupted token.
-- [ ] Chaos sim green in CI (rides the M5 push)
+- [x] Chaos sim green in CI: run 33059990436 (2026-08-27), all matrix +
+      netem legs. (The prior run 33059762113 failed only its
+      pair-sim-netem leg — the pre-existing peers.toml save race, fixed
+      for good in M6's gate: see M6 "Fixed en route".)
+
+## M6 — Model logistics (implementation landed; CI gate in progress)
+
+- [x] Range-level cache (contract: docs/logistics.md): tensor-aligned
+      ranges from GGUF metadata + one header range, per-range BLAKE3
+      verify-before-trust, resumable HTTP-Range fetch, full files answer
+      range reads by offset with no duplication, re-plans reuse on-disk
+      bytes; HF_TOKEN passthrough (host-scoped to huggingface.co)
+- [x] P2P LAN-first sharing: iroh-blobs provider on the EXISTING endpoint
+      (paired peers only, closed code 1 otherwise — no new sockets);
+      `RangeQuery`/`RangeInventory` control messages, PROTO_VERSION → 4,
+      BLOB_SHARING capability bit; range files are blobs addressed by the
+      same BLAKE3 as the manifest (identity tested)
+- [x] Worker range fetch on plan adoption: header + assigned layers only,
+      peers asked before any WAN byte, stable per-download log line
+      (p2p vs wan bytes); completed downloads indexed + shared back
+- [x] RPC tensor-cache pre-seeding (ADR 0004 payoff): workers pre-seed
+      `rpc-cache/` with FNV-1a-64-named files (exact upstream naming,
+      vector-tested) for >10 MiB assigned tensors; serve sessions get the
+      cache dir; reaper LRU-caps at `rpc_cache_max_bytes` (default
+      20 GiB), active epoch protected
+- [x] Split-GGUF: part-name derivation (`-%05d-of-%05d`), per-part cache
+      dirs, `ob_model_load_splits` shim wrapping
+      `llama_model_load_from_splits`, `ls` aggregates parts as one model
+- [x] LRU GC + pinning: `onebrain pin`/`unpin` (internal API + CLI),
+      GC after downloads when `cache_max_bytes` exceeded — never pinned,
+      never loaded; `ls` shows PARTS/PIN/LAST USED
+- [x] Registry v1: 8 curated URL-verified entries (Qwen3 4B/32B/30B-A3B,
+      GLM-4.5-Air split MoE, gpt-oss-120b, DeepSeek-R1-Distill 7B/14B,
+      Llama-3.3-70B) with MoE fields, parts, min_pooled_memory_mb,
+      recommended_ctx (renamed from ctx_recommended)
+- [x] Sim DoD proofs green locally: zero-WAN (counting fake-WAN server;
+      B's pull after A holds the model moves 0 new WAN bytes, manifests
+      byte-exact) + pre-seed (first 2-node load logs pre-seeded, reload
+      logs already-present, WAN counter frozen)
+- [x] Fixed en route (gate catch, pre-existing M2 bug): peers.toml save
+      was remove-then-rename — concurrent load in the gap saw an empty
+      store; now atomic rename + serialized read-modify-write
+- [x] Full local gate green: fmt, clippy -Dwarnings, workspace tests
+      (21 binaries), e2e, pair-sim, sim (chaos + M6 steps)
+- [ ] CI green on all three OSes (rides the M6 push)
+- Note: workspace rust-version 1.80 → 1.91 (iroh-blobs 0.103 floor)
 
 ## Upcoming
-- M6 model logistics · M7 performance · M8 product polish. Details in the
-  spec.
+- M7 performance · M8 product polish. Details in the spec.
 
 ## Dev environment notes (this machine: Windows 11)
 

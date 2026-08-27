@@ -83,3 +83,18 @@ that passthrough). New optional fields: `moe_total_params`,
   pre-seed: second load of the same plan logs skipped transfers (assert
   via daemon log grep for the skip counter line the daemon emits).
 - CI: rides the existing test-job steps (models tests + sim).
+
+## Implementation notes (recorded at landing)
+
+- `OB_HF_BASE_URL` (registry.rs) is a TEST-ONLY env seam that rebases
+  `hf:` ref resolution onto a local server — required for the zero-WAN
+  proof, since the daemon only downloads registry-derived URLs. Default
+  behavior is unchanged; HF_TOKEN stays host-gated to huggingface.co
+  separately, so the token is never sent to a rebased host.
+- The sim's counting fake-WAN server is a raw loopback TcpListener in
+  xtask — DoD harness tooling, not shipped daemon code; the §10
+  no-listener guarantee applies to the product, and the sim's socket
+  scans continue to assert it against the daemons.
+- HF_TOKEN passthrough is deliberately host-scoped to huggingface.co and
+  subdomains (not "any URL"), so the credential cannot leak to non-HF
+  registry mirrors.

@@ -10,6 +10,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 M0 (skeleton & CI) complete locally; M1 (excellent single-node) implemented,
 cross-OS CI proof in flight.
 
+### Added — M6
+
+- Weights now move at range granularity: the model cache stores
+  tensor-aligned, per-range-BLAKE3-verified ranges, so a worker assigned
+  layers L..R fetches only the file header plus those layers' tensors
+  (resumable mid-range; a full file on disk implicitly answers every
+  range read with no duplication, and re-plans never re-download bytes
+  already present).
+- Paired machines share weights LAN-first over iroh-blobs riding the
+  existing authenticated endpoint (paired peers only, no new sockets):
+  before any WAN byte, a downloader asks every connected peer for its
+  range inventory (`RangeQuery`/`RangeInventory`, proto v4) and fetches
+  what a peer holds as bao-verified blobs — sim-proven: the second
+  machine's pull moves ZERO new WAN bytes.
+- Distributed loads stop re-pushing big weights (ADR 0004 payoff):
+  workers pre-seed the RPC tensor cache from their on-disk ranges at plan
+  adoption, so the head's push skips every tensor over the 10 MiB hash
+  threshold on reloads; the pre-seed dir is LRU-capped
+  (`rpc_cache_max_bytes`, default 20 GiB) and never evicts the active
+  epoch's tensors.
+- Split GGUFs (`-00001-of-000NN.gguf`) download, cache, and load as one
+  model (`llama_model_load_from_splits` via the shim); `onebrain ls`
+  shows one row with a parts count.
+- Cache management: `onebrain pin`/`unpin` protect models from the new
+  LRU GC (`cache_max_bytes`, default off) that runs after downloads and
+  never evicts pinned or loaded models; `ls` shows pin state and age.
+- Registry v1: eight curated, URL-verified entries from 2.5 GB
+  (Qwen3-4B) to 73.5 GB (GLM-4.5-Air, split; MoE metadata recorded), with
+  pooled-memory floors and recommended contexts; `HF_TOKEN` is sent to
+  huggingface.co (only) when set.
+
+### Fixed — M6
+
+- A pre-existing peer-store race (M2 era): saving `peers.toml` deleted
+  the old file before renaming the replacement in, so a concurrent read
+  in that window saw an empty store (a just-paired daemon could
+  transiently report zero peers); saves now rename atomically and
+  read-modify-write cycles are serialized.
+
 ### Added — M5
 
 - A lost node no longer kills anything: RPC transport failures became
