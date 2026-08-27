@@ -86,6 +86,9 @@ pub enum Message {
     /// for control-channel fallback and testing.
     EngineFrame { epoch: Epoch, payload: Vec<u8> },
     /// Polite shutdown notice: node is draining (battery policy, `stop`).
+    /// The mesh surfaces the arrival as a `Draining` peer event AND forwards
+    /// the envelope to the control consumer — the head needs `epoch` to run
+    /// the failure lifecycle (docs/resilience.md).
     Draining { epoch: Epoch, reason: String },
     /// Worker → head, sent after `Hello`: the memory the scheduler may
     /// budget against. `usable_memory_bytes` is measured free memory of the
@@ -98,7 +101,8 @@ pub enum Message {
     /// cluster run the same build (docs/scheduler-v1.md); the version bump
     /// keeps the handshake refusal message truthful for genuinely mixed
     /// builds. `None` means the node has not run its profile yet (the
-    /// scheduler then falls back to memory-only weighting).
+    /// scheduler then falls back to memory-only weighting). M5
+    /// (`PROTO_VERSION` 3) added `draining` in place under the same rule.
     NodeStatus {
         usable_memory_bytes: u64,
         devices: Vec<DeviceBrief>,
@@ -111,6 +115,12 @@ pub enum Message {
         /// Measured sequential disk read rate (MB/s), if profiled. An upper
         /// bound (OS page cache); used only for relative ordering.
         disk_mbps: Option<f64>,
+        /// `true` while the node's battery policy says new plans should
+        /// avoid it (below the drain threshold and not on AC — M5,
+        /// docs/resilience.md). The scheduler excludes draining nodes from
+        /// new plans unless a plan is infeasible without them.
+        #[serde(default)]
+        draining: bool,
     },
 }
 
@@ -179,6 +189,7 @@ mod tests {
             prefill_tps: Some(812.5),
             decode_tps: Some(41.25),
             disk_mbps: Some(1732.0),
+            draining: true,
         });
         let bytes = crate::encode(&env).unwrap();
         let back: Envelope = crate::decode(&bytes).unwrap();
@@ -189,6 +200,7 @@ mod tests {
                 prefill_tps,
                 decode_tps,
                 disk_mbps,
+                draining,
             } => {
                 assert_eq!(usable_memory_bytes, 12 << 30);
                 assert_eq!(devices.len(), 2);
@@ -197,6 +209,7 @@ mod tests {
                 assert_eq!(prefill_tps, Some(812.5));
                 assert_eq!(decode_tps, Some(41.25));
                 assert_eq!(disk_mbps, Some(1732.0));
+                assert!(draining, "the M5 draining flag must survive roundtrip");
             }
             other => panic!("expected NodeStatus, got {other:?}"),
         }
@@ -212,6 +225,7 @@ mod tests {
             prefill_tps: None,
             decode_tps: None,
             disk_mbps: None,
+            draining: false,
         });
         let bytes = crate::encode(&env).unwrap();
         let back: Envelope = crate::decode(&bytes).unwrap();
@@ -221,14 +235,35 @@ mod tests {
                 prefill_tps,
                 decode_tps,
                 disk_mbps,
+                draining,
                 ..
             } => {
                 assert_eq!(usable_memory_bytes, 8 << 30);
                 assert_eq!(prefill_tps, None);
                 assert_eq!(decode_tps, None);
                 assert_eq!(disk_mbps, None);
+                assert!(!draining, "draining defaults to false");
             }
             other => panic!("expected NodeStatus, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn draining_roundtrip_keeps_the_epoch() {
+        // The head consumes the epoch field to fence stale drains, so it must
+        // survive the wire (docs/resilience.md worker-side drain).
+        let env = Envelope::new(Message::Draining {
+            epoch: Epoch(7),
+            reason: "battery below threshold".into(),
+        });
+        let bytes = crate::encode(&env).unwrap();
+        let back: Envelope = crate::decode(&bytes).unwrap();
+        match back.message {
+            Message::Draining { epoch, reason } => {
+                assert_eq!(epoch, Epoch(7));
+                assert_eq!(reason, "battery below threshold");
+            }
+            other => panic!("expected Draining, got {other:?}"),
         }
     }
 }

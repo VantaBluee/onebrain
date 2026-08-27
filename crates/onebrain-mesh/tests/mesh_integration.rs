@@ -296,6 +296,67 @@ async fn unpaired_mesh_connect_is_rejected() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn peer_events_report_connected_and_down() {
+    let a_dir = TempDir::new().unwrap();
+    let b_dir = TempDir::new().unwrap();
+    let a = spawn_node(&a_dir, "node-a", Duration::from_secs(120)).await;
+    let b = spawn_node(&b_dir, "node-b", Duration::from_secs(120)).await;
+    let b_id = b.endpoint_id().to_string();
+
+    // Take the peer-events consumer before pairing so the Connected
+    // transition cannot be missed; the receiver is single-take.
+    let mut events = a.peer_events().await.expect("peer-events rx");
+    assert!(matches!(
+        a.peer_events().await,
+        Err(MeshError::ConsumerTaken {
+            what: "peer-events"
+        })
+    ));
+
+    let window = a.pair_start().await.expect("window opens");
+    b.pair_join(
+        PairTarget::Ticket(window.ticket.clone()),
+        Some(window.code.clone()),
+    )
+    .await
+    .expect("pairing succeeds");
+
+    // Pairing establishes the mesh session: the subscriber sees the
+    // Connected transition, attributed to b's id and store name.
+    let connected = timeout(Duration::from_secs(15), async {
+        loop {
+            let event = events.recv().await.expect("peer-events channel open");
+            if event.state == PeerState::Connected {
+                break event;
+            }
+        }
+    })
+    .await
+    .expect("a sees the Connected transition");
+    assert_eq!(connected.peer.0, b_id);
+    assert_eq!(connected.name, "node-b");
+
+    // Shut b down. Its connection close ends a's session, which must
+    // surface as a Down transition within ~15 s (spec §5 uses 10 s of
+    // heartbeat silence as the outer bound; a clean close is immediate).
+    b.shutdown().await.unwrap();
+    let down = timeout(Duration::from_secs(15), async {
+        loop {
+            let event = events.recv().await.expect("peer-events channel open");
+            if event.state == PeerState::Down {
+                break event;
+            }
+        }
+    })
+    .await
+    .expect("a sees the Down transition after b shut down");
+    assert_eq!(down.peer.0, b_id);
+    assert_eq!(down.name, "node-b");
+
+    a.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn restart_reconnects_without_repairing() {
     let a_dir = TempDir::new().unwrap();
     let b_dir = TempDir::new().unwrap();

@@ -27,7 +27,10 @@ pub const PRODUCT_NAME: &str = "OneBrain";
 ///   is legal here because the engine build-hash gate already forces every
 ///   cluster to be same-build; this bump exists so the refusal message
 ///   stays truthful when genuinely mixed builds meet.
-pub const PROTO_VERSION: u16 = 2;
+/// - `3` — M5: `NodeStatus` gained `draining` in place (battery drain
+///   policy, docs/resilience.md) — the same build-hash-gate justification
+///   as version 2.
+pub const PROTO_VERSION: u16 = 3;
 
 /// Errors produced while encoding or decoding protocol messages.
 #[derive(Debug, thiserror::Error)]

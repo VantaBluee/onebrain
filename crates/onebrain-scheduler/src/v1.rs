@@ -44,6 +44,16 @@
 //! profiled the compute term is zero and only boundary RTTs differ, which
 //! makes "more nodes never help unless memory demands it" fall out
 //! naturally.
+//!
+//! # Draining nodes (M5)
+//!
+//! A node whose `NodeStatus` advertises `draining` (battery below the drain
+//! threshold and not on AC — docs/resilience.md) is excluded from new plans
+//! unless the plan is infeasible without it; then it joins and the
+//! explanation says so explicitly ("included despite draining battery: the
+//! plan does not fit without it"). Under `--nodes N`, draining nodes rank
+//! behind every non-draining node, so they fill the count only when nothing
+//! else can.
 
 use onebrain_proto::plan::{Assignment, Epoch, LayerRange, NodeId, Plan, Strategy};
 
@@ -79,6 +89,11 @@ pub struct NodeCaps {
     /// From the node's `NodeStatus` / persisted profile; `None` until the
     /// node has benched.
     pub compute: Option<ComputeProfile>,
+    /// `true` when the node advertised battery drain in its `NodeStatus`
+    /// (M5, docs/resilience.md). Draining nodes are excluded from new plans
+    /// unless the plan is infeasible without them — then they join and the
+    /// explanation says so. Default `false` (mains-powered / desktop).
+    pub draining: bool,
 }
 
 /// Measured round-trip time between two nodes, from the mesh prober.
@@ -122,6 +137,7 @@ impl From<&PlanInput> for PlanRequest {
             node: n.node.clone(),
             usable_memory_bytes: n.usable_memory_bytes,
             compute: None,
+            draining: false,
         };
         PlanRequest {
             head: to_caps(&input.head),
@@ -509,16 +525,20 @@ fn distributed_v1(
     let pooled_budget: u64 = cands.iter().map(|c| c.budget).sum();
 
     // ---- Participant selection ------------------------------------------
-    // Worker candidate order: by memory-and-compute score, descending
-    // (ties: earlier stable order).
+    // Worker candidate order: non-draining before draining (a draining
+    // battery joins only when nothing else works — docs/resilience.md), then
+    // by memory-and-compute score, descending (ties: earlier stable order).
     let mut ranked_workers: Vec<usize> = (0..head_idx).collect();
     ranked_workers.sort_by(|&a, &b| {
         let (sa, sb) = (
             cands[a].cap_f * cands[a].factor,
             cands[b].cap_f * cands[b].factor,
         );
-        sb.partial_cmp(&sa)
-            .expect("scores are never NaN")
+        cands[a]
+            .caps
+            .draining
+            .cmp(&cands[b].caps.draining)
+            .then(sb.partial_cmp(&sa).expect("scores are never NaN"))
             .then(a.cmp(&b))
     });
 
@@ -534,7 +554,9 @@ fn distributed_v1(
 
     match forced {
         Some(n) => {
-            // Forced: exactly the n-1 best-scoring workers; no 5% rule.
+            // Forced: exactly the n-1 best-ranked workers; no 5% rule.
+            // Draining nodes rank last, so they join only when the count
+            // cannot be met without them — and the explanation says so.
             selected = ranked_workers
                 .iter()
                 .copied()
@@ -545,6 +567,15 @@ fn distributed_v1(
                  time-per-token test",
                 n - 1
             ));
+            for &wi in &selected {
+                if cands[wi].caps.draining {
+                    selection_notes.push(format!(
+                        "Node '{}': included despite draining battery: --nodes {n} cannot be \
+                         met with non-draining nodes alone",
+                        cands[wi].caps.node.0
+                    ));
+                }
+            }
         }
         None => {
             for &wi in &ranked_workers {
@@ -561,6 +592,28 @@ fn distributed_v1(
                     continue;
                 }
                 let current = evaluate(&participants(&selected), n_layers, &input.links);
+                // A draining node never joins for speed; it joins only when
+                // the plan does not fit without it (docs/resilience.md).
+                if cand.caps.draining {
+                    match current {
+                        None => {
+                            selection_notes.push(format!(
+                                "Node '{}': included despite draining battery: the plan does \
+                                 not fit without it",
+                                cand.caps.node.0
+                            ));
+                            selected.push(wi);
+                        }
+                        Some(_) => {
+                            selection_notes.push(format!(
+                                "Node '{}': excluded — battery draining (a draining node \
+                                 joins new plans only when the model does not fit without it)",
+                                cand.caps.node.0
+                            ));
+                        }
+                    }
+                    continue;
+                }
                 match current {
                     None => {
                         let have: u64 = participants(&selected).iter().map(|c| c.cap_layers).sum();
@@ -808,6 +861,15 @@ mod tests {
                 prefill_tps: d * 8.0,
                 decode_tps: d,
             }),
+            draining: false,
+        }
+    }
+
+    /// [`caps`] with the M5 battery-drain flag set.
+    fn draining_caps(id: &str, usable_mib: u64, decode_tps: Option<f64>) -> NodeCaps {
+        NodeCaps {
+            draining: true,
+            ..caps(id, usable_mib, decode_tps)
         }
     }
 
@@ -1141,5 +1203,76 @@ mod tests {
             }
             other => panic!("expected NotEnoughNodes, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn draining_node_excluded_when_others_suffice() {
+        // Three equal nodes, cheap links: adding w2 trims the max stage from
+        // 16 to 11 layers (160 -> 110 relative ms at 100 tok/s) against a
+        // 0.1 ms boundary — a ~31% gain, far over the 5% bar. Sanity: with
+        // no drain flag, w2 joins.
+        let req = |w2: NodeCaps| PlanRequest {
+            head: caps("head", 3072, Some(100.0)),
+            workers: vec![caps("w1", 3072, Some(100.0)), w2],
+            dims: dims(32, 100, 16384),
+            ctx_len: 2048,
+            forced_nodes: None,
+            links: vec![
+                link("w1", "head", 0.1),
+                link("w2", "head", 0.1),
+                link("w1", "w2", 0.1),
+            ],
+        };
+        let fresh = plan_v1(&req(caps("w2", 3072, Some(100.0)))).unwrap();
+        assert_eq!(
+            fresh.plan.assignments.len(),
+            3,
+            "sanity: w2 must join when not draining\n{}",
+            fresh.explanation
+        );
+
+        // Same cluster, w2 on a draining battery: the two remaining nodes
+        // hold the model, so w2 stays out and the explanation says why.
+        let placed = plan_v1(&req(draining_caps("w2", 3072, Some(100.0)))).unwrap();
+        let a = &placed.plan.assignments;
+        assert_eq!(a.len(), 2, "{}", placed.explanation);
+        assert!(a.iter().all(|x| x.node.0 != "w2"));
+        assert!(
+            placed
+                .explanation
+                .contains("Node 'w2': excluded — battery draining"),
+            "{}",
+            placed.explanation
+        );
+    }
+
+    #[test]
+    fn draining_node_included_when_the_plan_does_not_fit_without_it() {
+        // 2200 MiB usable -> 1688 MiB budget -> 12-layer capacity each; two
+        // nodes hold 24 < 32 layers, so the draining third node must join —
+        // and the explanation says so explicitly (docs/resilience.md).
+        let placed = plan_v1(&PlanRequest {
+            head: caps("head", 2200, Some(100.0)),
+            workers: vec![
+                caps("w1", 2200, Some(100.0)),
+                draining_caps("w2", 2200, Some(100.0)),
+            ],
+            dims: dims(32, 100, 16384),
+            ctx_len: 2048,
+            forced_nodes: None,
+            links: vec![],
+        })
+        .unwrap();
+        assert_eq!(placed.plan.assignments.len(), 3, "{}", placed.explanation);
+        assert!(placed.plan.assignments.iter().any(|x| x.node.0 == "w2"));
+        assert!(
+            placed.explanation.contains(
+                "Node 'w2': included despite draining battery: the plan does not fit \
+                 without it"
+            ),
+            "{}",
+            placed.explanation
+        );
+        assert_contiguous(&placed, 32);
     }
 }

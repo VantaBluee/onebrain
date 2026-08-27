@@ -26,6 +26,16 @@
 //! [`MeshHandle::send_control`], which opens a short-lived `Control` stream
 //! per message (the persistent heartbeat stream stays heartbeat-only).
 //!
+//! # Peer events (M5)
+//!
+//! [`MeshHandle::peer_events`] hands out a single-consumer stream of
+//! [`PeerEvent`]s: one per live peer-state transition (`Connected`,
+//! `Suspect`, `Down`, `Incompatible`), plus a [`PeerState::Draining`] event
+//! whenever a proto `Draining` envelope arrives from that peer over control
+//! (the envelope itself is still forwarded to the control consumer — the
+//! daemon needs its epoch). The daemon's failure lifecycle keys off this
+//! stream (docs/resilience.md).
+//!
 //! # Reconnection across restarts (M2 DoD)
 //!
 //! The peer store (`peers.toml`) persists each peer's last-known
@@ -76,8 +86,8 @@ pub mod store;
 
 pub use iroh::endpoint::{RecvStream, SendStream};
 pub use service::{
-    ControlMessage, IncomingRpcStream, MeshHandle, MeshService, PairEvent, PairWindow, PeerInfo,
-    ALPN_MESH, ALPN_PAIR,
+    ControlMessage, IncomingRpcStream, MeshHandle, MeshService, PairEvent, PairWindow, PeerEvent,
+    PeerInfo, ALPN_MESH, ALPN_PAIR,
 };
 
 /// This node's `NodeStatus` payload as supplied by the daemon's provider:
@@ -86,7 +96,11 @@ pub use service::{
 /// microbench figures from the persisted device profile. The profile fields
 /// are `None` until the node has run `onebrain bench` (the scheduler then
 /// falls back to memory-only weighting, docs/scheduler-v1.md).
-#[derive(Debug, Clone)]
+///
+/// `Default` is the empty report (no memory, no devices, unprofiled, not
+/// draining) so construction sites can spell only the fields they know via
+/// `..Default::default()` as the report grows across milestones.
+#[derive(Debug, Clone, Default)]
 pub struct NodeStatusReport {
     pub usable_memory_bytes: u64,
     pub devices: Vec<DeviceBrief>,
@@ -96,6 +110,9 @@ pub struct NodeStatusReport {
     pub decode_tps: Option<f64>,
     /// Measured sequential disk read rate (MB/s), if profiled.
     pub disk_mbps: Option<f64>,
+    /// `true` while this node's battery policy asks new plans to avoid it
+    /// (M5, docs/resilience.md). `false` for desktops / on AC.
+    pub draining: bool,
 }
 
 /// Provider for this node's `NodeStatus` message. Called once per
@@ -255,13 +272,13 @@ pub enum MeshError {
     /// The mesh service task is gone.
     #[error("the mesh service has stopped; restart the daemon (`onebrain up`)")]
     ServiceStopped,
-    /// `incoming_rpc`/`incoming_control` called twice.
+    /// `incoming_rpc`/`incoming_control`/`peer_events` called twice.
     #[error(
         "the incoming {what} receiver was already taken; only one daemon task may consume \
          mesh {what} traffic — restart the daemon if this recurs"
     )]
     ConsumerTaken {
-        /// Which receiver ("rpc" or "control").
+        /// Which receiver ("rpc", "control", or "peer-events").
         what: &'static str,
     },
 }
@@ -349,6 +366,16 @@ pub enum PeerState {
     Down,
     /// The `Hello` handshake failed: protocol or engine build mismatch.
     Incompatible,
+    /// The peer announced a polite drain: a proto `Draining` envelope
+    /// arrived on control (battery policy or `onebrain stop` — M5,
+    /// docs/resilience.md). Surfaced through [`MeshHandle::peer_events`]
+    /// only; `peers()` keeps reporting the session-derived state (usually
+    /// still [`PeerState::Connected`] until the peer actually goes away).
+    /// Planners treat a draining peer like a dead one when building NEW
+    /// plans; no QUIC close code is involved (the close-code list in
+    /// `onebrain_proto::message` is unchanged — draining is an envelope,
+    /// not a close).
+    Draining,
 }
 
 /// One row of `peers()`: persisted store entry merged with live link state.
@@ -381,6 +408,12 @@ pub struct PeerStatus {
     /// Sequential disk read rate (MB/s) from the peer's last `NodeStatus`
     /// (page-cache upper bound; relative ordering only).
     pub disk_mbps: Option<f64>,
+    /// `true` when the peer's last `NodeStatus` advertised battery drain
+    /// (M5, docs/resilience.md): the scheduler excludes it from new plans
+    /// unless a plan is infeasible without it. Overwritten whole by every
+    /// `NodeStatus`, like the profile fields; `false` until one arrives.
+    #[serde(default)]
+    pub draining: bool,
 }
 
 /// Measured quality of a link between two nodes. Populated by the prober;

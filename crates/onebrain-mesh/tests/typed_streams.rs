@@ -19,6 +19,9 @@ const BETA_USABLE: u64 = 7 * 1024 * 1024 * 1024;
 const BETA_PREFILL_TPS: f64 = 812.5;
 const BETA_DECODE_TPS: f64 = 41.25;
 const BETA_DISK_MBPS: f64 = 1732.0;
+/// Beta advertises battery drain (M5) so the roundtrip into alpha's
+/// `PeerStatus` is asserted on a non-default value.
+const BETA_DRAINING: bool = true;
 
 fn loopback() -> SocketAddr {
     SocketAddr::from((Ipv4Addr::LOCALHOST, 0))
@@ -37,6 +40,7 @@ async fn spawn_node(dir: &TempDir, name: &str, usable: Option<u64>) -> MeshHandl
             prefill_tps: Some(BETA_PREFILL_TPS),
             decode_tps: Some(BETA_DECODE_TPS),
             disk_mbps: Some(BETA_DISK_MBPS),
+            draining: BETA_DRAINING,
         }) as onebrain_mesh::NodeStatusFn
     });
     onebrain_mesh::MeshService::spawn(
@@ -94,6 +98,7 @@ async fn typed_streams_control_and_rpc_roundtrip() {
     let mut alpha_ctrl = alpha.incoming_control().await.expect("alpha control rx");
     let mut beta_ctrl = beta.incoming_control().await.expect("beta control rx");
     let mut beta_rpc = beta.incoming_rpc().await.expect("beta rpc rx");
+    let mut alpha_events = alpha.peer_events().await.expect("alpha peer-events rx");
     // Single-consumer contract: a second take is refused.
     assert!(matches!(
         beta.incoming_control().await,
@@ -102,6 +107,12 @@ async fn typed_streams_control_and_rpc_roundtrip() {
     assert!(matches!(
         beta.incoming_rpc().await,
         Err(MeshError::ConsumerTaken { what: "rpc" })
+    ));
+    assert!(matches!(
+        alpha.peer_events().await,
+        Err(MeshError::ConsumerTaken {
+            what: "peer-events"
+        })
     ));
 
     // Pair via ticket, then heartbeats (now header-framed Control streams)
@@ -120,12 +131,13 @@ async fn typed_streams_control_and_rpc_roundtrip() {
     .await;
 
     // Beta's NodeStatus (sent right after Hello) lands in alpha's peer view,
-    // including the M4 microbench profile fields.
+    // including the M4 microbench profile fields and the M5 draining flag.
     wait_for_peer(&alpha, "beta's NodeStatus budget + profile", |p| {
         p.usable_memory_bytes == Some(BETA_USABLE)
             && p.prefill_tps == Some(BETA_PREFILL_TPS)
             && p.decode_tps == Some(BETA_DECODE_TPS)
             && p.disk_mbps == Some(BETA_DISK_MBPS)
+            && p.draining == BETA_DRAINING
     })
     .await;
 
@@ -177,6 +189,45 @@ async fn typed_streams_control_and_rpc_roundtrip() {
     assert_eq!(ack.0, NodeId(beta_id.clone()));
     assert_eq!(ack.1, Epoch(3));
     assert!(ack.2);
+
+    // M5 drain notice: beta announces `Draining`; alpha's peer-events
+    // consumer sees a `PeerState::Draining` event AND the envelope still
+    // reaches the control consumer with its epoch (the daemon fences on it,
+    // docs/resilience.md).
+    beta.send_control(
+        &alpha_id,
+        Envelope::new(Message::Draining {
+            epoch: Epoch(3),
+            reason: "battery below threshold".into(),
+        }),
+    )
+    .await
+    .expect("send Draining by id");
+    let drain = timeout(Duration::from_secs(15), async {
+        loop {
+            let msg = alpha_ctrl.recv().await.expect("alpha control channel open");
+            if let Message::Draining { epoch, reason } = msg.envelope.message {
+                break (msg.peer, epoch, reason);
+            }
+        }
+    })
+    .await
+    .expect("alpha receives the drain envelope");
+    assert_eq!(drain.0, NodeId(beta_id.clone()));
+    assert_eq!(drain.1, Epoch(3));
+    assert_eq!(drain.2, "battery below threshold");
+    let drain_event = timeout(Duration::from_secs(15), async {
+        loop {
+            let event = alpha_events.recv().await.expect("alpha peer-events open");
+            if event.state == PeerState::Draining {
+                break event;
+            }
+        }
+    })
+    .await
+    .expect("alpha sees the Draining peer event");
+    assert_eq!(drain_event.peer, NodeId(beta_id.clone()));
+    assert_eq!(drain_event.name, "beta");
 
     // Rpc stream: opened with an epoch, delivered to beta's consumer, and
     // byte-transparent in both directions after the header.

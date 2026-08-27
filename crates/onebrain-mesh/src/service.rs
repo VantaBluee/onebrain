@@ -97,6 +97,22 @@ pub struct ControlMessage {
     pub envelope: Envelope,
 }
 
+/// One peer state transition, delivered to the single
+/// [`MeshHandle::peer_events`] consumer (M5, docs/resilience.md): emitted on
+/// every live-state change (`Connected`, `Suspect`, `Down`, `Incompatible`)
+/// and, with [`PeerState::Draining`], whenever a proto `Draining` envelope
+/// arrives from the peer over control (the envelope itself still reaches the
+/// control consumer, epoch included).
+#[derive(Debug, Clone)]
+pub struct PeerEvent {
+    /// The peer whose state changed (endpoint id, hex).
+    pub peer: NodeId,
+    /// The peer's human-readable name from the peer store.
+    pub name: String,
+    /// The state entered (or [`PeerState::Draining`] for a drain notice).
+    pub state: PeerState,
+}
+
 /// An accepted `rpc` bi-stream, delivered to the daemon for bridging into a
 /// local GGML RPC session. The mesh validates the sender is a paired peer
 /// (sessions only exist for store members); the *epoch* is validated by the
@@ -183,6 +199,9 @@ enum Internal {
     TakeControl {
         reply: oneshot::Sender<Option<mpsc::Receiver<ControlMessage>>>,
     },
+    TakeEvents {
+        reply: oneshot::Sender<Option<mpsc::Receiver<PeerEvent>>>,
+    },
     SendControl {
         peer: String,
         envelope: Envelope,
@@ -267,6 +286,9 @@ struct Live {
     prefill_tps: Option<f64>,
     decode_tps: Option<f64>,
     disk_mbps: Option<f64>,
+    /// Battery-drain flag from the peer's last `NodeStatus` (M5). Like the
+    /// profile fields, overwritten whole on every `NodeStatus`.
+    draining: bool,
 }
 
 type LiveMap = Arc<StdMutex<HashMap<EndpointId, Live>>>;
@@ -274,6 +296,51 @@ type LiveMap = Arc<StdMutex<HashMap<EndpointId, Live>>>;
 fn set_live(live: &LiveMap, peer: EndpointId, update: impl FnOnce(&mut Live)) {
     let mut map = live.lock().expect("live map poisoned");
     update(map.entry(peer).or_default());
+}
+
+/// Record `state` for `peer` in the live map and, when that CHANGES the
+/// peer's state, emit a [`PeerEvent`] toward the `peer_events()` consumer.
+/// Events are sent with `try_send`: peer transitions are rare, so the
+/// buffer only fills if the consumer stalls for dozens of transitions — a
+/// dropped event is logged, never blocks a session task.
+fn note_transition(
+    live: &LiveMap,
+    events: &mpsc::Sender<PeerEvent>,
+    peer: EndpointId,
+    name: &str,
+    state: PeerState,
+) {
+    let changed = {
+        let mut map = live.lock().expect("live map poisoned");
+        let entry = map.entry(peer).or_default();
+        let changed = entry.state != Some(state);
+        entry.state = Some(state);
+        changed
+    };
+    if changed {
+        emit_peer_event(events, peer, name, state);
+    }
+}
+
+/// Send one [`PeerEvent`] (best effort; see [`note_transition`]).
+fn emit_peer_event(
+    events: &mpsc::Sender<PeerEvent>,
+    peer: EndpointId,
+    name: &str,
+    state: PeerState,
+) {
+    let event = PeerEvent {
+        peer: NodeId(peer.to_string()),
+        name: name.to_string(),
+        state,
+    };
+    if events.try_send(event).is_err() {
+        debug!(
+            peer = %peer.fmt_short(),
+            ?state,
+            "peer event dropped: consumer buffer full or service stopping"
+        );
+    }
 }
 
 fn unix_now() -> u64 {
@@ -323,6 +390,10 @@ struct Service {
     ctrl_tx: mpsc::Sender<ControlMessage>,
     /// Receiver side, held until taken via `incoming_control`.
     ctrl_rx: Option<mpsc::Receiver<ControlMessage>>,
+    /// Sender side of the peer-event channel (cloned into sessions).
+    event_tx: mpsc::Sender<PeerEvent>,
+    /// Receiver side, held until taken via `peer_events`.
+    event_rx: Option<mpsc::Receiver<PeerEvent>>,
 }
 
 impl MeshService {
@@ -379,6 +450,7 @@ impl MeshService {
 
         let (rpc_tx, rpc_rx) = mpsc::channel(16);
         let (ctrl_tx, ctrl_rx) = mpsc::channel(64);
+        let (event_tx, event_rx) = mpsc::channel(64);
         let service = Service {
             ep,
             store,
@@ -399,6 +471,8 @@ impl MeshService {
             rpc_rx: Some(rpc_rx),
             ctrl_tx,
             ctrl_rx: Some(ctrl_rx),
+            event_tx,
+            event_rx: Some(event_rx),
         };
         // Kick one dial attempt per stored peer at startup (using the
         // addressing persisted in the peer store); the reconnect ticker
@@ -490,6 +564,20 @@ impl MeshHandle {
             .ok_or(MeshError::ConsumerTaken { what: "control" })
     }
 
+    /// Take the receiver of [`PeerEvent`]s: one event per live peer-state
+    /// transition (`Connected`, `Suspect`, `Down`, `Incompatible`), plus a
+    /// [`PeerState::Draining`] event whenever the peer announces a polite
+    /// drain over control (M5, docs/resilience.md — the daemon's failure
+    /// lifecycle keys off this stream). Single consumer, like
+    /// [`Self::incoming_control`].
+    pub async fn peer_events(&self) -> Result<mpsc::Receiver<PeerEvent>, MeshError> {
+        self.request(|reply| Internal::TakeEvents { reply })
+            .await?
+            .ok_or(MeshError::ConsumerTaken {
+                what: "peer-events",
+            })
+    }
+
     /// Send one [`Envelope`] to a peer (by name or endpoint id) on a fresh
     /// short-lived `Control` stream. Returns once the frame is written and
     /// the stream finished; QUIC delivers it reliably while the session
@@ -572,6 +660,9 @@ impl Service {
                 }
                 Internal::TakeControl { reply } => {
                     let _ = reply.send(self.ctrl_rx.take());
+                }
+                Internal::TakeEvents { reply } => {
+                    let _ = reply.send(self.event_rx.take());
                 }
                 Internal::SendControl {
                     peer,
@@ -886,6 +977,7 @@ impl Service {
                 prefill_tps: entry.prefill_tps,
                 decode_tps: entry.decode_tps,
                 disk_mbps: entry.disk_mbps,
+                draining: entry.draining,
             });
         }
         out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -1141,10 +1233,21 @@ impl Service {
                 }
             }
         }
+        // Resolve the peer's store name once for peer events; sessions only
+        // exist for store members, so a miss (unpair race) falls back to the
+        // short id form.
+        let peer_name = self
+            .store
+            .load()
+            .ok()
+            .and_then(|mut stored| stored.remove(&peer.to_string()))
+            .map(|record| record.name)
+            .unwrap_or_else(|| peer.fmt_short().to_string());
         let ctx = SessionCtx {
             conn: conn.clone(),
             dialer,
             peer,
+            peer_name,
             hello: self.local_hello(),
             live: self.live.clone(),
             tx: self.tx.clone(),
@@ -1152,6 +1255,7 @@ impl Service {
             node_status: self.cfg.node_status.clone(),
             rpc_tx: self.rpc_tx.clone(),
             ctrl_tx: self.ctrl_tx.clone(),
+            event_tx: self.event_tx.clone(),
         };
         let runner = tokio::spawn(session_runner(ctx));
         self.sessions.insert(
@@ -1382,6 +1486,9 @@ struct SessionCtx {
     conn: Connection,
     dialer: bool,
     peer: EndpointId,
+    /// The peer's store name, resolved at session adoption (used in
+    /// [`PeerEvent`]s).
+    peer_name: String,
     hello: Hello,
     live: LiveMap,
     tx: mpsc::Sender<Internal>,
@@ -1389,6 +1496,7 @@ struct SessionCtx {
     node_status: Option<NodeStatusFn>,
     rpc_tx: mpsc::Sender<IncomingRpcStream>,
     ctrl_tx: mpsc::Sender<ControlMessage>,
+    event_tx: mpsc::Sender<PeerEvent>,
 }
 
 /// The remote transport addresses of a connection's live QUIC paths, split
@@ -1423,11 +1531,23 @@ async fn session_runner(ctx: SessionCtx) {
     let stable_id = ctx.conn.stable_id();
     let peer = ctx.peer;
     let end = run_session(&ctx).await;
-    set_live(&ctx.live, peer, |l| match end {
-        SessionEnd::Incompatible => l.state = Some(PeerState::Incompatible),
-        SessionEnd::Established => l.state = Some(PeerState::Down),
+    match end {
+        SessionEnd::Incompatible => note_transition(
+            &ctx.live,
+            &ctx.event_tx,
+            peer,
+            &ctx.peer_name,
+            PeerState::Incompatible,
+        ),
+        SessionEnd::Established => note_transition(
+            &ctx.live,
+            &ctx.event_tx,
+            peer,
+            &ctx.peer_name,
+            PeerState::Down,
+        ),
         SessionEnd::NeverEstablished => {}
-    });
+    }
     let _ = ctx
         .tx
         .send(Internal::SessionEnded { peer, stable_id })
@@ -1504,17 +1624,27 @@ async fn run_session(ctx: &SessionCtx) -> SessionEnd {
         }
     }
     set_live(&ctx.live, ctx.peer, |l| {
-        l.state = Some(PeerState::Connected);
         l.last_seen_unix = Some(unix_now());
     });
+    note_transition(
+        &ctx.live,
+        &ctx.event_tx,
+        ctx.peer,
+        &ctx.peer_name,
+        PeerState::Connected,
+    );
 
     let mut workers = JoinSet::new();
     workers.spawn(stream_acceptor(
         ctx.conn.clone(),
-        ctx.peer,
-        ctx.live.clone(),
-        ctx.rpc_tx.clone(),
-        ctx.ctrl_tx.clone(),
+        StreamPeerCtx {
+            peer: ctx.peer,
+            name: ctx.peer_name.clone(),
+            live: ctx.live.clone(),
+            rpc_tx: ctx.rpc_tx.clone(),
+            ctrl_tx: ctx.ctrl_tx.clone(),
+            event_tx: ctx.event_tx.clone(),
+        },
     ));
     workers.spawn(uni_drainer(ctx.conn.clone()));
     {
@@ -1543,6 +1673,7 @@ async fn run_session(ctx: &SessionCtx) -> SessionEnd {
                 prefill_tps: status.prefill_tps,
                 decode_tps: status.decode_tps,
                 disk_mbps: status.disk_mbps,
+                draining: status.draining,
             });
             match send_control_stream(&conn, &envelope).await {
                 Ok(()) => debug!(
@@ -1554,7 +1685,7 @@ async fn run_session(ctx: &SessionCtx) -> SessionEnd {
         });
     }
     tokio::select! {
-        _ = run_heartbeat(&ctx.conn, &ctx.live, ctx.peer) => {
+        _ = run_heartbeat(&ctx.conn, &ctx.live, ctx.peer, &ctx.peer_name, &ctx.event_tx) => {
             ctx.conn.close(0u32.into(), b"heartbeat-lost");
         }
         err = ctx.conn.closed() => {
@@ -1645,7 +1776,15 @@ fn expect_hello(envelope: Envelope) -> Result<Hello, MeshError> {
 /// Send `Envelope(Heartbeat)` every 2 s on a dedicated bi stream and measure
 /// echo round-trips. Returns when the peer is `down` (10 s silence) or the
 /// stream fails. 3 missed heartbeats mark the peer `suspect` (spec §5).
-async fn run_heartbeat(conn: &Connection, live: &LiveMap, peer: EndpointId) {
+/// Suspect/Connected flips go through [`note_transition`], so the
+/// `peer_events()` consumer sees each one exactly once.
+async fn run_heartbeat(
+    conn: &Connection,
+    live: &LiveMap,
+    peer: EndpointId,
+    peer_name: &str,
+    events: &mpsc::Sender<PeerEvent>,
+) {
     let (mut tx, mut rx) = match conn.open_bi().await {
         Ok(pair) => pair,
         Err(err) => {
@@ -1678,7 +1817,7 @@ async fn run_heartbeat(conn: &Connection, live: &LiveMap, peer: EndpointId) {
                     return;
                 }
                 if missed >= SUSPECT_AFTER_MISSED {
-                    set_live(live, peer, |l| l.state = Some(PeerState::Suspect));
+                    note_transition(live, events, peer, peer_name, PeerState::Suspect);
                 }
                 let beat = Envelope::new(Message::Heartbeat { epoch: Epoch(0) });
                 if write_frame(&mut tx, &beat).await.is_err() {
@@ -1703,9 +1842,11 @@ async fn run_heartbeat(conn: &Connection, live: &LiveMap, peer: EndpointId) {
                             None => sample_ms,
                         });
                         l.loss = Some(loss);
-                        l.state = Some(PeerState::Connected);
                         l.last_seen_unix = Some(unix_now());
                     });
+                    // Only an actual Suspect -> Connected recovery emits an
+                    // event; steady echoes are transition-free.
+                    note_transition(live, events, peer, peer_name, PeerState::Connected);
                 }
             }
         }
@@ -1727,29 +1868,30 @@ fn loss_fraction(history: &VecDeque<bool>) -> f32 {
     missed as f32 / history.len() as f32
 }
 
+/// Everything a per-stream handler needs to know about the peer whose
+/// connection the stream arrived on: identity, store name, and the shared
+/// channels/state its traffic feeds.
+#[derive(Clone)]
+struct StreamPeerCtx {
+    peer: EndpointId,
+    /// The peer's store name (used in [`PeerEvent`]s).
+    name: String,
+    live: LiveMap,
+    rpc_tx: mpsc::Sender<IncomingRpcStream>,
+    ctrl_tx: mpsc::Sender<ControlMessage>,
+    event_tx: mpsc::Sender<PeerEvent>,
+}
+
 /// Accept the peer's bi-streams and dispatch them by their `StreamHeader`
 /// kind: `Control` streams run the envelope loop (heartbeat echo + control
 /// message delivery), `Rpc` streams are handed to the daemon's consumer, and
 /// `Probe` is reserved (drained).
-async fn stream_acceptor(
-    conn: Connection,
-    peer: EndpointId,
-    live: LiveMap,
-    rpc_tx: mpsc::Sender<IncomingRpcStream>,
-    ctrl_tx: mpsc::Sender<ControlMessage>,
-) {
+async fn stream_acceptor(conn: Connection, ctx: StreamPeerCtx) {
     let mut handlers = JoinSet::new();
     loop {
         match conn.accept_bi().await {
             Ok((tx, rx)) => {
-                handlers.spawn(handle_stream(
-                    peer,
-                    tx,
-                    rx,
-                    live.clone(),
-                    rpc_tx.clone(),
-                    ctrl_tx.clone(),
-                ));
+                handlers.spawn(handle_stream(ctx.clone(), tx, rx));
             }
             Err(_) => break,
         }
@@ -1758,14 +1900,8 @@ async fn stream_acceptor(
     handlers.abort_all();
 }
 
-async fn handle_stream(
-    peer: EndpointId,
-    tx: SendStream,
-    mut rx: RecvStream,
-    live: LiveMap,
-    rpc_tx: mpsc::Sender<IncomingRpcStream>,
-    ctrl_tx: mpsc::Sender<ControlMessage>,
-) {
+async fn handle_stream(ctx: StreamPeerCtx, tx: SendStream, mut rx: RecvStream) {
+    let peer = ctx.peer;
     let header = match read_frame::<StreamHeader>(&mut rx).await {
         Ok(header) => header,
         Err(err) => {
@@ -1774,7 +1910,7 @@ async fn handle_stream(
         }
     };
     match header.kind {
-        StreamKind::Control => control_stream(peer, tx, rx, live, ctrl_tx).await,
+        StreamKind::Control => control_stream(ctx, tx, rx).await,
         StreamKind::Rpc => {
             let incoming = IncomingRpcStream {
                 peer: NodeId(peer.to_string()),
@@ -1782,7 +1918,7 @@ async fn handle_stream(
                 send: tx,
                 recv: rx,
             };
-            if let Err(returned) = rpc_tx.send(incoming).await {
+            if let Err(returned) = ctx.rpc_tx.send(incoming).await {
                 // No daemon consumer (or it is gone): refuse rather than
                 // leaving the head's bridge hanging. Code 4 — the receiving
                 // side cannot have an active epoch without a consumer.
@@ -1805,16 +1941,13 @@ async fn handle_stream(
 }
 
 /// The `Control` envelope loop: heartbeats are echoed back unchanged (the
-/// pre-M3 wire behavior), `NodeStatus` is cached into the live map, and
-/// every non-heartbeat envelope is forwarded to the daemon's control
-/// consumer.
-async fn control_stream(
-    peer: EndpointId,
-    mut tx: SendStream,
-    mut rx: RecvStream,
-    live: LiveMap,
-    ctrl_tx: mpsc::Sender<ControlMessage>,
-) {
+/// pre-M3 wire behavior), `NodeStatus` is cached into the live map (budget,
+/// profile, and — M5 — the `draining` flag), a `Draining` envelope emits a
+/// [`PeerState::Draining`] peer event, and every non-heartbeat envelope is
+/// forwarded to the daemon's control consumer (`Draining` included: the
+/// daemon needs its epoch, docs/resilience.md).
+async fn control_stream(ctx: StreamPeerCtx, mut tx: SendStream, mut rx: RecvStream) {
+    let peer = ctx.peer;
     loop {
         match read_frame::<Envelope>(&mut rx).await {
             Ok(envelope) => {
@@ -1829,25 +1962,44 @@ async fn control_stream(
                     prefill_tps,
                     decode_tps,
                     disk_mbps,
+                    draining,
                     ..
                 } = &envelope.message
                 {
                     let usable = *usable_memory_bytes;
                     let (prefill, decode, disk) = (*prefill_tps, *decode_tps, *disk_mbps);
-                    set_live(&live, peer, |l| {
+                    let draining = *draining;
+                    set_live(&ctx.live, peer, |l| {
                         l.usable_memory_bytes = Some(usable);
                         // The profile fields are overwritten whole: a peer
                         // that has not (or no longer) benched reports None.
                         l.prefill_tps = prefill;
                         l.decode_tps = decode;
                         l.disk_mbps = disk;
+                        // Same rule for the drain flag: every NodeStatus is
+                        // the whole truth (a recharged node reports false).
+                        l.draining = draining;
                     });
+                }
+                if let Message::Draining { epoch, reason } = &envelope.message {
+                    // Polite drain notice: surface it to the peer-events
+                    // consumer. The live state is NOT changed — the session
+                    // stays Connected until the peer actually goes away —
+                    // and the envelope still flows to the control consumer
+                    // below (the daemon fences on its epoch).
+                    debug!(
+                        peer = %peer.fmt_short(),
+                        epoch = epoch.0,
+                        reason,
+                        "peer announced a polite drain"
+                    );
+                    emit_peer_event(&ctx.event_tx, peer, &ctx.name, PeerState::Draining);
                 }
                 let message = ControlMessage {
                     peer: NodeId(peer.to_string()),
                     envelope,
                 };
-                if ctrl_tx.send(message).await.is_err() {
+                if ctx.ctrl_tx.send(message).await.is_err() {
                     debug!(
                         peer = %peer.fmt_short(),
                         "control message dropped: no consumer registered"
