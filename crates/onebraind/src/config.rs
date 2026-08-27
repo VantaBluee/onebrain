@@ -25,6 +25,18 @@ pub struct Config {
     pub api_bind: String,
     /// Context length for the inference session created at model load.
     pub ctx_len: u32,
+    /// Model-cache size cap in bytes (docs/logistics.md "LRU GC + pinning").
+    /// After every completed download the daemon evicts least-recently-used
+    /// unpinned entries (never the currently loaded model) until the cache
+    /// fits. `0` (the default) disables GC entirely — the cache grows
+    /// unbounded, exactly the pre-M6 behavior.
+    pub cache_max_bytes: u64,
+    /// Size cap in bytes for `<data_dir>/rpc-cache/`, the worker-side RPC
+    /// tensor cache pre-seeded on plan adoption (docs/logistics.md "RPC
+    /// tensor-cache pre-seeding"). After each pre-seed the reaper removes
+    /// least-recently-used files over this cap, never touching files the
+    /// ACTIVE epoch's plan references. Default 20 GiB.
+    pub rpc_cache_max_bytes: u64,
     /// Mesh transport switches (`[mesh]` table, docs/mesh.md).
     pub mesh: MeshSection,
     /// Test-only knobs (`[debug]` table, docs/distributed.md).
@@ -93,6 +105,8 @@ impl Default for Config {
             battery_drain_threshold: 25,
             api_bind: "127.0.0.1:11435".to_string(),
             ctx_len: 4096,
+            cache_max_bytes: 0,
+            rpc_cache_max_bytes: 20 * 1024 * 1024 * 1024,
             mesh: MeshSection::default(),
             debug: DebugSection::default(),
         }
@@ -144,6 +158,9 @@ mod tests {
         // The API listens on loopback only in M1 (internal-api contract).
         assert_eq!(c.api_bind, "127.0.0.1:11435");
         assert_eq!(c.ctx_len, 4096);
+        // M6 logistics defaults: GC off, rpc-cache capped at 20 GiB.
+        assert_eq!(c.cache_max_bytes, 0, "GC must default to disabled");
+        assert_eq!(c.rpc_cache_max_bytes, 20 * 1024 * 1024 * 1024);
         // Mesh defaults on: pairing works out of the box (docs/mesh.md).
         assert!(c.mesh.enable_mdns);
         assert!(c.mesh.enable_relays);
@@ -291,6 +308,34 @@ mod tests {
                 decode_tps_override: Some(80.25),
                 decode_delay_ms: None,
             },
+            ..Default::default()
+        };
+        c.save(&path).unwrap();
+        assert_eq!(Config::load(&path).unwrap(), c);
+    }
+
+    #[test]
+    fn logistics_caps_parse_and_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        // Parse from a hand-written file (the operator's usual route).
+        std::fs::write(
+            &path,
+            "cache_max_bytes = 1073741824\nrpc_cache_max_bytes = 2147483648\n",
+        )
+        .unwrap();
+        let c = Config::load(&path).unwrap();
+        assert_eq!(c.cache_max_bytes, 1 << 30);
+        assert_eq!(c.rpc_cache_max_bytes, 2 << 30);
+        // A file without the keys defaults them in (pre-M6 configs parse).
+        std::fs::write(&path, "ctx_len = 2048\n").unwrap();
+        let c = Config::load(&path).unwrap();
+        assert_eq!(c.cache_max_bytes, 0);
+        assert_eq!(c.rpc_cache_max_bytes, 20 * 1024 * 1024 * 1024);
+        // Full save/load roundtrip.
+        let c = Config {
+            cache_max_bytes: 5_000_000,
+            rpc_cache_max_bytes: 6_000_000,
             ..Default::default()
         };
         c.save(&path).unwrap();

@@ -23,7 +23,7 @@
 //! aborts on a torn stream), and the bridges close afterwards. On the worker
 //! the serve threads end when their streams close, and are joined here.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -49,6 +49,24 @@ use crate::supervisor::{SupervisorMsg, SupervisorTx};
 /// node's schedulable budget (docs/distributed.md "Placement": usable memory
 /// is measured free minus a fixed OS reserve — never total RAM).
 pub const OS_RESERVE_BYTES: u64 = 1 << 30;
+
+/// M6 logistics wiring for the worker side of the cluster task
+/// (docs/logistics.md): where the model cache and the RPC tensor cache
+/// live, and the reaper's cap. Built once by the runtime from `AppPaths` +
+/// `Config`.
+#[derive(Debug, Clone)]
+pub struct WorkerLogistics {
+    /// `<data_dir>/models` — the download/range cache root.
+    pub cache_root: PathBuf,
+    /// `<data_dir>/rpc-cache` — pre-seeded tensor payloads the serve
+    /// sessions answer `SET_TENSOR_HASH` from (ADR 0004 payoff).
+    pub rpc_cache_dir: PathBuf,
+    /// `config.rpc_cache_max_bytes` for the LRU reaper.
+    pub rpc_cache_max_bytes: u64,
+    /// `config.cache_max_bytes` — the worker's range fetch is a download
+    /// too, so it triggers the same GC (0 = disabled).
+    pub cache_max_bytes: u64,
+}
 
 /// How long a worker serve thread gets to finish after its bridge closes.
 const SERVE_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -164,10 +182,19 @@ pub struct LoadedSource {
     pub reference: String,
     /// Canonical display name of the loaded model.
     pub name: String,
-    /// Local GGUF path (the head holds the full file — ADR 0004); what
-    /// planning reads the header from and a distributed reload pushes.
-    pub path: PathBuf,
+    /// Local GGUF part paths in load order (one entry for single-file
+    /// models — the head holds every part, ADR 0004). Planning reads the
+    /// header from the first part; a distributed reload pushes them all.
+    pub paths: Vec<PathBuf>,
     pub size_bytes: u64,
+}
+
+impl LoadedSource {
+    /// The path planning reads the GGUF header from (part 1 carries the
+    /// model-wide metadata for split sets).
+    pub fn header_path(&self) -> &Path {
+        &self.paths[0]
+    }
 }
 
 /// Shared cluster-session state: the epoch counter, the active plan (for
@@ -431,6 +458,10 @@ struct AdoptedPlan {
     epoch: Epoch,
     head: NodeId,
     serves: Vec<WorkerServe>,
+    /// The M6 logistics task for this epoch (range fetch + rpc-cache
+    /// pre-seed). Aborted at teardown; an aborted fetch leaves resumable
+    /// `.part` files that the next adoption picks up.
+    prepare: Option<JoinHandle<()>>,
 }
 
 /// Spawn the cluster task. It exits when the mesh service stops (all
@@ -440,6 +471,7 @@ struct AdoptedPlan {
 /// transitions request the lazy re-plan — the heavier follow-up work runs
 /// on the supervisor task (`supervisor` channel), which serializes it with
 /// in-flight generation jobs (docs/resilience.md).
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_cluster_task(
     mesh: MeshHandle,
     host: EngineHost,
@@ -448,12 +480,14 @@ pub fn spawn_cluster_task(
     rpc_rx: mpsc::Receiver<IncomingRpcStream>,
     events_rx: mpsc::Receiver<PeerEvent>,
     supervisor: SupervisorTx,
+    logistics: WorkerLogistics,
 ) -> JoinHandle<()> {
     tokio::spawn(cluster_task(
-        mesh, host, state, ctrl_rx, rpc_rx, events_rx, supervisor,
+        mesh, host, state, ctrl_rx, rpc_rx, events_rx, supervisor, logistics,
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn cluster_task(
     mesh: MeshHandle,
     host: EngineHost,
@@ -462,6 +496,7 @@ async fn cluster_task(
     mut rpc_rx: mpsc::Receiver<IncomingRpcStream>,
     mut events_rx: mpsc::Receiver<PeerEvent>,
     supervisor: SupervisorTx,
+    logistics: WorkerLogistics,
 ) {
     let mut adopted: Option<AdoptedPlan> = None;
     let mut ctrl_open = true;
@@ -470,11 +505,13 @@ async fn cluster_task(
     while ctrl_open || rpc_open || events_open {
         tokio::select! {
             msg = ctrl_rx.recv(), if ctrl_open => match msg {
-                Some(msg) => handle_control(&mesh, &host, &state, &mut adopted, msg).await,
+                Some(msg) => {
+                    handle_control(&mesh, &host, &state, &logistics, &mut adopted, msg).await
+                }
                 None => ctrl_open = false,
             },
             stream = rpc_rx.recv(), if rpc_open => match stream {
-                Some(stream) => handle_rpc_stream(&mut adopted, stream),
+                Some(stream) => handle_rpc_stream(&mut adopted, &logistics, stream),
                 None => rpc_open = false,
             },
             event = events_rx.recv(), if events_open => match event {
@@ -554,13 +591,14 @@ async fn handle_control(
     mesh: &MeshHandle,
     host: &EngineHost,
     state: &Arc<ClusterState>,
+    logistics: &WorkerLogistics,
     adopted: &mut Option<AdoptedPlan>,
     msg: ControlMessage,
 ) {
     let sender = msg.peer;
     match msg.envelope.message {
         Message::PlanProposal(plan) => {
-            handle_proposal(mesh, host, state, adopted, sender, plan).await;
+            handle_proposal(mesh, host, state, logistics, adopted, sender, plan).await;
         }
         Message::PlanAck {
             epoch,
@@ -590,10 +628,12 @@ async fn handle_control(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_proposal(
     mesh: &MeshHandle,
     host: &EngineHost,
     state: &Arc<ClusterState>,
+    logistics: &WorkerLogistics,
     adopted: &mut Option<AdoptedPlan>,
     sender: NodeId,
     plan: Plan,
@@ -648,10 +688,20 @@ async fn handle_proposal(
             }));
             // Remembered for the polite drain at `onebrain stop` (M5).
             state.set_worker_shard(Some((epoch, sender.clone())));
+            // M6 logistics run in the background so the ack (and with it the
+            // head's 15 s activation window) never waits on a fetch: the
+            // range fetch + pre-seed land what they can, and any tensor not
+            // cached in time simply transfers over the stream as in M3.
+            let prepare = tokio::spawn(worker_prepare(
+                mesh.clone(),
+                logistics.clone(),
+                plan.clone(),
+            ));
             *adopted = Some(AdoptedPlan {
                 epoch,
                 head: sender.clone(),
                 serves: Vec::new(),
+                prepare: Some(prepare),
             });
             let ack = Envelope::new(Message::PlanAck {
                 epoch,
@@ -665,10 +715,100 @@ async fn handle_proposal(
     }
 }
 
+/// The worker's M6 logistics for one adopted plan (docs/logistics.md):
+/// fetch ONLY the header + this node's layers' tensor ranges (LAN-first —
+/// peers before any WAN byte), then pre-seed `<data_dir>/rpc-cache/` with
+/// the big assigned tensor payloads so the head's weight push can skip
+/// them, then LRU-reap the rpc-cache protecting this epoch's files.
+///
+/// Every failure here is survivable: the head pushes whatever was not
+/// cached, exactly the M3 weight flow — so this task warns and returns
+/// instead of failing the adoption.
+async fn worker_prepare(mesh: MeshHandle, logistics: WorkerLogistics, plan: Plan) {
+    let own_id = mesh.endpoint_id().to_string();
+    let epoch = plan.epoch.0;
+    let Some(assignment) = plan.assignments.iter().find(|a| a.node.0 == own_id) else {
+        tracing::warn!(
+            epoch,
+            "adopted plan has no assignment for this node; nothing to fetch"
+        );
+        return;
+    };
+    let layers: BTreeSet<u64> =
+        (u64::from(assignment.layers.start)..u64::from(assignment.layers.end)).collect();
+    if layers.is_empty() {
+        return;
+    }
+    let fetched = match crate::logistics::fetch_layer_ranges(
+        &mesh,
+        &logistics.cache_root,
+        &plan.model,
+        &layers,
+    )
+    .await
+    {
+        Ok(Some(fetched)) => fetched,
+        Ok(None) => {
+            tracing::debug!(
+                epoch,
+                model = %plan.model,
+                "model is not range-fetchable here; the head's push covers this worker"
+            );
+            return;
+        }
+        Err(message) => {
+            tracing::warn!(
+                epoch,
+                model = %plan.model,
+                %message,
+                "worker range fetch failed; the head will push all weights over the stream"
+            );
+            return;
+        }
+    };
+    // Pre-seed + reaper + GC are blocking file work (payload reads +
+    // hashing + directory walks).
+    let rpc_cache_dir = logistics.rpc_cache_dir.clone();
+    let max_bytes = logistics.rpc_cache_max_bytes;
+    let cache_root = logistics.cache_root.clone();
+    let cache_max_bytes = logistics.cache_max_bytes;
+    let model = plan.model.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        let stats = crate::logistics::preseed_rpc_cache(
+            &rpc_cache_dir,
+            &fetched.dir,
+            &fetched.header,
+            fetched.total_size,
+            &layers,
+            epoch,
+        )?;
+        crate::logistics::reap_rpc_cache(&rpc_cache_dir, max_bytes, &stats.protected);
+        // The range fetch was a download: same GC trigger as the pull
+        // paths, never evicting the entry the active plan reads from.
+        let protected: HashSet<String> = std::iter::once(model).collect();
+        crate::logistics::run_cache_gc(&cache_root, cache_max_bytes, &protected);
+        Ok::<(), String>(())
+    })
+    .await;
+    match outcome {
+        Ok(Ok(())) => {}
+        Ok(Err(message)) => tracing::warn!(
+            epoch,
+            %message,
+            "rpc-cache pre-seed failed; the head will push those tensors"
+        ),
+        Err(_) => tracing::warn!(epoch, "rpc-cache pre-seed task failed unexpectedly"),
+    }
+}
+
 /// Bridge one accepted `rpc` stream into an in-process GGML RPC serve
 /// session — or refuse it with close code 4 (`bad-epoch`) when it is not for
 /// the active epoch from that epoch's head (the M3 fencing rule).
-fn handle_rpc_stream(adopted: &mut Option<AdoptedPlan>, stream: IncomingRpcStream) {
+fn handle_rpc_stream(
+    adopted: &mut Option<AdoptedPlan>,
+    logistics: &WorkerLogistics,
+    stream: IncomingRpcStream,
+) {
     let Some(active) = adopted.as_mut() else {
         tracing::warn!(
             peer = %stream.peer.0,
@@ -688,14 +828,20 @@ fn handle_rpc_stream(adopted: &mut Option<AdoptedPlan>, stream: IncomingRpcStrea
         stream.refuse(4);
         return;
     }
-    let mut session = match RpcSession::start(0, serve_device_index()) {
-        Ok(session) => session,
-        Err(err) => {
-            tracing::error!(error = %err, "cannot start an rpc serve session");
-            stream.refuse(4);
-            return;
-        }
-    };
+    // The serve session answers `SET_TENSOR_HASH` from the pre-seeded
+    // rpc-cache (docs/logistics.md; ADR 0004 payoff) — the skip itself
+    // happens inside the native serve loop, the observable is the pre-seed
+    // log lines `worker_prepare` emits.
+    let mut session =
+        match RpcSession::start_with_cache(0, serve_device_index(), Some(&logistics.rpc_cache_dir))
+        {
+            Ok(session) => session,
+            Err(err) => {
+                tracing::error!(error = %err, "cannot start an rpc serve session");
+                stream.refuse(4);
+                return;
+            }
+        };
     let bridge = session
         .take_bridge()
         .expect("a fresh RpcSession always holds its bridge end");
@@ -716,8 +862,13 @@ fn handle_rpc_stream(adopted: &mut Option<AdoptedPlan>, stream: IncomingRpcStrea
 }
 
 /// Stop every serve session of a retired plan: abort the pumps (closing the
-/// bridge sockets, which ends the serve threads) and join the threads.
+/// bridge sockets, which ends the serve threads) and join the threads. The
+/// logistics task is aborted first — its `.part` files resume under the
+/// next adoption (nothing re-downloads, docs/logistics.md).
 async fn teardown_adopted(plan: AdoptedPlan) {
+    if let Some(prepare) = plan.prepare {
+        prepare.abort();
+    }
     for serve in plan.serves {
         serve.pump.abort();
         let session = serve.session;
@@ -1028,7 +1179,7 @@ mod tests {
         state.note_loaded(LoadedSource {
             reference: "tinystories-260k".into(),
             name: "tinystories-260k".into(),
-            path: PathBuf::from("C:/models/t.gguf"),
+            paths: vec![PathBuf::from("C:/models/t.gguf")],
             size_bytes: 42,
         });
         let source = state.loaded_source().expect("recorded");
@@ -1158,7 +1309,7 @@ mod tests {
         state.note_loaded(LoadedSource {
             reference: "m".into(),
             name: "m".into(),
-            path: PathBuf::from("m.gguf"),
+            paths: vec![PathBuf::from("m.gguf")],
             size_bytes: 1,
         });
         handle_peer_event(&state, &sup_tx, event("w2", PeerState::Connected));

@@ -76,6 +76,9 @@ pub struct InternalState {
     /// Where `POST /api/internal/bench` persists the profile
     /// (`<config_dir>/profile.toml`).
     pub profile_path: PathBuf,
+    /// `config.cache_max_bytes`: the post-download GC trigger's cap
+    /// (docs/logistics.md "LRU GC + pinning"; 0 = GC disabled).
+    pub cache_max_bytes: u64,
 }
 
 /// Build the internal router with its always-on token middleware.
@@ -89,6 +92,8 @@ pub fn internal_router(state: Arc<InternalState>) -> Router {
         .route("/api/internal/pair/join", post(pair_join))
         .route("/api/internal/peers", get(peers))
         .route("/api/internal/unpair", post(unpair))
+        .route("/api/internal/models/pin", post(pin_model))
+        .route("/api/internal/models/unpin", post(unpin_model))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             require_internal_token,
@@ -247,10 +252,17 @@ async fn bench(State(state): State<Arc<InternalState>>) -> Response {
             );
         }
     };
-    let dest_dir = state.cache_root.join(&spec.cache_key);
-    let model_path = match onebrain_models::download::download(&spec, &dest_dir, |_, _| {}).await {
-        Ok(path) => path,
-        Err(e) => return bench_error(StatusCode::BAD_GATEWAY, e.to_string()),
+    // LAN-first like every other download path (docs/logistics.md).
+    let model_path = match crate::logistics::ensure_remote_local(
+        &state.mesh,
+        &state.cache_root,
+        &spec,
+        |_, _| {},
+    )
+    .await
+    {
+        Ok(fetched) => fetched.paths[0].clone(),
+        Err(message) => return bench_error(StatusCode::BAD_GATEWAY, message),
     };
 
     // 2. The compute microbench and the disk probe (blocking, ~seconds).
@@ -358,11 +370,20 @@ async fn bench(State(state): State<Arc<InternalState>>) -> Response {
     Json(serde_json::json!({ "profile": profile_json, "links": links })).into_response()
 }
 
-/// A model reference resolved to a local file (downloaded if needed).
+/// A model reference resolved to local files (downloaded if needed). Split
+/// models carry every part in load order; single files carry one path.
 pub(crate) struct LocalModel {
-    pub(crate) path: PathBuf,
+    pub(crate) paths: Vec<PathBuf>,
     pub(crate) name: String,
     pub(crate) size_bytes: u64,
+}
+
+impl LocalModel {
+    /// The path planning reads the GGUF header from (part 1 carries the
+    /// model-wide metadata for split sets).
+    pub(crate) fn header_path(&self) -> &Path {
+        &self.paths[0]
+    }
 }
 
 impl From<&LoadedSource> for LocalModel {
@@ -370,7 +391,7 @@ impl From<&LoadedSource> for LocalModel {
     /// recorded source of the model that was loaded (M5).
     fn from(source: &LoadedSource) -> LocalModel {
         LocalModel {
-            path: source.path.clone(),
+            paths: source.paths.clone(),
             name: source.name.clone(),
             size_bytes: source.size_bytes,
         }
@@ -422,34 +443,31 @@ async fn ensure_local(
             Some(LocalModel {
                 name: format!("local:{stem}"),
                 size_bytes: meta.len(),
-                path,
+                paths: vec![path],
             })
         }
         Resolved::Remote(spec) => {
-            let dest_dir = state.cache_root.join(&spec.cache_key);
             let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<(u64, u64)>();
             let mut throttle = ProgressThrottle::default();
-            let download =
-                onebrain_models::download::download(&spec, &dest_dir, move |completed, total| {
+            // LAN-first + split-aware (docs/logistics.md): peers are asked
+            // before any WAN byte; split refs fetch every part.
+            let download = crate::logistics::ensure_remote_local(
+                &state.mesh,
+                &state.cache_root,
+                &spec,
+                move |completed, total| {
                     if throttle.should_emit(completed, total) {
                         let _ = progress_tx.send((completed, total));
                     }
-                });
+                },
+            );
             tokio::pin!(download);
-            loop {
+            let fetched = loop {
                 tokio::select! {
                     result = &mut download => match result {
-                        Ok(path) => {
-                            let size_bytes =
-                                std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-                            return Some(LocalModel {
-                                name: spec.cache_key.clone(),
-                                path,
-                                size_bytes,
-                            });
-                        }
-                        Err(e) => {
-                            emit_error(tx, e.to_string()).await;
+                        Ok(fetched) => break fetched,
+                        Err(message) => {
+                            emit_error(tx, message).await;
                             return None;
                         }
                     },
@@ -461,7 +479,25 @@ async fn ensure_local(
                         })).await;
                     }
                 }
+            };
+            // GC trigger (docs/logistics.md): after every completed
+            // download — never the loaded model, never the fresh entry.
+            let root = state.cache_root.clone();
+            let max = state.cache_max_bytes;
+            let mut protected: HashSet<String> = HashSet::new();
+            protected.insert(spec.cache_key.clone());
+            if let Some(source) = state.cluster.loaded_source() {
+                protected.insert(source.name);
             }
+            let _ = tokio::task::spawn_blocking(move || {
+                crate::logistics::run_cache_gc(&root, max, &protected)
+            })
+            .await;
+            Some(LocalModel {
+                name: spec.cache_key.clone(),
+                paths: fetched.paths,
+                size_bytes: fetched.size_bytes,
+            })
         }
     }
 }
@@ -696,7 +732,7 @@ async fn drive_load(state: Arc<InternalState>, body: LoadBody, tx: LineSender) {
     let planned = match plan_load(
         &state,
         &local.name,
-        &local.path,
+        local.header_path(),
         local.size_bytes,
         body.nodes,
         &HashSet::new(),
@@ -817,7 +853,7 @@ fn install_solo_active(
     state.cluster.note_loaded(LoadedSource {
         reference: reference.to_string(),
         name: local.name.clone(),
-        path: local.path.clone(),
+        paths: local.paths.clone(),
         size_bytes: local.size_bytes,
     });
 }
@@ -1002,7 +1038,7 @@ pub(crate) async fn activate_distributed_plan(
     if state
         .host
         .send(HostMsg::LoadDistributed {
-            path: local.path.clone(),
+            paths: local.paths.clone(),
             reference: reference.to_string(),
             name: local.name.clone(),
             ctx_len: state.ctx_len,
@@ -1031,7 +1067,7 @@ pub(crate) async fn activate_distributed_plan(
             state.cluster.note_loaded(LoadedSource {
                 reference: reference.to_string(),
                 name: local.name.clone(),
-                path: local.path.clone(),
+                paths: local.paths.clone(),
                 size_bytes: local.size_bytes,
             });
             Ok(model)
@@ -1186,6 +1222,76 @@ async fn unpair(State(state): State<Arc<InternalState>>, Json(body): Json<Unpair
     }
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct PinBody {
+    model: String,
+}
+
+/// Map a [`onebrain_models::cache::CacheError`] to the internal API's error
+/// envelope (the message is the error's own Display, remedy included).
+fn cache_error_response(err: onebrain_models::cache::CacheError) -> Response {
+    use onebrain_models::cache::CacheError;
+    let status = match &err {
+        CacheError::NotCached { .. } => StatusCode::NOT_FOUND,
+        CacheError::InvalidId { .. } | CacheError::Pinned { .. } => StatusCode::BAD_REQUEST,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    let kind = if status.is_client_error() {
+        "invalid_request_error"
+    } else {
+        "cache_error"
+    };
+    (
+        status,
+        Json(serde_json::json!({
+            "error": { "message": err.to_string(), "type": kind }
+        })),
+    )
+        .into_response()
+}
+
+/// Shared body of the pin/unpin endpoints (docs/logistics.md "LRU GC +
+/// pinning"): flip the entry's pin flag in its manifest. Blocking file I/O
+/// rides the blocking pool.
+async fn set_model_pinned(state: Arc<InternalState>, model: String, pinned: bool) -> Response {
+    let root = state.cache_root.clone();
+    let id = model.clone();
+    let result =
+        tokio::task::spawn_blocking(move || onebrain_models::cache::set_pinned(&root, &id, pinned))
+            .await;
+    match result {
+        Ok(Ok(())) => Json(serde_json::json!({
+            "status": "ok", "model": model, "pinned": pinned,
+        }))
+        .into_response(),
+        Ok(Err(err)) => cache_error_response(err),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": {
+                    "message": "the pin task failed unexpectedly; retry the command",
+                    "type": "cache_error"
+                }
+            })),
+        )
+            .into_response(),
+    }
+}
+
+/// `POST /api/internal/models/pin` `{"model": id}` — pinned entries are
+/// never GC eviction candidates.
+async fn pin_model(State(state): State<Arc<InternalState>>, Json(body): Json<PinBody>) -> Response {
+    set_model_pinned(state, body.model, true).await
+}
+
+/// `POST /api/internal/models/unpin` `{"model": id}`.
+async fn unpin_model(
+    State(state): State<Arc<InternalState>>,
+    Json(body): Json<PinBody>,
+) -> Response {
+    set_model_pinned(state, body.model, false).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1251,6 +1357,7 @@ mod tests {
                 ac: Some(true),
             }),
             battery_threshold: 25,
+            cache_max_bytes: 0,
         });
         let app = internal_router(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1470,6 +1577,125 @@ mod tests {
             profile["measured_unix"].as_u64().unwrap()
         );
         assert!(stored.decode_tps > 0.0);
+        teardown(host, host_thread);
+    }
+
+    /// Seed one completed cache entry (model file + M1-shaped manifest).
+    fn seed_cache_entry(cache_root: &std::path::Path, id: &str, bytes: &[u8]) {
+        let dir = cache_root.join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("model.gguf"), bytes).unwrap();
+        let manifest = onebrain_models::download::Manifest {
+            url: format!("https://example.invalid/{id}.gguf"),
+            size_bytes: bytes.len() as u64,
+            blake3: "test".to_string(),
+        };
+        std::fs::write(
+            dir.join("manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pin_and_unpin_flip_the_entry_state() {
+        let (base, _notify, host, host_thread, dir) = serve_internal("sekrit").await;
+        let cache_root = dir.path().join("models");
+        seed_cache_entry(&cache_root, "pin-me", b"weights");
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("{base}/api/internal/models/pin"))
+            .bearer_auth("sekrit")
+            .json(&serde_json::json!({ "model": "pin-me" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["status"], "ok");
+        assert_eq!(body["pinned"], true);
+        let listed = onebrain_models::cache::list(&cache_root).unwrap();
+        assert!(listed[0].pinned, "pin must persist to the entry manifest");
+
+        let resp = client
+            .post(format!("{base}/api/internal/models/unpin"))
+            .bearer_auth("sekrit")
+            .json(&serde_json::json!({ "model": "pin-me" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["pinned"], false);
+        let listed = onebrain_models::cache::list(&cache_root).unwrap();
+        assert!(!listed[0].pinned);
+        teardown(host, host_thread);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pin_of_unknown_model_is_a_404_with_the_error_envelope() {
+        let (base, _notify, host, host_thread, _dir) = serve_internal("sekrit").await;
+        let resp = reqwest::Client::new()
+            .post(format!("{base}/api/internal/models/pin"))
+            .bearer_auth("sekrit")
+            .json(&serde_json::json!({ "model": "ghost-model" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("ghost-model"));
+        // Traversal ids are a clean 400, never a filesystem touch.
+        let resp = reqwest::Client::new()
+            .post(format!("{base}/api/internal/models/pin"))
+            .bearer_auth("sekrit")
+            .json(&serde_json::json!({ "model": "../evil" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+        teardown(host, host_thread);
+    }
+
+    /// The `ls`/models listing payload gains pinned, last_used_unix and the
+    /// part count (docs/logistics.md; the CLI renders these columns).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn models_listing_reports_pin_lru_and_parts() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_root = dir.path().join("models");
+        seed_cache_entry(&cache_root, "listed-model", b"0123456789");
+        onebrain_models::cache::set_pinned(&cache_root, "listed-model", true).unwrap();
+        onebrain_models::cache::touch(&cache_root, "listed-model").unwrap();
+
+        let (host, host_thread) = EngineHost::spawn(None);
+        let mesh = spawn_test_mesh(dir.path()).await;
+        let (sup_tx, _sup_rx) = crate::supervisor::channel();
+        let backend = crate::engine_host::DaemonBackend::new(
+            host.clone(),
+            cache_root.clone(),
+            sup_tx,
+            mesh.clone(),
+            0,
+        );
+        let models = tokio::task::spawn_blocking(move || {
+            onebrain_api::backend::EngineBackend::models(&backend)
+        })
+        .await
+        .unwrap();
+        let m = models
+            .iter()
+            .find(|m| m.name == "listed-model")
+            .expect("seeded model listed");
+        assert_eq!(m.details.get("pinned").map(String::as_str), Some("true"));
+        assert_eq!(m.details.get("parts").map(String::as_str), Some("1"));
+        let last_used: u64 = m.details.get("last_used_unix").unwrap().parse().unwrap();
+        assert!(last_used > 0, "touch must be visible in the listing");
+        let _ = mesh.shutdown().await;
         teardown(host, host_thread);
     }
 

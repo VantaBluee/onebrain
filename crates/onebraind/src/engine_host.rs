@@ -160,8 +160,10 @@ pub enum HostMsg {
     /// connects out synchronously. The loaded model serves generations
     /// exactly like a solo one.
     LoadDistributed {
-        /// Local GGUF path (the head holds the full file — ADR 0004).
-        path: PathBuf,
+        /// Local GGUF part paths in load order — one entry for single-file
+        /// models (the head holds every part, ADR 0004 / docs/logistics.md
+        /// "Split-GGUF").
+        paths: Vec<PathBuf>,
         /// The reference the user loaded by (accepted as a model name in
         /// generation requests, like the solo path).
         reference: String,
@@ -277,10 +279,11 @@ impl EngineHost {
     }
 }
 
-/// A model reference resolved to a local file, downloaded if needed.
+/// A model reference resolved to local files, downloaded if needed. Split
+/// models carry every part in load order; single files carry one path.
 struct ResolvedLocal {
     name: String,
-    path: PathBuf,
+    paths: Vec<PathBuf>,
     size_bytes: u64,
 }
 
@@ -295,7 +298,7 @@ struct LoadReq {
 
 /// One pending distributed load request.
 struct DistLoadReq {
-    path: PathBuf,
+    paths: Vec<PathBuf>,
     reference: String,
     name: String,
     ctx_len: u32,
@@ -367,7 +370,7 @@ fn host_loop(rx: std_mpsc::Receiver<HostMsg>, decode_delay: Option<Duration>) {
                         })
                     }
                     Ok(HostMsg::LoadDistributed {
-                        path,
+                        paths,
                         reference,
                         name,
                         ctx_len,
@@ -377,7 +380,7 @@ fn host_loop(rx: std_mpsc::Receiver<HostMsg>, decode_delay: Option<Duration>) {
                         resp,
                     }) => {
                         break Pending::Dist(DistLoadReq {
-                            path,
+                            paths,
                             reference,
                             name,
                             ctx_len,
@@ -417,7 +420,12 @@ fn host_loop(rx: std_mpsc::Receiver<HostMsg>, decode_delay: Option<Duration>) {
                 // the terminal line, delivered via `resp`.
                 drop(progress);
 
-                let model = match Model::load(&resolved.path, &ModelParams::default()) {
+                // `load_splits` handles single files identically to `load`
+                // (the loader ignores the splits list when the GGUF carries
+                // no split metadata), so one call covers both shapes
+                // (docs/logistics.md "Split-GGUF").
+                let path_refs: Vec<&Path> = resolved.paths.iter().map(PathBuf::as_path).collect();
+                let model = match Model::load_splits(&path_refs, &ModelParams::default()) {
                     Ok(m) => m,
                     Err(e) => {
                         let _ = resp.send(Err(e.to_string()));
@@ -434,7 +442,7 @@ fn host_loop(rx: std_mpsc::Receiver<HostMsg>, decode_delay: Option<Duration>) {
             }
             Pending::Dist(req) => {
                 let DistLoadReq {
-                    path,
+                    paths,
                     reference,
                     name,
                     ctx_len,
@@ -459,8 +467,9 @@ fn host_loop(rx: std_mpsc::Receiver<HostMsg>, decode_delay: Option<Duration>) {
                     continue 'outer;
                 }
                 let server_refs: Vec<&RemoteServer> = servers.iter().collect();
-                let model = match Model::load_distributed(
-                    &path,
+                let path_refs: Vec<&Path> = paths.iter().map(PathBuf::as_path).collect();
+                let model = match Model::load_distributed_splits(
+                    &path_refs,
                     &server_refs,
                     &tensor_split,
                     use_local_device,
@@ -472,7 +481,10 @@ fn host_loop(rx: std_mpsc::Receiver<HostMsg>, decode_delay: Option<Duration>) {
                         continue 'outer;
                     }
                 };
-                let size_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                let size_bytes = paths
+                    .iter()
+                    .map(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0))
+                    .sum();
                 let info = LoadedModel {
                     name,
                     size_bytes,
@@ -558,7 +570,7 @@ fn host_loop(rx: std_mpsc::Receiver<HostMsg>, decode_delay: Option<Duration>) {
                     continue 'outer;
                 }
                 Ok(HostMsg::LoadDistributed {
-                    path,
+                    paths,
                     reference,
                     name,
                     ctx_len,
@@ -569,7 +581,7 @@ fn host_loop(rx: std_mpsc::Receiver<HostMsg>, decode_delay: Option<Duration>) {
                 }) => {
                     tracing::info!(model = %info.name, next = %reference, "unloading for a distributed load");
                     pending = Some(Pending::Dist(DistLoadReq {
-                        path,
+                        paths,
                         reference,
                         name,
                         ctx_len,
@@ -585,8 +597,12 @@ fn host_loop(rx: std_mpsc::Receiver<HostMsg>, decode_delay: Option<Duration>) {
     }
 }
 
-/// Resolve a reference to a local file, driving any download on `rt` and
+/// Resolve a reference to local files, driving any download on `rt` and
 /// forwarding progress. Error strings are user-facing (with remedies).
+/// Split refs (`-%05d-of-%05d.gguf`) fetch every part into its own
+/// download dir (docs/logistics.md "Split-GGUF"); in the daemon the load
+/// flow made everything local already, so the downloads here hit the
+/// cached-manifest fast path.
 fn ensure_local(
     rt: &tokio::runtime::Runtime,
     reference: &str,
@@ -608,24 +624,55 @@ fn ensure_local(
                 .unwrap_or_else(|| "model".to_string());
             Ok(ResolvedLocal {
                 name: format!("local:{stem}"),
-                path,
+                paths: vec![path],
                 size_bytes: meta.len(),
             })
         }
         Resolved::Remote(spec) => {
-            let dest_dir = cache_root.join(&spec.cache_key);
             let mut throttle = ProgressThrottle::default();
-            let path = rt
-                .block_on(download::download(&spec, &dest_dir, |completed, total| {
-                    if throttle.should_emit(completed, total) {
-                        let _ = progress.send(LoadProgress::Downloading { completed, total });
-                    }
-                }))
-                .map_err(|e| e.to_string())?;
-            let size_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            let mut report = |completed, total| {
+                if throttle.should_emit(completed, total) {
+                    let _ = progress.send(LoadProgress::Downloading { completed, total });
+                }
+            };
+            if let Some(split) = onebrain_models::split::parse_split_name(&spec.file_name) {
+                let mut done = 0u64;
+                for part_name in split.part_file_names() {
+                    let dir = cache::split_part_dir(cache_root, &spec.cache_key, &part_name)
+                        .map_err(|e| e.to_string())?;
+                    let part_spec = onebrain_models::registry::DownloadSpec {
+                        cache_key: spec.cache_key.clone(),
+                        url: onebrain_models::split::sibling_url(&spec.url, &part_name),
+                        file_name: part_name,
+                    };
+                    // Cross-part totals are unknown until every part has
+                    // answered; report the cumulative count with total 0.
+                    let path = rt
+                        .block_on(download::download(&part_spec, &dir, |c, _| {
+                            report(done + c, 0)
+                        }))
+                        .map_err(|e| e.to_string())?;
+                    done += std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                }
+            } else {
+                let dest_dir = cache_root.join(&spec.cache_key);
+                rt.block_on(download::download(&spec, &dest_dir, report))
+                    .map_err(|e| e.to_string())?;
+            }
+            let paths =
+                cache::split_part_paths(cache_root, &spec.cache_key).map_err(|e| e.to_string())?;
+            let size_bytes = paths
+                .iter()
+                .map(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0))
+                .sum();
+            // LRU stamp: eviction order must reflect actual use
+            // (docs/logistics.md "LRU GC + pinning": touched on load).
+            if let Err(err) = cache::touch(cache_root, &spec.cache_key) {
+                tracing::debug!(id = %spec.cache_key, error = %err, "could not touch cache entry");
+            }
             Ok(ResolvedLocal {
                 name: spec.cache_key,
-                path,
+                paths,
                 size_bytes,
             })
         }
@@ -931,14 +978,27 @@ pub struct DaemonBackend {
     /// Generation jobs go here; the supervisor owns their whole lifecycle
     /// (attempt, transparent retry, terminal event — docs/resilience.md).
     supervisor: SupervisorTx,
+    /// Mesh handle for LAN-first pulls (docs/logistics.md: before any WAN
+    /// byte, every Connected peer is asked what it holds).
+    mesh: onebrain_mesh::MeshHandle,
+    /// `config.cache_max_bytes` for the post-download GC trigger (0 = off).
+    cache_max_bytes: u64,
 }
 
 impl DaemonBackend {
-    pub fn new(host: EngineHost, cache_root: PathBuf, supervisor: SupervisorTx) -> DaemonBackend {
+    pub fn new(
+        host: EngineHost,
+        cache_root: PathBuf,
+        supervisor: SupervisorTx,
+        mesh: onebrain_mesh::MeshHandle,
+        cache_max_bytes: u64,
+    ) -> DaemonBackend {
         DaemonBackend {
             host,
             cache_root,
             supervisor,
+            mesh,
+            cache_max_bytes,
         }
     }
 }
@@ -955,6 +1015,11 @@ impl EngineBackend for DaemonBackend {
                     if let Some(b3) = m.blake3 {
                         details.insert("blake3".to_string(), b3);
                     }
+                    // M6 `onebrain ls` columns (docs/logistics.md): pin
+                    // state, last-use stamp, and the split part count.
+                    details.insert("pinned".to_string(), m.pinned.to_string());
+                    details.insert("last_used_unix".to_string(), m.last_used_unix.to_string());
+                    details.insert("parts".to_string(), m.parts.to_string());
                     ModelSummary {
                         loaded: loaded.as_ref().is_some_and(|l| l.name == m.id),
                         name: m.id,
@@ -1002,6 +1067,9 @@ impl EngineBackend for DaemonBackend {
             .resolve()
             .map_err(|e| ApiError::BadRequest(format!("{e}")))?;
         let cache_root = self.cache_root.clone();
+        let mesh = self.mesh.clone();
+        let host = self.host.clone();
+        let cache_max_bytes = self.cache_max_bytes;
         tokio::spawn(async move {
             let terminal = match resolved {
                 Resolved::Local(path) => {
@@ -1017,23 +1085,45 @@ impl EngineBackend for DaemonBackend {
                     }
                 }
                 Resolved::Remote(spec) => {
-                    let dest_dir = cache_root.join(&spec.cache_key);
                     let mut throttle = ProgressThrottle::default();
                     let progress_tx = tx.clone();
-                    let result = download::download(&spec, &dest_dir, move |completed, total| {
-                        if throttle.should_emit(completed, total) {
-                            // try_send: never block the downloader on a slow
-                            // client; skipped progress lines are harmless.
-                            let _ =
-                                progress_tx.try_send(PullEvent::Downloading { completed, total });
-                        }
-                    })
+                    // LAN-first (docs/logistics.md): peers are asked before
+                    // any WAN byte; split sets fetch every part.
+                    let result = crate::logistics::ensure_remote_local(
+                        &mesh,
+                        &cache_root,
+                        &spec,
+                        move |completed, total| {
+                            if throttle.should_emit(completed, total) {
+                                // try_send: never block the downloader on a
+                                // slow client; skipped lines are harmless.
+                                let _ = progress_tx
+                                    .try_send(PullEvent::Downloading { completed, total });
+                            }
+                        },
+                    )
                     .await;
                     match result {
-                        Ok(_) => PullEvent::Done,
-                        Err(e) => PullEvent::Error {
-                            message: e.to_string(),
-                        },
+                        Ok(_) => {
+                            // GC trigger (docs/logistics.md): after every
+                            // completed download — never the loaded model,
+                            // never the entry just fetched.
+                            let root = cache_root.clone();
+                            let host = host.clone();
+                            let fresh = spec.cache_key.clone();
+                            let _ = tokio::task::spawn_blocking(move || {
+                                let mut protected = std::collections::HashSet::new();
+                                protected.insert(fresh);
+                                if let Some(loaded) = host.loaded_model(Duration::from_millis(250))
+                                {
+                                    protected.insert(loaded.name);
+                                }
+                                crate::logistics::run_cache_gc(&root, cache_max_bytes, &protected);
+                            })
+                            .await;
+                            PullEvent::Done
+                        }
+                        Err(message) => PullEvent::Error { message },
                     }
                 }
             };

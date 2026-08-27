@@ -32,3 +32,5 @@ getrandom = { workspace = true }
 [dev-dependencies]
 tempfile = "3"
 reqwest = { workspace = true }
+# M6 logistics tests hash range fixtures exactly like the models crate.
+blake3 = { workspace = true }

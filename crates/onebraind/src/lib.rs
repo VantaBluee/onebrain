@@ -10,6 +10,7 @@ pub mod cluster;
 pub mod config;
 pub mod engine_host;
 pub mod lock;
+pub mod logistics;
 pub mod paths;
 pub mod power;
 pub mod runtime;

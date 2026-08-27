@@ -316,7 +316,7 @@ async fn handle_interrupted(
     let planned = match plan_load(
         state,
         &source.name,
-        &source.path,
+        source.header_path(),
         source.size_bytes,
         None,
         &lost_ids,
@@ -448,7 +448,7 @@ async fn maybe_rejoin_replan(state: &Arc<InternalState>) {
     let planned = match plan_load(
         state,
         &source.name,
-        &source.path,
+        source.header_path(),
         source.size_bytes,
         None,
         &HashSet::new(),

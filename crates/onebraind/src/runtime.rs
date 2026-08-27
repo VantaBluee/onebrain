@@ -162,6 +162,14 @@ pub fn run_blocking() -> Result<(), DaemonError> {
                 .draining,
             }
         })),
+        // M6 logistics (docs/logistics.md): a persistent blob store so
+        // shared ranges survive restarts, and the local range inventory so
+        // this daemon ANSWERS peers' RangeQuery — the same source shape it
+        // queries them with.
+        blobs_dir: Some(paths.data_dir.join("blobs")),
+        range_source: Some(Arc::new(crate::logistics::LocalRangeInventory::new(
+            cache_root.clone(),
+        ))),
         ..MeshConfig::default()
     };
     let served = match runtime.block_on(MeshService::spawn(
@@ -192,6 +200,14 @@ pub fn run_blocking() -> Result<(), DaemonError> {
                     rpc_rx,
                     events_rx,
                     sup_tx.clone(),
+                    // M6 worker logistics: range fetch on plan adoption +
+                    // rpc-cache pre-seed and reaper (docs/logistics.md).
+                    cluster::WorkerLogistics {
+                        cache_root: cache_root.clone(),
+                        rpc_cache_dir: paths.data_dir.join("rpc-cache"),
+                        rpc_cache_max_bytes: config.rpc_cache_max_bytes,
+                        cache_max_bytes: config.cache_max_bytes,
+                    },
                 ))
             });
             let cluster_task = match cluster_task {
@@ -331,6 +347,8 @@ async fn serve(
             host.clone(),
             cache_root.to_path_buf(),
             supervisor_tx,
+            mesh.clone(),
+            config.cache_max_bytes,
         )),
         auth: Arc::new(AuthConfig {
             token: token.clone(),
@@ -362,6 +380,7 @@ async fn serve(
         // instance here keeps `serve` self-contained.
         battery_probe: Arc::from(crate::power::platform_battery_probe()),
         battery_threshold: config.battery_drain_threshold,
+        cache_max_bytes: config.cache_max_bytes,
     });
     // M5 supervisor: owns every generation job's lifecycle (transparent
     // retry) plus the death-teardown and lazy rejoin re-plan follow-ups
