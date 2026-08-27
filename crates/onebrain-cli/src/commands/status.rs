@@ -139,8 +139,10 @@ pub fn run(json: bool) -> Result<(), CliError> {
 }
 
 /// Format the PEERS table: NAME, ID (8 chars), STATE, RTT ms, BW Mbps —
-/// `-` for unknowns. Tolerant of missing fields (forward compatibility).
-/// Returns the whole table, each line `\n`-terminated.
+/// `-` for unknowns. A peer advertising battery drain (M5,
+/// docs/resilience.md) gets a `(draining)` marker on its STATE cell.
+/// Tolerant of missing fields (forward compatibility). Returns the whole
+/// table, each line `\n`-terminated.
 fn peers_table(peers: &[serde_json::Value]) -> String {
     const HEADERS: [&str; 5] = ["NAME", "ID", "STATE", "RTT ms", "BW Mbps"];
     let rows: Vec<[String; 5]> = peers.iter().map(peer_row).collect();
@@ -203,7 +205,17 @@ fn peer_row(peer: &serde_json::Value) -> [String; 5] {
         Some(id) if !id.is_empty() => id.chars().take(8).collect(),
         _ => "-".to_string(),
     };
-    let state = text("state");
+    let mut state = text("state");
+    // Battery-drain advertisement (M5): the peer asked new plans to avoid
+    // it. Mesh state (connected/…) is unchanged, so mark rather than
+    // replace.
+    if peer
+        .get("draining")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        state.push_str(" (draining)");
+    }
     let number = |key: &str| {
         peer.get(key)
             .and_then(|v| v.as_f64())
@@ -257,6 +269,47 @@ mod tests {
             "state": "reachable",
         }));
         assert_eq!(row, ["laptop", "01234567", "reachable", "-", "-"]);
+    }
+
+    #[test]
+    fn peer_row_marks_draining_state() {
+        // M5 (docs/resilience.md): a draining peer stays connected but is
+        // avoided by new plans — the STATE cell says so.
+        let row = peer_row(&serde_json::json!({
+            "name": "macbook", "id": "abcd1234", "state": "connected",
+            "draining": true,
+        }));
+        assert_eq!(row[2], "connected (draining)");
+        // Explicit false and absent both render the plain state.
+        let row = peer_row(&serde_json::json!({
+            "name": "pc", "id": "abcd1234", "state": "connected",
+            "draining": false,
+        }));
+        assert_eq!(row[2], "connected");
+        let row = peer_row(&serde_json::json!({
+            "name": "pc", "id": "abcd1234", "state": "connected",
+        }));
+        assert_eq!(row[2], "connected");
+    }
+
+    #[test]
+    fn peers_table_sizes_state_column_for_the_draining_marker() {
+        let peers: Vec<serde_json::Value> = serde_json::from_str(
+            r#"[
+              {"name":"macbook","id":"ab12cd34ef56ab78","state":"connected",
+               "draining":true,"rtt_ms":1.2,"bandwidth_mbps":800.0},
+              {"name":"pc","id":"ffee001122334455","state":"connected",
+               "draining":false,"rtt_ms":0.4,"bandwidth_mbps":941.7}
+            ]"#,
+        )
+        .unwrap();
+        let table = peers_table(&peers);
+        assert_eq!(
+            table,
+            "  NAME     ID        STATE                 RTT ms  BW Mbps\n\
+             \x20 macbook  ab12cd34  connected (draining)     1.2    800.0\n\
+             \x20 pc       ffee0011  connected                0.4    941.7\n"
+        );
     }
 
     #[test]

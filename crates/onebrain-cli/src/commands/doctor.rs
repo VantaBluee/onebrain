@@ -1,18 +1,20 @@
 //! `onebrain doctor` v1: every check is a finding — (status, message,
 //! remedy) — covering identity/paths (kept from v0), compute devices from
-//! the engine, daemon state, and config-file validity. Grows firewall and
-//! self-update checks in M8.
+//! the engine, battery/power realities (M5, docs/resilience.md), daemon
+//! state, and config-file validity. Grows firewall and self-update checks
+//! in M8.
 
 use serde::Serialize;
 
 use onebrain_engine::DeviceKind;
 use onebraind::config::Config;
 use onebraind::paths::AppPaths;
+use onebraind::power::{self, InhibitorSupport};
 
 use super::{human_bytes, CliError};
 use crate::client::{ClientError, DaemonClient};
 
-#[derive(Serialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 enum Status {
     Ok,
@@ -101,25 +103,35 @@ pub fn run(json: bool) -> Result<(), CliError> {
         paths.data_dir.join("logs").join("daemon.log").display()
     )));
 
-    // Config file validity.
+    // Config file validity. The parsed config is kept: the battery check
+    // below reports against the node's real drain threshold (an unreadable
+    // file falls back to defaults — the daemon would not start on it
+    // anyway, and that is already a `fail` finding here).
     let config_file = paths.config_file();
-    if config_file.exists() {
+    let config = if config_file.exists() {
         match Config::load(&config_file) {
-            Ok(_) => findings.push(Finding::ok(format!(
-                "config file: {} (valid)",
-                config_file.display()
-            ))),
-            Err(e) => findings.push(Finding::fail(
-                format!("config file: {e}"),
-                "fix the file or delete it — every setting has a working default",
-            )),
+            Ok(config) => {
+                findings.push(Finding::ok(format!(
+                    "config file: {} (valid)",
+                    config_file.display()
+                )));
+                config
+            }
+            Err(e) => {
+                findings.push(Finding::fail(
+                    format!("config file: {e}"),
+                    "fix the file or delete it — every setting has a working default",
+                ));
+                Config::default()
+            }
         }
     } else {
         findings.push(Finding::ok(format!(
             "config file: {} (absent; defaults in effect)",
             config_file.display()
         )));
-    }
+        Config::default()
+    };
 
     // Compute devices.
     let devices = onebrain_engine::devices();
@@ -150,6 +162,17 @@ pub fn run(json: bool) -> Result<(), CliError> {
             "install or update GPU drivers (CUDA/Vulkan/Metal), then re-run `onebrain doctor`",
         ));
     }
+
+    // Battery / power (M5, docs/resilience.md "Power realities"): battery
+    // level and AC state against the draining policy, plus whether this
+    // node can hold OS sleep during requests.
+    let probe = power::platform_battery_probe();
+    findings.extend(power_findings(
+        probe.level_percent(),
+        probe.on_ac(),
+        config.battery_drain_threshold,
+        &power::sleep_inhibitor_support(),
+    ));
 
     // Daemon state.
     match DaemonClient::from_paths(&paths) {
@@ -212,6 +235,57 @@ pub fn run(json: bool) -> Result<(), CliError> {
     Ok(())
 }
 
+/// The battery/power findings (M5), pure over already-probed values so the
+/// formats are unit-testable on any OS. The draining decision is
+/// [`power::battery_verdict`] itself — this report can never disagree with
+/// what the daemon advertises in `NodeStatus`.
+fn power_findings(
+    level: Option<u8>,
+    on_ac: Option<bool>,
+    threshold: u8,
+    inhibit: &InhibitorSupport,
+) -> Vec<Finding> {
+    let mut findings = Vec::new();
+
+    let verdict = power::battery_verdict(level, on_ac, threshold);
+    match level {
+        None => findings.push(Finding::ok(
+            "battery: none detected (desktop; never drains out of plans)",
+        )),
+        Some(level) => {
+            let ac_desc = match on_ac {
+                Some(true) => "on AC",
+                Some(false) => "discharging",
+                None => "AC state unknown",
+            };
+            if verdict.draining {
+                findings.push(Finding::warn(
+                    format!(
+                        "battery: {level}% ({ac_desc}) — below the {threshold}% drain threshold"
+                    ),
+                    "this node advertises draining and is avoided by new plans; plug in to \
+                     rejoin them (threshold: battery_drain_threshold in config.toml)",
+                ));
+            } else {
+                findings.push(Finding::ok(format!("battery: {level}% ({ac_desc})")));
+            }
+        }
+    }
+
+    match inhibit {
+        InhibitorSupport::Available(mechanism) => {
+            findings.push(Finding::ok(format!("sleep inhibit: {mechanism}")));
+        }
+        InhibitorSupport::Unavailable(reason) => findings.push(Finding::warn(
+            format!("sleep inhibit: {reason}"),
+            "the OS may sleep mid-generation on this node; install systemd \
+             (for systemd-inhibit) or keep it awake manually during long runs",
+        )),
+    }
+
+    findings
+}
+
 fn kind_str(kind: DeviceKind) -> &'static str {
     match kind {
         DeviceKind::Cpu => "cpu",
@@ -219,5 +293,74 @@ fn kind_str(kind: DeviceKind) -> &'static str {
         DeviceKind::IntegratedGpu => "integrated gpu",
         DeviceKind::Accelerator => "accelerator",
         DeviceKind::Other => "other",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const AVAILABLE: InhibitorSupport = InhibitorSupport::Available("test-mechanism");
+
+    #[test]
+    fn draining_battery_warns_with_the_threshold_and_a_remedy() {
+        let findings = power_findings(Some(19), Some(false), 25, &AVAILABLE);
+        assert_eq!(findings.len(), 2);
+        assert_eq!(findings[0].status, Status::Warn);
+        assert_eq!(
+            findings[0].message,
+            "battery: 19% (discharging) — below the 25% drain threshold"
+        );
+        assert!(findings[0]
+            .remedy
+            .as_deref()
+            .unwrap()
+            .contains("battery_drain_threshold"));
+    }
+
+    #[test]
+    fn healthy_battery_states_are_ok_findings() {
+        let on_ac = power_findings(Some(87), Some(true), 25, &AVAILABLE);
+        assert_eq!(on_ac[0].status, Status::Ok);
+        assert_eq!(on_ac[0].message, "battery: 87% (on AC)");
+
+        // Low but on AC: the policy never drains on AC, so no warning.
+        let low_on_ac = power_findings(Some(5), Some(true), 25, &AVAILABLE);
+        assert_eq!(low_on_ac[0].status, Status::Ok);
+
+        let discharging_high = power_findings(Some(62), Some(false), 25, &AVAILABLE);
+        assert_eq!(discharging_high[0].status, Status::Ok);
+        assert_eq!(discharging_high[0].message, "battery: 62% (discharging)");
+
+        let unknown_ac = power_findings(Some(10), None, 25, &AVAILABLE);
+        assert_eq!(unknown_ac[0].status, Status::Ok);
+        assert_eq!(unknown_ac[0].message, "battery: 10% (AC state unknown)");
+    }
+
+    #[test]
+    fn desktops_report_no_battery_as_ok() {
+        let findings = power_findings(None, Some(true), 25, &AVAILABLE);
+        assert_eq!(findings[0].status, Status::Ok);
+        assert_eq!(
+            findings[0].message,
+            "battery: none detected (desktop; never drains out of plans)"
+        );
+    }
+
+    #[test]
+    fn inhibitor_availability_maps_to_ok_or_warn() {
+        let ok = power_findings(None, None, 25, &AVAILABLE);
+        assert_eq!(ok[1].status, Status::Ok);
+        assert_eq!(ok[1].message, "sleep inhibit: test-mechanism");
+        assert!(ok[1].remedy.is_none());
+
+        let missing = InhibitorSupport::Unavailable("systemd-inhibit not found on PATH".into());
+        let warned = power_findings(None, None, 25, &missing);
+        assert_eq!(warned[1].status, Status::Warn);
+        assert_eq!(
+            warned[1].message,
+            "sleep inhibit: systemd-inhibit not found on PATH"
+        );
+        assert!(warned[1].remedy.as_deref().unwrap().contains("sleep"));
     }
 }
