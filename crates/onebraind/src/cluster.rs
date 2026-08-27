@@ -93,9 +93,11 @@ fn serve_device_index() -> i32 {
         .unwrap_or(0) as i32
 }
 
-/// Read the transformer layer count (`{arch}.block_count`) from a GGUF
-/// file's header. Blocking file I/O — call from a blocking context.
-pub fn gguf_layer_count(path: &Path) -> Result<u32, String> {
+/// Read and parse a GGUF file's full header (metadata + tensor infos),
+/// growing the read window until the header fits. The scheduler derives
+/// [`onebrain_scheduler::ModelDims`] from it (M4; replaces the M3
+/// layer-count-only read). Blocking file I/O — call from a blocking context.
+pub fn read_gguf_header(path: &Path) -> Result<GgufHeader, String> {
     use std::io::Read;
     let display = path.display();
     let file_len = std::fs::metadata(path)
@@ -108,33 +110,7 @@ pub fn gguf_layer_count(path: &Path) -> Result<u32, String> {
             .and_then(|f| f.take(want).read_to_end(&mut bytes))
             .map_err(|e| format!("cannot read model file {display}: {e}; check permissions"))?;
         match GgufHeader::parse(&bytes) {
-            Ok(header) => {
-                let arch = header
-                    .metadata
-                    .get("general.architecture")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| {
-                        format!(
-                            "model {display} declares no general.architecture; the file may be \
-                             corrupt — re-download it with `onebrain pull`"
-                        )
-                    })?
-                    .to_string();
-                let key = format!("{arch}.block_count");
-                let count = header
-                    .metadata
-                    .get(&key)
-                    .and_then(|v| v.as_u64())
-                    .ok_or_else(|| {
-                        format!(
-                            "model {display} declares no {key}; a layer split cannot be \
-                             computed — re-download it with `onebrain pull`"
-                        )
-                    })?;
-                return u32::try_from(count).map_err(|_| {
-                    format!("model {display} declares an absurd layer count ({count})")
-                });
-            }
+            Ok(header) => return Ok(header),
             Err(GgufError::NeedMoreData { need_hint }) if want < file_len => {
                 want = need_hint.max(want.saturating_mul(2)).min(file_len);
             }
@@ -158,6 +134,13 @@ pub struct ActivePlanView {
     /// The scheduler's prose explanation (head side only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub explanation: Option<String>,
+    /// The scheduler's predicted time-per-token for a distributed plan
+    /// (head side only): `max_stage(layers / decode_tps) × 1000 + Σ boundary
+    /// RTT ms`. A RELATIVE comparison metric — decode_tps comes from the
+    /// tiny-model microbench, so this is never a latency promise (honest-UX
+    /// rule §1.6) and is absent on solo plans and on workers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub predicted_tpt_ms: Option<f64>,
 }
 
 /// A worker's answer to a plan proposal, recorded for the awaiting head.
@@ -448,6 +431,7 @@ async fn handle_proposal(
                 role: "worker",
                 plan: plan.clone(),
                 explanation: None,
+                predicted_tpt_ms: None,
             }));
             *adopted = Some(AdoptedPlan {
                 epoch,
@@ -759,23 +743,33 @@ mod tests {
     }
 
     #[test]
-    fn gguf_layer_count_rejects_non_gguf_files() {
+    fn read_gguf_header_rejects_non_gguf_files() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("fake.gguf");
         std::fs::write(&path, b"definitely not a gguf header").unwrap();
-        let err = gguf_layer_count(&path).expect_err("garbage must not parse");
+        let err = read_gguf_header(&path).expect_err("garbage must not parse");
         assert!(err.contains("onebrain pull"), "remedy missing: {err}");
     }
 
     #[test]
-    fn gguf_layer_count_reads_the_smoke_model() {
+    fn read_gguf_header_feeds_model_dims_for_the_smoke_model() {
         // Real-model check, only when the smoke model is available (CI and
-        // local runs set OB_SMOKE_MODEL).
+        // local runs set OB_SMOKE_MODEL). This is exactly the drive_load
+        // planning path: header -> scheduler ModelDims.
         let Ok(path) = std::env::var("OB_SMOKE_MODEL") else {
-            eprintln!("OB_SMOKE_MODEL not set; skipping gguf layer count smoke test");
+            eprintln!("OB_SMOKE_MODEL not set; skipping gguf header smoke test");
             return;
         };
-        let layers = gguf_layer_count(Path::new(&path)).expect("smoke model header parses");
-        assert!(layers > 0, "layer count must be positive");
+        let path = Path::new(&path);
+        let header = read_gguf_header(path).expect("smoke model header parses");
+        let file_size = std::fs::metadata(path).unwrap().len();
+        let dims =
+            onebrain_scheduler::model_dims(&header, file_size).expect("dims derive from header");
+        assert!(dims.n_layers > 0, "layer count must be positive");
+        assert!(dims.total_weight_bytes > 0);
+        assert!(
+            dims.kv_bytes_per_layer_per_ctx_token > 0,
+            "the smoke model must yield a KV growth rate"
+        );
     }
 }

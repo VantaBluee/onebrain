@@ -261,6 +261,12 @@ struct Live {
     /// From the peer's last `NodeStatus`; cached here so reading a budget is
     /// never a network round trip.
     usable_memory_bytes: Option<u64>,
+    /// Microbench profile from the peer's last `NodeStatus` (M4). Every
+    /// `NodeStatus` overwrites all three — a peer that lost its profile
+    /// truthfully reports `None` again.
+    prefill_tps: Option<f64>,
+    decode_tps: Option<f64>,
+    disk_mbps: Option<f64>,
 }
 
 type LiveMap = Arc<StdMutex<HashMap<EndpointId, Live>>>;
@@ -877,6 +883,9 @@ impl Service {
                 loss: entry.loss,
                 last_seen_unix: entry.last_seen_unix,
                 usable_memory_bytes: entry.usable_memory_bytes,
+                prefill_tps: entry.prefill_tps,
+                decode_tps: entry.decode_tps,
+                disk_mbps: entry.disk_mbps,
             });
         }
         out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -1526,10 +1535,14 @@ async fn run_session(ctx: &SessionCtx) -> SessionEnd {
         let conn = ctx.conn.clone();
         let peer = ctx.peer;
         workers.spawn(async move {
-            let (usable_memory_bytes, devices) = provider();
+            let status = provider();
+            let usable_memory_bytes = status.usable_memory_bytes;
             let envelope = Envelope::new(Message::NodeStatus {
-                usable_memory_bytes,
-                devices,
+                usable_memory_bytes: status.usable_memory_bytes,
+                devices: status.devices,
+                prefill_tps: status.prefill_tps,
+                decode_tps: status.decode_tps,
+                disk_mbps: status.disk_mbps,
             });
             match send_control_stream(&conn, &envelope).await {
                 Ok(()) => debug!(
@@ -1813,11 +1826,22 @@ async fn control_stream(
                 }
                 if let Message::NodeStatus {
                     usable_memory_bytes,
+                    prefill_tps,
+                    decode_tps,
+                    disk_mbps,
                     ..
                 } = &envelope.message
                 {
                     let usable = *usable_memory_bytes;
-                    set_live(&live, peer, |l| l.usable_memory_bytes = Some(usable));
+                    let (prefill, decode, disk) = (*prefill_tps, *decode_tps, *disk_mbps);
+                    set_live(&live, peer, |l| {
+                        l.usable_memory_bytes = Some(usable);
+                        // The profile fields are overwritten whole: a peer
+                        // that has not (or no longer) benched reports None.
+                        l.prefill_tps = prefill;
+                        l.decode_tps = decode;
+                        l.disk_mbps = disk;
+                    });
                 }
                 let message = ControlMessage {
                     peer: NodeId(peer.to_string()),

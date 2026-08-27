@@ -16,6 +16,9 @@ use tempfile::TempDir;
 use tokio::time::timeout;
 
 const BETA_USABLE: u64 = 7 * 1024 * 1024 * 1024;
+const BETA_PREFILL_TPS: f64 = 812.5;
+const BETA_DECODE_TPS: f64 = 41.25;
+const BETA_DISK_MBPS: f64 = 1732.0;
 
 fn loopback() -> SocketAddr {
     SocketAddr::from((Ipv4Addr::LOCALHOST, 0))
@@ -24,15 +27,16 @@ fn loopback() -> SocketAddr {
 async fn spawn_node(dir: &TempDir, name: &str, usable: Option<u64>) -> MeshHandle {
     let key = identity::load_or_create(dir.path()).expect("device key");
     let node_status = usable.map(|bytes| {
-        Arc::new(move || {
-            (
-                bytes,
-                vec![DeviceBrief {
-                    kind: "cpu".to_string(),
-                    free_bytes: bytes,
-                    total_bytes: bytes * 2,
-                }],
-            )
+        Arc::new(move || onebrain_mesh::NodeStatusReport {
+            usable_memory_bytes: bytes,
+            devices: vec![DeviceBrief {
+                kind: "cpu".to_string(),
+                free_bytes: bytes,
+                total_bytes: bytes * 2,
+            }],
+            prefill_tps: Some(BETA_PREFILL_TPS),
+            decode_tps: Some(BETA_DECODE_TPS),
+            disk_mbps: Some(BETA_DISK_MBPS),
         }) as onebrain_mesh::NodeStatusFn
     });
     onebrain_mesh::MeshService::spawn(
@@ -115,9 +119,13 @@ async fn typed_streams_control_and_rpc_roundtrip() {
     })
     .await;
 
-    // Beta's NodeStatus (sent right after Hello) lands in alpha's peer view.
-    wait_for_peer(&alpha, "beta's NodeStatus budget", |p| {
+    // Beta's NodeStatus (sent right after Hello) lands in alpha's peer view,
+    // including the M4 microbench profile fields.
+    wait_for_peer(&alpha, "beta's NodeStatus budget + profile", |p| {
         p.usable_memory_bytes == Some(BETA_USABLE)
+            && p.prefill_tps == Some(BETA_PREFILL_TPS)
+            && p.decode_tps == Some(BETA_DECODE_TPS)
+            && p.disk_mbps == Some(BETA_DISK_MBPS)
     })
     .await;
 

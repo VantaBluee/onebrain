@@ -74,10 +74,40 @@ pub fn run_blocking() -> Result<(), DaemonError> {
         .build()
         .map_err(|source| DaemonError::Runtime { source })?;
 
+    // Persisted device profile (M4, docs/scheduler-v1.md): loaded at
+    // startup when present, refreshed by `POST /api/internal/bench`. Shared
+    // between the NodeStatus provider (peers see the profile fields) and
+    // the planner (the head scores itself with them). A corrupt file warns
+    // and is treated as absent — startup must not fail over a stale bench.
+    let profile_path = paths.config_dir.join("profile.toml");
+    let profile: crate::server::SharedProfile =
+        Arc::new(std::sync::Mutex::new(if profile_path.exists() {
+            match onebrain_scheduler::load_profile(&profile_path) {
+                Ok(stored) => {
+                    tracing::info!(
+                        measured_unix = stored.measured_unix,
+                        decode_tps = stored.decode_tps,
+                        "loaded persisted device profile"
+                    );
+                    Some(stored)
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, "ignoring unreadable profile.toml");
+                    None
+                }
+            }
+        } else {
+            None
+        }));
+
     // NodeStatus provider: the schedulable memory this node reports to
     // peers and budgets for itself — the CPU device's free memory minus the
-    // OS reserve, or the test-only `[debug]` override (docs/distributed.md).
+    // OS reserve, or the test-only `[debug]` override (docs/distributed.md)
+    // — plus the profile fields (the `[debug] decode_tps_override` wins
+    // over the measured decode rate, docs/scheduler-v1.md).
     let debug_override = config.debug.usable_memory_override_bytes;
+    let decode_override = config.debug.decode_tps_override;
+    let status_profile = profile.clone();
     let bind_addrs = match &config.mesh.bind_addr {
         Some(addr) => vec![addr.parse().map_err(|e| DaemonError::ConfigParse {
             path: paths.config_file().display().to_string(),
@@ -92,7 +122,17 @@ pub fn run_blocking() -> Result<(), DaemonError> {
         enable_relays: config.mesh.enable_relays,
         bind_addrs,
         engine_build: onebrain_engine::engine_build_hash().0,
-        node_status: Some(Arc::new(move || cluster::local_node_status(debug_override))),
+        node_status: Some(Arc::new(move || {
+            let (usable_memory_bytes, devices) = cluster::local_node_status(debug_override);
+            let stored = *status_profile.lock().expect("profile state poisoned");
+            onebrain_mesh::NodeStatusReport {
+                usable_memory_bytes,
+                devices,
+                prefill_tps: stored.map(|p| p.prefill_tps),
+                decode_tps: decode_override.or(stored.map(|p| p.decode_tps)),
+                disk_mbps: stored.map(|p| p.disk_mbps),
+            }
+        })),
         ..MeshConfig::default()
     };
     let served = match runtime.block_on(MeshService::spawn(
@@ -132,6 +172,8 @@ pub fn run_blocking() -> Result<(), DaemonError> {
                 mesh.clone(),
                 cluster.clone(),
                 debug_override,
+                profile.clone(),
+                profile_path.clone(),
             ));
             // Teardown ordering (ADR 0004): free any loaded model FIRST —
             // a distributed head model sends remote frees over its rpc
@@ -195,6 +237,8 @@ async fn serve(
     mesh: MeshHandle,
     cluster: Arc<ClusterState>,
     usable_memory_override: Option<u64>,
+    profile: crate::server::SharedProfile,
+    profile_path: std::path::PathBuf,
 ) -> Result<(), DaemonError> {
     let product_version: &'static str = env!("CARGO_PKG_VERSION");
     let shutdown = Arc::new(Notify::new());
@@ -235,6 +279,9 @@ async fn serve(
         mesh,
         cluster,
         usable_memory_override,
+        decode_tps_override: config.debug.decode_tps_override,
+        profile,
+        profile_path,
     });
     let app = onebrain_api::router(api_state).merge(internal_router(internal_state));
 

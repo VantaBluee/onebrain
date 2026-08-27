@@ -33,7 +33,7 @@ pub struct Config {
 
 /// The `[debug]` table: test-only knobs for the cluster simulator. Nothing
 /// here changes real resource allocation.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DebugSection {
     /// TEST-ONLY (docs/distributed.md "Tests / DoD hooks"): when set, this
@@ -42,6 +42,13 @@ pub struct DebugSection {
     /// cap nodes without cgroups. It never touches real allocation; the
     /// engine will still use whatever memory the load actually needs.
     pub usable_memory_override_bytes: Option<u64>,
+    /// TEST-ONLY (docs/scheduler-v1.md "DoD sim hooks"): when set, this
+    /// value replaces the measured decode throughput (tokens/sec) this node
+    /// reports in `NodeStatus` and uses for itself in placement scoring —
+    /// so the cluster sim can shape "fast" and "slow" nodes without real
+    /// hardware differences. It never changes how fast the engine actually
+    /// runs, only how the scheduler weighs this node.
+    pub decode_tps_override: Option<f64>,
 }
 
 /// The `[mesh]` table: switches passed to `onebrain-mesh::MeshConfig`.
@@ -190,6 +197,7 @@ mod tests {
     fn debug_section_defaults_to_no_override() {
         let c = Config::default();
         assert_eq!(c.debug.usable_memory_override_bytes, None);
+        assert_eq!(c.debug.decode_tps_override, None);
         // A config file without a [debug] table parses to the same default.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
@@ -228,6 +236,29 @@ mod tests {
         let c = Config {
             debug: DebugSection {
                 usable_memory_override_bytes: Some(256 * 1024 * 1024),
+                decode_tps_override: None,
+            },
+            ..Default::default()
+        };
+        c.save(&path).unwrap();
+        assert_eq!(Config::load(&path).unwrap(), c);
+    }
+
+    #[test]
+    fn decode_tps_override_parses_and_roundtrips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        // Parse from a hand-written sim config.
+        std::fs::write(&path, "[debug]\ndecode_tps_override = 12.5\n").unwrap();
+        let c = Config::load(&path).unwrap();
+        assert_eq!(c.debug.decode_tps_override, Some(12.5));
+        // A missing override in the same table stays None.
+        assert_eq!(c.debug.usable_memory_override_bytes, None);
+        // Full save/load roundtrip with both knobs set.
+        let c = Config {
+            debug: DebugSection {
+                usable_memory_override_bytes: Some(1 << 30),
+                decode_tps_override: Some(80.25),
             },
             ..Default::default()
         };

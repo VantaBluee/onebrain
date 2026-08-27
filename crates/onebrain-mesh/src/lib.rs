@@ -80,11 +80,28 @@ pub use service::{
     ALPN_MESH, ALPN_PAIR,
 };
 
-/// Provider for this node's `NodeStatus` message: returns
-/// `(usable_memory_bytes, devices)`. Called once per established mesh
-/// session, right after a compatible `Hello`, so peers learn this node's
-/// schedulable memory (measured free minus OS reserve — never total RAM).
-pub type NodeStatusFn = Arc<dyn Fn() -> (u64, Vec<DeviceBrief>) + Send + Sync>;
+/// This node's `NodeStatus` payload as supplied by the daemon's provider:
+/// schedulable memory (measured free minus OS reserve — never total RAM),
+/// the device inventory, and — since M4 — the optional compute/disk
+/// microbench figures from the persisted device profile. The profile fields
+/// are `None` until the node has run `onebrain bench` (the scheduler then
+/// falls back to memory-only weighting, docs/scheduler-v1.md).
+#[derive(Debug, Clone)]
+pub struct NodeStatusReport {
+    pub usable_memory_bytes: u64,
+    pub devices: Vec<DeviceBrief>,
+    /// Measured prefill throughput (tokens/sec), if profiled.
+    pub prefill_tps: Option<f64>,
+    /// Measured decode throughput (tokens/sec), if profiled.
+    pub decode_tps: Option<f64>,
+    /// Measured sequential disk read rate (MB/s), if profiled.
+    pub disk_mbps: Option<f64>,
+}
+
+/// Provider for this node's `NodeStatus` message. Called once per
+/// established mesh session, right after a compatible `Hello`, so peers
+/// learn this node's schedulable memory and (when benched) its profile.
+pub type NodeStatusFn = Arc<dyn Fn() -> NodeStatusReport + Send + Sync>;
 
 /// Errors from the mesh service. Every user-facing variant carries a one-line
 /// remedy in its message (§12 of the product spec).
@@ -355,6 +372,15 @@ pub struct PeerStatus {
     /// (measured free minus OS reserve — never total RAM). `None` until the
     /// peer sends one; retains the last value across reconnects.
     pub usable_memory_bytes: Option<u64>,
+    /// Prefill throughput (tokens/sec) from the peer's last `NodeStatus`
+    /// — its compute-microbench result, `None` until the peer has benched.
+    /// Like `usable_memory_bytes`, each `NodeStatus` overwrites it whole.
+    pub prefill_tps: Option<f64>,
+    /// Decode throughput (tokens/sec) from the peer's last `NodeStatus`.
+    pub decode_tps: Option<f64>,
+    /// Sequential disk read rate (MB/s) from the peer's last `NodeStatus`
+    /// (page-cache upper bound; relative ordering only).
+    pub disk_mbps: Option<f64>,
 }
 
 /// Measured quality of a link between two nodes. Populated by the prober;

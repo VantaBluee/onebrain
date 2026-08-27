@@ -6,8 +6,8 @@
 //! file (same-user filesystem access).
 
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Request, State};
 use axum::http::{header, StatusCode};
@@ -17,16 +17,27 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use onebrain_api::auth::AuthConfig;
 use onebrain_api::ApiError;
-use onebrain_mesh::{MeshError, MeshHandle, PairEvent, PairTarget, PeerState};
+use onebrain_mesh::{MeshError, MeshHandle, PairEvent, PairTarget, PeerState, PeerStatus};
 use onebrain_models::registry::{ModelRef, Resolved};
 use onebrain_proto::message::{Envelope, Message};
-use onebrain_proto::plan::{NodeId, Plan, Strategy};
-use onebrain_scheduler::{NodeBudget, PlanInput};
+use onebrain_proto::plan::{Assignment, NodeId, Plan, Strategy};
+use onebrain_scheduler::{ComputeProfile, LinkRtt, NodeCaps, PlanRequest, StoredProfile};
 use tokio::sync::{mpsc, oneshot, Notify};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::cluster::{ActivePlanView, ClusterState};
 use crate::engine_host::{EngineHost, HostMsg, LoadProgress, ProgressThrottle};
+
+/// Registry id of the microbench test model (docs/scheduler-v1.md
+/// "Profiles"): pulled through the normal registry path on first bench —
+/// never bundled in the binary.
+pub const BENCH_MODEL_ID: &str = "tinystories-260k";
+
+/// The daemon's in-memory view of the persisted device profile
+/// (`<config_dir>/profile.toml`): loaded at startup, refreshed by
+/// `POST /api/internal/bench`, read by the `NodeStatus` provider and the
+/// planner.
+pub type SharedProfile = Arc<StdMutex<Option<StoredProfile>>>;
 
 /// Shared state for the internal router.
 pub struct InternalState {
@@ -47,6 +58,15 @@ pub struct InternalState {
     pub cluster: Arc<ClusterState>,
     /// Test-only `[debug] usable_memory_override_bytes` (docs/distributed.md).
     pub usable_memory_override: Option<u64>,
+    /// Test-only `[debug] decode_tps_override` (docs/scheduler-v1.md): when
+    /// set it replaces the measured decode throughput in `NodeStatus` and in
+    /// local placement scoring.
+    pub decode_tps_override: Option<f64>,
+    /// The persisted device profile, shared with the `NodeStatus` provider.
+    pub profile: SharedProfile,
+    /// Where `POST /api/internal/bench` persists the profile
+    /// (`<config_dir>/profile.toml`).
+    pub profile_path: PathBuf,
 }
 
 /// Build the internal router with its always-on token middleware.
@@ -54,6 +74,7 @@ pub fn internal_router(state: Arc<InternalState>) -> Router {
     Router::new()
         .route("/api/internal/status", get(status))
         .route("/api/internal/load", post(load))
+        .route("/api/internal/bench", post(bench))
         .route("/api/internal/shutdown", post(shutdown))
         .route("/api/internal/pair/start", post(pair_start))
         .route("/api/internal/pair/join", post(pair_join))
@@ -173,6 +194,156 @@ async fn load(State(state): State<Arc<InternalState>>, Json(body): Json<LoadBody
     ndjson_response(line_rx)
 }
 
+fn bench_error(status: StatusCode, message: String) -> Response {
+    (
+        status,
+        Json(serde_json::json!({
+            "error": { "message": message, "type": "bench_error" }
+        })),
+    )
+        .into_response()
+}
+
+/// `POST /api/internal/bench` (docs/scheduler-v1.md "onebrain bench"):
+/// run the full local profile — compute microbench on the registry test
+/// model (pulled through the normal registry path if absent) plus the disk
+/// sequential-read probe — persist it to `profile.toml`, refresh every
+/// connected peer's link probe, and answer with the profile and the link
+/// table. Peers learn the fresh profile immediately via a best-effort
+/// `NodeStatus` push (and again on every future session).
+async fn bench(State(state): State<Arc<InternalState>>) -> Response {
+    // 1. Ensure the test model is cached — exactly a normal registry pull.
+    let spec = match BENCH_MODEL_ID
+        .parse::<ModelRef>()
+        .map_err(|e| e.to_string())
+        .and_then(|r| r.resolve().map_err(|e| e.to_string()))
+    {
+        Ok(Resolved::Remote(spec)) => spec,
+        Ok(Resolved::Local(_)) => {
+            return bench_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "registry id {BENCH_MODEL_ID:?} resolved to a local path; this is a \
+                     OneBrain packaging bug — please report it"
+                ),
+            );
+        }
+        Err(message) => {
+            return bench_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "the embedded registry cannot resolve the test model \
+                     {BENCH_MODEL_ID:?}: {message}"
+                ),
+            );
+        }
+    };
+    let dest_dir = state.cache_root.join(&spec.cache_key);
+    let model_path = match onebrain_models::download::download(&spec, &dest_dir, |_, _| {}).await {
+        Ok(path) => path,
+        Err(e) => return bench_error(StatusCode::BAD_GATEWAY, e.to_string()),
+    };
+
+    // 2. The compute microbench and the disk probe (blocking, ~seconds).
+    let probe_path = model_path.clone();
+    let measured = tokio::task::spawn_blocking(move || {
+        let compute = onebrain_scheduler::measure_compute(&probe_path)?;
+        let disk_mbps = onebrain_scheduler::measure_disk(&probe_path)?;
+        Ok::<_, onebrain_scheduler::ProfileError>((compute, disk_mbps))
+    })
+    .await;
+    let (compute, disk_mbps) = match measured {
+        Ok(Ok(pair)) => pair,
+        Ok(Err(e)) => return bench_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(_) => {
+            return bench_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the microbench task failed unexpectedly; retry `onebrain bench`".to_string(),
+            );
+        }
+    };
+    let stored = StoredProfile {
+        measured_unix: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        prefill_tps: compute.prefill_tps,
+        decode_tps: compute.decode_tps,
+        disk_mbps,
+    };
+
+    // 3. Persist, then publish to the state the NodeStatus provider and the
+    // planner read. The measured values are stored/returned even under the
+    // decode_tps_override — the override applies at reporting/scoring time.
+    if let Err(e) = onebrain_scheduler::save_profile(&state.profile_path, &stored) {
+        return bench_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+    }
+    *state.profile.lock().expect("profile state poisoned") = Some(stored);
+    tracing::info!(
+        prefill_tps = stored.prefill_tps,
+        decode_tps = stored.decode_tps,
+        disk_mbps = stored.disk_mbps,
+        "device profile refreshed by bench"
+    );
+
+    // 4. Refresh every connected peer's link probe, then read the table
+    // back. A failed probe keeps the peer's last-known figures.
+    let peers = state.mesh.peers().await.unwrap_or_default();
+    for peer in peers.iter().filter(|p| p.state == PeerState::Connected) {
+        if let Err(err) = state.mesh.probe(&peer.name).await {
+            tracing::warn!(
+                peer = %peer.name,
+                error = %err,
+                "bench link probe failed; reporting last-known figures"
+            );
+        }
+    }
+    let refreshed = state.mesh.peers().await.unwrap_or(peers);
+    let connected: Vec<&PeerStatus> = refreshed
+        .iter()
+        .filter(|p| p.state == PeerState::Connected)
+        .collect();
+    let links: Vec<serde_json::Value> = connected
+        .iter()
+        .map(|p| {
+            serde_json::json!({
+                "peer": p.name,
+                "id": p.id,
+                "rtt_ms": p.rtt_ms,
+                "bandwidth_mbps": p.bandwidth_mbps,
+                "loss": p.loss,
+            })
+        })
+        .collect();
+
+    // 5. Best-effort push of the refreshed NodeStatus so peers do not wait
+    // for the next session to learn the new profile; the measured usable
+    // memory also joins the report's profile object (the bench report's
+    // NODE table shows memory alongside the throughputs).
+    let override_bytes = state.usable_memory_override;
+    let mut profile_json = serde_json::to_value(stored).unwrap_or_else(|_| serde_json::json!({}));
+    if let Ok((usable_memory_bytes, devices)) =
+        tokio::task::spawn_blocking(move || crate::cluster::local_node_status(override_bytes)).await
+    {
+        profile_json["usable_memory_bytes"] = serde_json::json!(usable_memory_bytes);
+        let envelope = Envelope::new(Message::NodeStatus {
+            usable_memory_bytes,
+            devices,
+            prefill_tps: Some(stored.prefill_tps),
+            // The test-only override wins wherever decode is reported.
+            decode_tps: Some(state.decode_tps_override.unwrap_or(stored.decode_tps)),
+            disk_mbps: Some(stored.disk_mbps),
+        });
+        for peer in &connected {
+            if let Err(err) = state.mesh.send_control(&peer.id, envelope.clone()).await {
+                tracing::debug!(peer = %peer.name, "NodeStatus push after bench failed: {err}");
+            }
+        }
+    }
+
+    Json(serde_json::json!({ "profile": profile_json, "links": links })).into_response()
+}
+
 /// A model reference resolved to a local file (downloaded if needed).
 struct LocalModel {
     path: PathBuf,
@@ -276,7 +447,8 @@ async fn drive_load(state: Arc<InternalState>, body: LoadBody, tx: LineSender) {
         return;
     };
 
-    // Phase B: plan.
+    // Phase B: plan (M4 scheduler v1: real model dims, device profiles, and
+    // measured link RTTs — docs/scheduler-v1.md).
     let _ = emit(&tx, serde_json::json!({ "status": "planning" })).await;
     let override_bytes = state.usable_memory_override;
     let head_status =
@@ -297,16 +469,16 @@ async fn drive_load(state: Arc<InternalState>, body: LoadBody, tx: LineSender) {
     // follows pairing within milliseconds), so wait briefly for budgets of
     // connected peers instead of silently planning without them.
     let budget_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-    let workers: Vec<NodeBudget> = loop {
-        let peers = match state.mesh.peers().await {
+    let peers: Vec<PeerStatus> = loop {
+        let all = match state.mesh.peers().await {
             Ok(p) => p,
             Err(e) => {
                 emit_error(&tx, e.to_string()).await;
                 return;
             }
         };
-        let connected: Vec<_> = peers
-            .iter()
+        let connected: Vec<PeerStatus> = all
+            .into_iter()
             .filter(|p| p.state == PeerState::Connected)
             .collect();
         let missing = connected.iter().any(|p| p.usable_memory_bytes.is_none());
@@ -317,35 +489,18 @@ async fn drive_load(state: Arc<InternalState>, body: LoadBody, tx: LineSender) {
                      (NodeStatus never arrived); they are excluded from this plan"
                 );
             }
-            break connected
-                .into_iter()
-                .filter_map(|p| {
-                    p.usable_memory_bytes.map(|bytes| NodeBudget {
-                        node: NodeId(p.id.clone()),
-                        usable_memory_bytes: bytes,
-                    })
-                })
-                .collect();
+            break connected;
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     };
+    // Model dims (per-layer weight bytes + KV growth rate) from the real
+    // GGUF header — replaces the M3 layer-count-only read.
     let header_path = local.path.clone();
-    let n_layers =
-        match tokio::task::spawn_blocking(move || crate::cluster::gguf_layer_count(&header_path))
+    let header =
+        match tokio::task::spawn_blocking(move || crate::cluster::read_gguf_header(&header_path))
             .await
         {
-            Ok(Ok(n)) if n > 0 => n,
-            Ok(Ok(_)) => {
-                emit_error(
-                    &tx,
-                    format!(
-                        "model {} declares zero transformer layers; the file may be corrupt",
-                        local.path.display()
-                    ),
-                )
-                .await;
-                return;
-            }
+            Ok(Ok(header)) => header,
             Ok(Err(message)) => {
                 emit_error(&tx, message).await;
                 return;
@@ -359,19 +514,73 @@ async fn drive_load(state: Arc<InternalState>, body: LoadBody, tx: LineSender) {
                 return;
             }
         };
+    let dims = match onebrain_scheduler::model_dims(&header, local.size_bytes) {
+        Ok(dims) => dims,
+        Err(e) => {
+            emit_error(&tx, e.to_string()).await;
+            return;
+        }
+    };
     let own_id = state.mesh.endpoint_id().to_string();
-    let input = PlanInput {
-        head: NodeBudget {
+    // Head compute profile: the persisted local profile, with the test-only
+    // `[debug] decode_tps_override` winning (docs/scheduler-v1.md DoD
+    // hooks). With an override but no stored profile, prefill is reported
+    // as 0.0 — v1 placement scoring only consumes decode_tps.
+    let stored = *state.profile.lock().expect("profile state poisoned");
+    let head_compute = match (state.decode_tps_override, stored) {
+        (Some(decode), stored) => Some(ComputeProfile {
+            prefill_tps: stored.map(|p| p.prefill_tps).unwrap_or(0.0),
+            decode_tps: decode,
+        }),
+        (None, Some(p)) => Some(ComputeProfile {
+            prefill_tps: p.prefill_tps,
+            decode_tps: p.decode_tps,
+        }),
+        (None, None) => None,
+    };
+    let mut workers = Vec::with_capacity(peers.len());
+    let mut links = Vec::new();
+    for p in &peers {
+        let Some(bytes) = p.usable_memory_bytes else {
+            continue;
+        };
+        workers.push(NodeCaps {
+            node: NodeId(p.id.clone()),
+            usable_memory_bytes: bytes,
+            // From the peer's NodeStatus; None (or a nonsense zero) means
+            // the peer has not benched — memory-only weighting for it.
+            compute: p
+                .decode_tps
+                .filter(|d| *d > 0.0)
+                .map(|decode| ComputeProfile {
+                    prefill_tps: p.prefill_tps.unwrap_or(0.0),
+                    decode_tps: decode,
+                }),
+        });
+        // Head <-> worker RTT from the heartbeat EWMA. Worker <-> worker
+        // links are not measured in M4 and are omitted — the scheduler
+        // defaults missing pairs to DEFAULT_LINK_RTT_MS.
+        if let Some(rtt_ms) = p.rtt_ms {
+            links.push(LinkRtt {
+                a: NodeId(own_id.clone()),
+                b: NodeId(p.id.clone()),
+                rtt_ms,
+            });
+        }
+    }
+    let request = PlanRequest {
+        head: NodeCaps {
             node: NodeId(own_id.clone()),
             usable_memory_bytes: head_usable,
+            compute: head_compute,
         },
         workers,
-        model_bytes: local.size_bytes,
-        n_layers,
+        dims,
         ctx_len: state.ctx_len,
         forced_nodes: body.nodes,
+        links,
     };
-    let placed = match onebrain_scheduler::plan(&input) {
+    let placed = match onebrain_scheduler::plan_v1(&request) {
         Ok(p) => p,
         Err(e) => {
             emit_error(&tx, e.to_string()).await;
@@ -384,7 +593,11 @@ async fn drive_load(state: Arc<InternalState>, body: LoadBody, tx: LineSender) {
     if !solo {
         plan.epoch = state.cluster.next_epoch();
     }
+    let predicted = (!solo).then(|| predicted_tpt_ms(&plan.assignments, &request));
     let mut plan_json = serde_json::to_value(&plan).unwrap_or_else(|_| serde_json::json!({}));
+    if let Some(tpt) = predicted {
+        plan_json["predicted_tpt_ms"] = serde_json::json!(tpt);
+    }
     if body.explain {
         plan_json["explanation"] = serde_json::json!(placed.explanation);
     }
@@ -408,11 +621,61 @@ async fn drive_load(state: Arc<InternalState>, body: LoadBody, tx: LineSender) {
             plan,
             placed.tensor_split,
             placed.explanation,
+            predicted,
             own_id,
             &tx,
         )
         .await;
     }
+}
+
+/// Mirror of the scheduler's plan-comparison metric for the FINAL plan
+/// (v1 module docs): `max_stage(layers / decode_tps) × 1000 + Σ boundary
+/// RTT ms`, where an unprofiled node is costed at the slowest profiled
+/// node's rate (conservative) or contributes zero when nothing is profiled,
+/// and unmeasured links default to
+/// [`onebrain_scheduler::DEFAULT_LINK_RTT_MS`]. A RELATIVE figure (the
+/// decode rates come from the tiny-model microbench), surfaced as
+/// `predicted_tpt_ms` on the plan view — never as a latency promise (§1.6).
+fn predicted_tpt_ms(assignments: &[Assignment], request: &PlanRequest) -> f64 {
+    let nodes = || std::iter::once(&request.head).chain(request.workers.iter());
+    let min_decode = nodes()
+        .filter_map(|c| c.compute.map(|p| p.decode_tps))
+        .filter(|d| *d > 0.0)
+        .fold(f64::NAN, f64::min);
+    let decode_of = |id: &NodeId| -> Option<f64> {
+        nodes()
+            .find(|c| &c.node == id)
+            .and_then(|c| c.compute.map(|p| p.decode_tps))
+            .filter(|d| *d > 0.0)
+            .or(if min_decode.is_finite() {
+                Some(min_decode)
+            } else {
+                None
+            })
+    };
+    let compute_ms = assignments
+        .iter()
+        .map(|a| match decode_of(&a.node) {
+            Some(tps) => a.layers.len() as f64 / tps * 1000.0,
+            None => 0.0,
+        })
+        .fold(0.0f64, f64::max);
+    let boundary_ms: f64 = assignments
+        .windows(2)
+        .map(|pair| {
+            request
+                .links
+                .iter()
+                .find(|l| {
+                    (l.a == pair[0].node && l.b == pair[1].node)
+                        || (l.a == pair[1].node && l.b == pair[0].node)
+                })
+                .map(|l| l.rtt_ms)
+                .unwrap_or(onebrain_scheduler::DEFAULT_LINK_RTT_MS)
+        })
+        .sum();
+    compute_ms + boundary_ms
 }
 
 /// The unchanged single-node path: the engine host resolves the (already
@@ -457,6 +720,7 @@ async fn solo_load(
                 role: "head",
                 plan,
                 explanation: Some(explanation),
+                predicted_tpt_ms: None,
             }));
             // Bridges of any replaced distributed plan are stale now — the
             // host dropped that model during the swap (ADR 0004 ordering:
@@ -487,6 +751,7 @@ async fn distributed_load(
     plan: Plan,
     tensor_split: Vec<f32>,
     explanation: String,
+    predicted_tpt_ms: Option<f64>,
     own_id: String,
     tx: &LineSender,
 ) {
@@ -582,6 +847,7 @@ async fn distributed_load(
                 role: "head",
                 plan,
                 explanation: Some(explanation),
+                predicted_tpt_ms,
             }));
             let _ = emit(tx, serde_json::json!({ "status": "ready", "model": model })).await;
         }
@@ -791,6 +1057,10 @@ mod tests {
             mesh,
             cluster: ClusterState::new(),
             usable_memory_override: None,
+            decode_tps_override: None,
+            profile: Arc::new(StdMutex::new(None)),
+            // Nested like a real <config_dir>: bench must create parents.
+            profile_path: dir.path().join("config").join("profile.toml"),
         });
         let app = internal_router(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -927,6 +1197,89 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("definitely-not-a-model"));
+        teardown(host, host_thread);
+    }
+
+    /// Bench endpoint shape over the hermetic mesh. Needs the engine, so it
+    /// runs only when OB_SMOKE_MODEL points at a tiny GGUF (same gating as
+    /// the engine smoke tests). The registry test model is seeded into the
+    /// cache with a manifest matching the registry URL, so `download`'s
+    /// fast path serves it without touching the network.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bench_measures_a_profile_persists_it_and_reports_links() {
+        let Ok(smoke) = std::env::var("OB_SMOKE_MODEL") else {
+            eprintln!("OB_SMOKE_MODEL not set; skipping bench endpoint test");
+            return;
+        };
+        let (base, _notify, host, host_thread, dir) = serve_internal("sekrit").await;
+        let spec = match BENCH_MODEL_ID
+            .parse::<ModelRef>()
+            .unwrap()
+            .resolve()
+            .unwrap()
+        {
+            Resolved::Remote(spec) => spec,
+            other => panic!("registry id must resolve remote, got {other:?}"),
+        };
+        let dest = dir.path().join("models").join(&spec.cache_key);
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::copy(&smoke, dest.join(&spec.file_name)).unwrap();
+        let size = std::fs::metadata(dest.join(&spec.file_name)).unwrap().len();
+        let manifest = onebrain_models::download::Manifest {
+            url: spec.url.clone(),
+            size_bytes: size,
+            // The cached-file fast path checks url + size, not the hash.
+            blake3: "seeded-by-test".to_string(),
+        };
+        std::fs::write(
+            dest.join("manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let resp = reqwest::Client::new()
+            .post(format!("{base}/api/internal/bench"))
+            .bearer_auth("sekrit")
+            .timeout(Duration::from_secs(300))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let profile = &body["profile"];
+        assert!(
+            profile["prefill_tps"].as_f64().unwrap() > 0.0,
+            "prefill must be positive: {body}"
+        );
+        assert!(
+            profile["decode_tps"].as_f64().unwrap() > 0.0,
+            "decode must be positive: {body}"
+        );
+        assert!(
+            profile["disk_mbps"].as_f64().unwrap() > 0.0,
+            "disk must be positive: {body}"
+        );
+        assert!(
+            profile["measured_unix"].as_u64().unwrap() > 0,
+            "measured_unix stamp missing: {body}"
+        );
+        // The report's NODE table shows memory next to the throughputs.
+        assert!(
+            profile["usable_memory_bytes"].is_u64(),
+            "usable_memory_bytes missing: {body}"
+        );
+        // No peers on the hermetic mesh: the link table is present but empty.
+        assert_eq!(body["links"], serde_json::json!([]));
+
+        // The profile persisted where the daemon reloads it at startup.
+        let stored =
+            onebrain_scheduler::load_profile(&dir.path().join("config").join("profile.toml"))
+                .expect("bench persists profile.toml");
+        assert_eq!(
+            stored.measured_unix,
+            profile["measured_unix"].as_u64().unwrap()
+        );
+        assert!(stored.decode_tps > 0.0);
         teardown(host, host_thread);
     }
 
