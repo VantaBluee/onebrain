@@ -1,3 +1,4 @@
+pub mod bench;
 pub mod doctor;
 pub mod ls;
 pub mod pair;
@@ -35,14 +36,6 @@ impl From<onebraind::DaemonError> for CliError {
     fn from(e: onebraind::DaemonError) -> CliError {
         CliError(e.to_string())
     }
-}
-
-/// Uniform message for commands whose milestone hasn't landed yet.
-pub fn not_yet(command: &str, milestone: &str) -> Result<(), CliError> {
-    Err(CliError(format!(
-        "`onebrain {command}` is not implemented yet; it arrives in milestone {milestone}. \
-         Track progress in STATUS.md."
-    )))
 }
 
 /// Format a byte count for humans: decimal units, one decimal below 10

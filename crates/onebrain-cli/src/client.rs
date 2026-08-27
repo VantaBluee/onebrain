@@ -250,6 +250,29 @@ impl DaemonClient {
         Self::success_json(resp)
     }
 
+    /// `POST /api/internal/bench` — re-run this node's profile (compute
+    /// microbench + disk probe) and every connected peer's link probe (M4,
+    /// docs/scheduler-v1.md "`onebrain bench`"). Returns
+    /// `{ "profile": { prefill_tps, decode_tps, disk_mbps,
+    /// usable_memory_bytes, measured_unix }, "links": [{ peer, rtt_ms,
+    /// bandwidth_mbps, loss }] }`. Deliberately long timeout: the
+    /// microbench alone has a ~10 s budget and the registry test model may
+    /// need a pull on the first run.
+    pub fn bench(&self) -> Result<serde_json::Value, ClientError> {
+        let url = format!("{}/api/internal/bench", self.base_url);
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(&self.token)
+            .timeout(Duration::from_secs(120))
+            .send()
+            .map_err(|e| ClientError::Unreachable {
+                url: url.clone(),
+                detail: e.to_string(),
+            })?;
+        Self::success_json(resp)
+    }
+
     /// `GET /api/internal/peers` — paired peers with live link state.
     pub fn peers(&self) -> Result<serde_json::Value, ClientError> {
         let url = format!("{}/api/internal/peers", self.base_url);

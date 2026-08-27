@@ -6,13 +6,16 @@
 //! off) and walks the four contract scenarios in one run:
 //!
 //! 1. **Distribute** — both daemons capped via `[debug]
-//!    usable_memory_override_bytes` so the tiny model fits neither alone
-//!    (cap = 70% of the file size: the scheduler's 85% budget of that is
-//!    ~59.5% < 100%, so solo fails; pooled ~119% > 100%, so two nodes fit).
-//!    A `load` WITHOUT `--nodes` must auto-engage `PipelineParallel` across
-//!    2 nodes, streaming `planning` + `plan` NDJSON lines; both API dialects
-//!    answer through the distributed plan, and the OpenAI completion
-//!    (temperature 0, max_tokens 12, fixed prompt) is captured.
+//!    usable_memory_override_bytes` so the tiny model fits neither alone.
+//!    The cap follows the M4 v1 budget rule (docs/scheduler-v1.md: budget =
+//!    usable minus the 512 MiB overhead reserve, layer capacity from real
+//!    weights + KV at the configured ctx): each node gets the reserve plus
+//!    exactly `n_layers - 1` layer-costs, so solo fails by one layer while
+//!    two nodes pool `2(n-1) >= n` layers. A `load` WITHOUT `--nodes` must
+//!    auto-engage `PipelineParallel` across 2 nodes, streaming `planning` +
+//!    `plan` NDJSON lines; both API dialects answer through the distributed
+//!    plan, and the OpenAI completion (temperature 0, max_tokens 12, fixed
+//!    prompt) is captured.
 //! 2. **Socket scan** — while the distributed session is open, every
 //!    listening TCP socket of both daemon pids is loopback-only (non-
 //!    loopback is forbidden ALWAYS); the head's per-epoch loopback rpc
@@ -25,6 +28,31 @@
 //!    the distributed one (the §9 correctness property).
 //! 4. **Forced** — `--nodes 2` on the uncapped pair distributes anyway;
 //!    `explain` prose is asserted on every plan line.
+//!
+//! After the M3 steps, the M4 scheduler-v1 scenarios run on the same
+//! paired daemons (docs/scheduler-v1.md "DoD sim hooks"), restarting them
+//! with new configs where the caps/ctx must change:
+//!
+//! 5. **Ctx 2048 (KV shifts with ctx, part 1)** — both daemons restarted
+//!    with EQUAL memory caps ([`m4_cap`]: the v1 512 MiB overhead reserve
+//!    plus a budget sized from the model's real dims so weights + KV fit
+//!    the head at ctx 2048 but not at 16384), `[debug]
+//!    decode_tps_override` 100.0 on A vs 50.0 on B, and `ctx_len = 2048`
+//!    (the load body has no ctx override — the daemon plans at its config
+//!    ctx, so ctx moves via config + restart). The load must plan `Solo`
+//!    on the head with all layers.
+//! 6. **Ctx 16384 + asymmetric** — same caps and overrides, `ctx_len =
+//!    16384`: KV per layer grows 8×, solo no longer fits, and the plan
+//!    must be `PipelineParallel` across both nodes with A (decode 100)
+//!    taking MORE layers than B (decode 50), each within ±1 layer of the
+//!    score prediction computed here from the contract's own formula
+//!    (shares ∝ `capacity × (0.5 + 0.5 × decode/max_decode)`; equal caps
+//!    cancel the capacity term). With two nodes and a fixed layer total,
+//!    "fewer layers per node at 16k" is asserted as: every 16k assignment
+//!    holds fewer layers than the 2k Solo plan's single assignment.
+//! 7. **Third node** — SKIPPED here (a third daemon would triple the sim's
+//!    wall time); the ≥5% rule is covered by the scheduler unit tests
+//!    named in the printed `[SKIP]` line.
 //!
 //! `--netem` (Linux, root only — SKIP + exit 0 anywhere else): the same
 //! scenario inside the pair-sim network namespaces, shaped to
@@ -103,23 +131,32 @@ pub fn run(netem: bool) -> Result<()> {
         locate_onebrain_binary(&root)
     })?;
 
-    let (model_path, cap) = step("model: tiny GGUF + caps (solo fails, pooled fits)", || {
-        let cache = root.join("target-smoke");
-        std::fs::create_dir_all(&cache).with_context(|| format!("creating {}", cache.display()))?;
-        let path = crate::smoke::ensure_model(&cache)?;
-        let size = std::fs::metadata(&path)
-            .with_context(|| format!("stat {}", path.display()))?
-            .len();
-        let cap = distribute_cap(size);
-        let budget = scheduler_budget(cap);
-        println!(
-            "  model {} ({size} B); per-node cap {cap} B \
-             (85% budget {budget} B < {size} B solo; pooled {} B > {size} B)",
+    let (model_path, dims, cap) = step(
+        "model: tiny GGUF + v1 caps (solo fails, pooled fits)",
+        || {
+            let cache = root.join("target-smoke");
+            std::fs::create_dir_all(&cache)
+                .with_context(|| format!("creating {}", cache.display()))?;
+            let path = crate::smoke::ensure_model(&cache)?;
+            let dims = read_gguf_dims(&path)?;
+            let cap = m3_distribute_cap(&dims);
+            let budget = m3_distribute_budget(&dims);
+            println!(
+            "  model {} ({} layers, kv {} B/token/layer, weights {} B)\n  per-node cap {cap} B \
+             = the v1 512 MiB reserve + budget {budget} B, which holds {} of {} layers at ctx \
+             {M3_DEFAULT_CTX} (solo needs {} B; two nodes pool {} layers)",
             path.display(),
-            2 * budget
+            dims.n_layers,
+            dims.kv_rate,
+            dims.total_weight_bytes,
+            budget / dims.per_layer_cost(M3_DEFAULT_CTX),
+            dims.n_layers,
+            dims.required_bytes(M3_DEFAULT_CTX),
+            2 * (budget / dims.per_layer_cost(M3_DEFAULT_CTX)),
         );
-        Ok((path, cap))
-    })?;
+            Ok((path, dims, cap))
+        },
+    )?;
 
     if netem {
         step(
@@ -154,8 +191,8 @@ pub fn run(netem: bool) -> Result<()> {
     // Node::new wrote the plain pair-sim config; overwrite with the same
     // switches PLUS the memory cap and pinned mesh port before the daemons
     // ever start.
-    write_config(&a, mesh_a, netem, Some(cap))?;
-    write_config(&b, mesh_b, netem, Some(cap))?;
+    write_config(&a, mesh_a, netem, SimKnobs::capped(cap))?;
+    write_config(&b, mesh_b, netem, SimKnobs::capped(cap))?;
     println!(
         "sandbox A: {} (api {port_a}, mesh {mesh_a})",
         a.home.display()
@@ -165,7 +202,7 @@ pub fn run(netem: bool) -> Result<()> {
         b.home.display()
     );
 
-    let outcome = scenario(&a, &b, &model_path, mesh_a, mesh_b, netem);
+    let outcome = scenario(&a, &b, &model_path, &dims, mesh_a, mesh_b, netem);
     if outcome.is_err() {
         dump_daemon_log(&a.home);
         dump_daemon_log(&b.home);
@@ -182,6 +219,7 @@ fn scenario(
     a: &Node,
     b: &Node,
     model_path: &Path,
+    dims: &SimModelDims,
     mesh_a: u16,
     mesh_b: u16,
     netem: bool,
@@ -264,7 +302,7 @@ fn scenario(
             // Head first: its epoch teardown closes the rpc streams before the
             // worker goes away, so nothing tears mid-session.
             for (node, mesh_port) in [(a, mesh_a), (b, mesh_b)] {
-                restart_uncapped(node, mesh_port, netem)?;
+                restart_with(node, mesh_port, netem, SimKnobs::default())?;
             }
             wait_connected(a, b, &peer_a, &peer_b, "after the uncapped restart")
         },
@@ -314,38 +352,646 @@ fn scenario(
         },
     )?;
 
+    // ---- M4 scheduler-v1 scenarios (docs/scheduler-v1.md "DoD sim hooks",
+    // module docs steps 5-7). Reuses the paired daemons from the forced
+    // step; restarts them because caps, decode overrides, and ctx all live
+    // in config (the load body carries no ctx override).
+    step(
+        "m4 caps: the ctx-shift + asymmetric invariants hold for this model",
+        || {
+            check_m4_scenario(dims)?;
+            println!(
+                "  per-node budget {} B (cap {} B = budget + the v1 512 MiB overhead \
+                 reserve): ctx {M4_CTX_SMALL} needs {} B (solo fits), ctx {M4_CTX_BIG} \
+                 needs {} B (solo fails)",
+                m4_budget(dims),
+                m4_cap(dims),
+                dims.required_bytes(M4_CTX_SMALL),
+                dims.required_bytes(M4_CTX_BIG),
+            );
+            Ok(())
+        },
+    )?;
+    let m4_knobs = |decode_tps: f64, ctx: u32| SimKnobs {
+        cap_bytes: Some(m4_cap(dims)),
+        decode_tps_override: Some(decode_tps),
+        ctx_len: Some(ctx),
+    };
+
+    step(
+        "m4 restart: equal caps, decode_tps_override 100 (A) / 50 (B), ctx 2048",
+        || {
+            // Head first, as in the uncapped restart (clean epoch teardown).
+            for (node, mesh_port, decode) in
+                [(a, mesh_a, M4_DECODE_FAST), (b, mesh_b, M4_DECODE_SLOW)]
+            {
+                restart_with(node, mesh_port, netem, m4_knobs(decode, M4_CTX_SMALL))?;
+            }
+            wait_connected(a, b, &peer_a, &peer_b, "after the m4 ctx-2048 restart")
+        },
+    )?;
+
+    // KV shifts with ctx, part 1: at ctx 2048 the weights + KV fit the
+    // head's budget, so the same caps that will force a split at 16k must
+    // plan Solo here (all layers on the head).
+    let solo_layers = step(
+        "m4 ctx 2048: weights + KV fit the head -> Solo plan",
+        || {
+            let plan = load_model(a, &json!({ "model": model_arg, "explain": true }))?;
+            assert_solo(&plan)?;
+            assert_explained(&plan)?;
+            assert_plan_ctx(&plan, M4_CTX_SMALL)?;
+            let layers = assignment_layers(&plan.assignments()?[0])?;
+            if layers != dims.n_layers {
+                bail!(
+                    "the Solo plan holds {layers} layers but the model has {}: {plan}",
+                    dims.n_layers
+                );
+            }
+            Ok(layers)
+        },
+    )?;
+
+    step("m4 restart: same caps and overrides, ctx 16384", || {
+        for (node, mesh_port, decode) in [(a, mesh_a, M4_DECODE_FAST), (b, mesh_b, M4_DECODE_SLOW)]
+        {
+            restart_with(node, mesh_port, netem, m4_knobs(decode, M4_CTX_BIG))?;
+        }
+        wait_connected(a, b, &peer_a, &peer_b, "after the m4 ctx-16384 restart")
+    })?;
+
+    // KV shifts with ctx, part 2: KV per layer grew 8x, so solo no longer
+    // fits and the plan must split across both nodes.
+    let big_plan = step(
+        "m4 ctx 16384: solo no longer fits -> PipelineParallel across 2",
+        || {
+            let plan = load_model(a, &json!({ "model": model_arg, "explain": true }))?;
+            assert_pipeline(&plan)?;
+            assert_explained(&plan)?;
+            assert_plan_ctx(&plan, M4_CTX_BIG)?;
+            Ok(plan)
+        },
+    )?;
+
+    // Asymmetric: equal caps, decode 100 vs 50. The score prediction is
+    // computed HERE from the contract's own formula (docs/scheduler-v1.md
+    // "Placement algorithm" §2: shares ∝ capacity × (0.5 + 0.5 ×
+    // decode/max_decode); equal caps cancel the capacity term), and the
+    // actual split must land within ±1 layer of it, with A strictly ahead.
+    step(
+        "m4 asymmetric: A (decode 100) takes MORE layers than B (decode 50), within ±1 of the score prediction",
+        || {
+            let (a_layers, b_layers) = layers_by_node(&big_plan, &peer_a.id, &peer_b.id)?;
+            let total = a_layers + b_layers;
+            if total != dims.n_layers {
+                bail!(
+                    "the 16k plan covers {total} layers but the model has {}: {big_plan}",
+                    dims.n_layers
+                );
+            }
+            if a_layers <= b_layers {
+                bail!(
+                    "A (decode_tps_override {M4_DECODE_FAST}) got {a_layers} layers vs B \
+                     (override {M4_DECODE_SLOW}) with {b_layers}; the memory-and-compute \
+                     score must tilt the split toward the faster node: {big_plan}"
+                );
+            }
+            let (exp_a, exp_b) = expected_split(dims.n_layers);
+            for (label, actual, expected) in
+                [("A", a_layers, exp_a), ("B", b_layers, exp_b)]
+            {
+                if (actual as f64 - expected).abs() > 1.0 {
+                    bail!(
+                        "{label} got {actual} layers but the score formula predicts \
+                         {expected:.2} (tolerance ±1): {big_plan}"
+                    );
+                }
+            }
+            println!(
+                "       split A/B = {a_layers}/{b_layers} (score prediction \
+                 {exp_a:.2}/{exp_b:.2})"
+            );
+            Ok(())
+        },
+    )?;
+
+    // With two nodes and a fixed layer total, "fewer layers per node at
+    // 16k" can only mean: solo at 2k, split at 16k — so every 16k
+    // assignment must hold fewer layers than the 2k Solo plan's one
+    // assignment did (module docs step 6).
+    step(
+        "m4 ctx shift: every 16k assignment holds fewer layers than the 2k plan's",
+        || {
+            for asg in big_plan.assignments()? {
+                let layers = assignment_layers(asg)?;
+                if layers >= solo_layers {
+                    bail!(
+                        "assignment {asg} holds {layers} layers, not fewer than the \
+                         ctx-2048 plan's {solo_layers}"
+                    );
+                }
+            }
+            Ok(())
+        },
+    )?;
+
+    // Third-node rule: not rehearsed here — a third daemon would triple the
+    // sim's wall time for coverage the scheduler unit tests already pin.
+    println!(
+        "[SKIP] m4 third node helps only when it helps: covered by the scheduler unit tests \
+         `third_node_excluded_when_gain_below_threshold` and \
+         `third_node_included_when_two_cannot_hold_the_model` \
+         (crates/onebrain-scheduler/src/v1.rs; docs/scheduler-v1.md \"DoD sim hooks\")"
+    );
+
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// M4 scenario support: model dims from the GGUF header, cap math, and the
+// score prediction (docs/scheduler-v1.md)
+// ---------------------------------------------------------------------------
+
+/// The two context lengths of the KV-shift scenario.
+const M4_CTX_SMALL: u32 = 2048;
+const M4_CTX_BIG: u32 = 16384;
+/// `[debug] decode_tps_override` values: A fast, B slow (contract: "100.0
+/// on A vs 50.0 on B").
+const M4_DECODE_FAST: f64 = 100.0;
+const M4_DECODE_SLOW: f64 = 50.0;
+/// The fixed per-node compute/graph reserve the v1 scheduler subtracts
+/// from usable memory (docs/scheduler-v1.md "Placement algorithm" §1;
+/// `onebrain_scheduler::OVERHEAD_RESERVE_BYTES` — mirrored here because
+/// xtask deliberately depends on no workspace crates).
+const V1_OVERHEAD_RESERVE_BYTES: u64 = 512 * 1024 * 1024;
+
+/// What the M4 scenarios need to know about the model, read from the GGUF
+/// header with the scheduler's own rules (crates/onebrain-scheduler/src/
+/// dims.rs; docs/scheduler-v1.md "Placement algorithm" §1):
+///
+/// ```text
+/// kv_rate    = 2 (K+V) × n_embd_kv × 2 bytes (f16)   per layer per token
+/// n_embd_kv  = n_head_kv × (n_embd / n_head)          fallbacks -> n_embd
+/// weights    = the whole tensor-data section (file minus header)
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SimModelDims {
+    n_layers: u64,
+    /// KV bytes one layer accrues per context token.
+    kv_rate: u64,
+    /// Total tensor bytes (every layer's weights, embedding and output
+    /// included — they ride on their host layers in the scheduler too).
+    total_weight_bytes: u64,
+}
+
+impl SimModelDims {
+    /// Mean weight bytes per layer, rounded up — the scheduler's
+    /// uniform-layer approximation (`ModelDims::mean_weight_bytes_per_layer`).
+    fn mean_weight(&self) -> u64 {
+        self.total_weight_bytes.div_ceil(self.n_layers.max(1))
+    }
+
+    /// Total memory at `ctx`: all weights + KV for every layer (the
+    /// scheduler's auto-solo requirement, `ModelDims::total_required_bytes`).
+    fn required_bytes(&self, ctx: u32) -> u64 {
+        self.total_weight_bytes + self.n_layers * self.kv_rate * ctx as u64
+    }
+
+    /// Cost of one layer at `ctx` under the uniform-layer approximation.
+    fn per_layer_cost(&self, ctx: u32) -> u64 {
+        self.mean_weight() + self.kv_rate * ctx as u64
+    }
+}
+
+/// The equal per-node BUDGET (bytes past the overhead reserve) for the M4
+/// scenarios: 80% of the way from the ctx-2048 requirement to the ctx-16384
+/// one. Below the 16k requirement (solo must fail there) yet far above the
+/// 2k one (solo must succeed there), and high enough that per-node layer
+/// capacity at 16k comfortably covers the biggest tilted share — the ±1
+/// prediction assumes pure proportions, so capacity must never clamp
+/// ([`check_m4_scenario`] verifies all of this against the real dims).
+fn m4_budget(dims: &SimModelDims) -> u64 {
+    let low = dims.required_bytes(M4_CTX_SMALL);
+    let high = dims.required_bytes(M4_CTX_BIG);
+    low + (high - low) * 8 / 10
+}
+
+/// The `[debug] usable_memory_override_bytes` value: the budget plus the
+/// v1 overhead reserve the scheduler will subtract back out.
+fn m4_cap(dims: &SimModelDims) -> u64 {
+    V1_OVERHEAD_RESERVE_BYTES + m4_budget(dims)
+}
+
+/// The score prediction for the asymmetric split, from the contract's own
+/// formula (docs/scheduler-v1.md "Placement algorithm" §2): shares are
+/// proportional to `capacity_layers × (0.5 + 0.5 × decode/max_decode)`.
+/// The caps are EQUAL, so the capacity factor cancels and only the decode
+/// tilt remains: fast 1.0 vs slow 0.75. Returns fractional (fast, slow)
+/// layer quotas.
+fn expected_split(n_layers: u64) -> (f64, f64) {
+    let f_fast = 0.5 + 0.5 * M4_DECODE_FAST / M4_DECODE_FAST;
+    let f_slow = 0.5 + 0.5 * M4_DECODE_SLOW / M4_DECODE_FAST;
+    let total = f_fast + f_slow;
+    (
+        n_layers as f64 * f_fast / total,
+        n_layers as f64 * f_slow / total,
+    )
+}
+
+/// Integer (fast, slow) counts the scheduler's largest-remainder rounding
+/// produces from [`expected_split`] (ties on the fractional remainder go to
+/// the higher score, i.e. fast) — used only to verify the scenario is
+/// DECISIVE before running it.
+fn predicted_counts(n_layers: u64) -> (u64, u64) {
+    let (qf, qs) = expected_split(n_layers);
+    let (mut f, mut s) = (qf.floor() as u64, qs.floor() as u64);
+    if f + s < n_layers {
+        // One leftover layer at most with two nodes; it goes to the larger
+        // fractional remainder, ties to the higher score (fast).
+        if qs - s as f64 > qf - f as f64 {
+            s += 1;
+        } else {
+            f += 1;
+        }
+    }
+    (f, s)
+}
+
+/// Every invariant the M4 scenarios rely on, checked against the real
+/// model before any daemon restarts — so a failure is one clear message,
+/// not a flaky assertion later.
+fn check_m4_scenario(dims: &SimModelDims) -> Result<()> {
+    if dims.n_layers < 2 {
+        bail!(
+            "model has {} transformer layer(s); the M4 scenarios need at least 2 to split",
+            dims.n_layers
+        );
+    }
+    if dims.kv_rate == 0 {
+        bail!("model KV rate is 0 bytes/token/layer; ctx cannot shift its memory need");
+    }
+    let budget = m4_budget(dims);
+    let low = dims.required_bytes(M4_CTX_SMALL);
+    let high = dims.required_bytes(M4_CTX_BIG);
+    if low > budget {
+        bail!("budget {budget} B cannot hold the ctx-{M4_CTX_SMALL} requirement {low} B solo");
+    }
+    if high <= budget {
+        bail!("budget {budget} B still holds the ctx-{M4_CTX_BIG} requirement {high} B solo");
+    }
+    let (fast, slow) = predicted_counts(dims.n_layers);
+    let cap_layers = budget / dims.per_layer_cost(M4_CTX_BIG);
+    if cap_layers < fast || 2 * cap_layers < dims.n_layers {
+        bail!(
+            "per-node capacity at ctx {M4_CTX_BIG} is {cap_layers} layers; the predicted \
+             split {fast}/{slow} of {} would be capacity-clamped, so the ±1 score \
+             assertion would not be testing the tilt",
+            dims.n_layers
+        );
+    }
+    if fast <= slow {
+        bail!(
+            "decode override {M4_DECODE_FAST} vs {M4_DECODE_SLOW} rounds to the indecisive \
+             split {fast}/{slow} for a {}-layer model, so 'A takes MORE layers' cannot be \
+             asserted; the scenario is calibrated for stories260K (5 layers) — delete \
+             target-smoke/ and re-run so `cargo xtask sim` downloads it again",
+            dims.n_layers
+        );
+    }
+    Ok(())
+}
+
+/// The layer counts of the two-assignment M4 plan, matched to the daemons
+/// by the node ids learned at pairing time: `(A's layers, B's layers)`.
+fn layers_by_node(plan: &Value, a_id: &str, b_id: &str) -> Result<(u64, u64)> {
+    let mut a_layers = None;
+    let mut b_layers = None;
+    for asg in plan.assignments()? {
+        let node = asg["node"]
+            .as_str()
+            .with_context(|| format!("assignment lacks a string `node`: {asg}"))?;
+        let layers = assignment_layers(asg)?;
+        if node == a_id {
+            a_layers = Some(layers);
+        } else if node == b_id {
+            b_layers = Some(layers);
+        } else {
+            bail!("assignment names unknown node {node} (A is {a_id}, B is {b_id}): {plan}");
+        }
+    }
+    Ok((
+        a_layers.with_context(|| format!("no assignment for A ({a_id}): {plan}"))?,
+        b_layers.with_context(|| format!("no assignment for B ({b_id}): {plan}"))?,
+    ))
+}
+
+/// Layer count of one assignment (`layers.end - layers.start`).
+fn assignment_layers(asg: &Value) -> Result<u64> {
+    match (
+        asg.pointer("/layers/start").and_then(Value::as_u64),
+        asg.pointer("/layers/end").and_then(Value::as_u64),
+    ) {
+        (Some(start), Some(end)) if end > start => Ok(end - start),
+        _ => bail!("assignment has an empty or missing layer range: {asg}"),
+    }
+}
+
+/// The plan must have been computed at the ctx the restart configured —
+/// pins that the config rewrite actually moved the daemon's ctx_len.
+fn assert_plan_ctx(plan: &Value, ctx: u32) -> Result<()> {
+    match plan["ctx_len"].as_u64() {
+        Some(got) if got == ctx as u64 => Ok(()),
+        other => bail!("plan carries ctx_len {other:?}, expected {ctx}: {plan}"),
+    }
+}
+
+/// Tiny extension trait so the M4 assertions read off the `assignments`
+/// array without repeating the shape check.
+trait PlanExt {
+    fn assignments(&self) -> Result<&Vec<Value>>;
+}
+
+impl PlanExt for Value {
+    fn assignments(&self) -> Result<&Vec<Value>> {
+        self["assignments"]
+            .as_array()
+            .with_context(|| format!("plan lacks an `assignments` array: {self}"))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Minimal GGUF metadata reader (M4 scenario support)
+// ---------------------------------------------------------------------------
+//
+// xtask deliberately depends on no workspace crates (it builds them), so
+// the few header facts the M4 cap math needs are read with a standalone
+// ~parser mirroring `onebrain-models::gguf` + `onebrain-scheduler::dims`:
+// scalar metadata + the header length, nothing else. Spec:
+// https://github.com/ggml-org/ggml/blob/master/docs/gguf.md
+
+/// Read [`SimModelDims`] from a GGUF file. Starts with a 1 MiB prefix and
+/// doubles until the header fits (the same strategy as the daemon's own
+/// header reads).
+fn read_gguf_dims(path: &Path) -> Result<SimModelDims> {
+    use std::io::Read;
+    let file_len = std::fs::metadata(path)
+        .with_context(|| format!("stat {}", path.display()))?
+        .len();
+    let mut want: u64 = (1u64 << 20).min(file_len);
+    loop {
+        let mut bytes = Vec::with_capacity(want as usize);
+        std::fs::File::open(path)
+            .and_then(|f| f.take(want).read_to_end(&mut bytes))
+            .with_context(|| format!("reading {}", path.display()))?;
+        match parse_gguf_dims(&bytes, file_len) {
+            Ok(dims) => return Ok(dims),
+            Err(e) if want < file_len && format!("{e:#}").contains(GGUF_TRUNCATED) => {
+                want = (want * 2).min(file_len);
+            }
+            Err(e) => {
+                return Err(e.context(format!("parsing the GGUF header of {}", path.display())))
+            }
+        }
+    }
+}
+
+/// Marker in truncation errors so [`read_gguf_dims`] knows a longer prefix
+/// may still succeed (vs real corruption, which never will).
+const GGUF_TRUNCATED: &str = "gguf header truncated";
+
+/// Byte cursor over a GGUF header prefix.
+struct GgufCursor<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> GgufCursor<'a> {
+    fn take(&mut self, n: u64) -> Result<&'a [u8]> {
+        let n = usize::try_from(n).ok().with_context(|| GGUF_TRUNCATED)?;
+        let end = self.pos.checked_add(n).with_context(|| GGUF_TRUNCATED)?;
+        if end > self.bytes.len() {
+            bail!(GGUF_TRUNCATED);
+        }
+        let slice = &self.bytes[self.pos..end];
+        self.pos = end;
+        Ok(slice)
+    }
+
+    fn u32(&mut self) -> Result<u32> {
+        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+    }
+
+    fn u64(&mut self) -> Result<u64> {
+        Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+    }
+
+    /// GGUF string: u64 length + UTF-8 bytes (lossy: keys are ASCII).
+    fn string(&mut self) -> Result<String> {
+        let len = self.u64()?;
+        Ok(String::from_utf8_lossy(self.take(len)?).into_owned())
+    }
+
+    /// Read one metadata value of `ty`, returning `Some(v)` for the
+    /// integer/bool types (the only ones the dims math needs) and `None`
+    /// for everything else (floats, strings, arrays — skipped over).
+    fn value(&mut self, ty: u32) -> Result<Option<u64>> {
+        Ok(match ty {
+            0 | 7 => Some(self.take(1)?[0] as u64),          // u8, bool
+            1 => u64::try_from(self.take(1)?[0] as i8).ok(), // i8
+            2 => Some(u16::from_le_bytes(self.take(2)?.try_into().unwrap()) as u64),
+            3 => u64::try_from(i16::from_le_bytes(self.take(2)?.try_into().unwrap())).ok(),
+            4 => Some(self.u32()? as u64),
+            5 => u64::try_from(self.u32()? as i32).ok(),
+            6 => {
+                self.take(4)?; // f32
+                None
+            }
+            8 => {
+                let len = self.u64()?;
+                self.take(len)?;
+                None
+            }
+            9 => {
+                let elem_ty = self.u32()?;
+                let count = self.u64()?;
+                match gguf_fixed_width(elem_ty) {
+                    // Fixed-width elements: skip the whole block at once.
+                    Some(width) => {
+                        let total = count.checked_mul(width).with_context(|| GGUF_TRUNCATED)?;
+                        self.take(total)?;
+                    }
+                    // Strings / nested arrays: element by element.
+                    None => {
+                        for _ in 0..count {
+                            self.value(elem_ty)?;
+                        }
+                    }
+                }
+                None
+            }
+            10 => Some(self.u64()?),
+            11 => u64::try_from(self.u64()? as i64).ok(),
+            12 => {
+                self.take(8)?; // f64
+                None
+            }
+            other => bail!("unknown GGUF metadata value type {other}; the file may be corrupt"),
+        })
+    }
+}
+
+/// Byte width of a fixed-size GGUF metadata value type (None for string /
+/// array).
+fn gguf_fixed_width(ty: u32) -> Option<u64> {
+    match ty {
+        0 | 1 | 7 => Some(1),
+        2 | 3 => Some(2),
+        4..=6 => Some(4),
+        10..=12 => Some(8),
+        _ => None,
+    }
+}
+
+/// Parse the dims out of a GGUF header prefix. `file_len` closes the
+/// tensor-data section (total weights = file minus the aligned header).
+fn parse_gguf_dims(bytes: &[u8], file_len: u64) -> Result<SimModelDims> {
+    let mut cur = GgufCursor { bytes, pos: 0 };
+    let magic = cur.u32()?;
+    if magic != 0x4655_4747 {
+        bail!("not a GGUF file (magic {magic:#010x})");
+    }
+    let version = cur.u32()?;
+    if !(2..=3).contains(&version) {
+        bail!("unsupported GGUF version {version} (this reader handles v2/v3)");
+    }
+    let tensor_count = cur.u64()?;
+    let kv_count = cur.u64()?;
+
+    let mut arch: Option<String> = None;
+    let mut scalars: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    for _ in 0..kv_count {
+        let key = cur.string()?;
+        let ty = cur.u32()?;
+        if ty == 8 && key == "general.architecture" {
+            arch = Some(cur.string()?);
+            continue;
+        }
+        if let Some(v) = cur.value(ty)? {
+            scalars.insert(key, v);
+        }
+    }
+    for _ in 0..tensor_count {
+        let _name = cur.string()?;
+        let n_dims = cur.u32()?;
+        if n_dims > 8 {
+            bail!("tensor declares {n_dims} dimensions; the file may be corrupt");
+        }
+        for _ in 0..n_dims {
+            cur.u64()?;
+        }
+        cur.u32()?; // ggml type
+        cur.u64()?; // offset
+    }
+
+    // Tensor data starts at the header end rounded up to the alignment.
+    let alignment = scalars
+        .get("general.alignment")
+        .copied()
+        .filter(|a| *a > 0)
+        .unwrap_or(32);
+    let data_offset = (cur.pos as u64).div_ceil(alignment) * alignment;
+    if file_len < data_offset {
+        bail!("file is shorter ({file_len} B) than its own header ({data_offset} B)");
+    }
+
+    let arch = arch.context("header declares no general.architecture")?;
+    let get = |suffix: &str| scalars.get(&format!("{arch}.{suffix}")).copied();
+    let n_layers = get("block_count")
+        .filter(|n| *n > 0)
+        .with_context(|| format!("header lacks {arch}.block_count"))?;
+    let n_embd = get("embedding_length")
+        .filter(|n| *n > 0)
+        .with_context(|| format!("header lacks {arch}.embedding_length"))?;
+    // GQA-aware KV width with the scheduler's conservative fallbacks
+    // (crates/onebrain-scheduler/src/dims.rs): anything missing degrades
+    // toward n_embd.
+    let n_embd_kv = match get("attention.head_count").filter(|n| *n > 0) {
+        Some(n_head) => {
+            let head_dim = n_embd / n_head;
+            let n_head_kv = get("attention.head_count_kv")
+                .filter(|n| *n > 0)
+                .unwrap_or(n_head);
+            (n_head_kv * head_dim).min(n_embd).max(1)
+        }
+        None => n_embd,
+    };
+
+    Ok(SimModelDims {
+        n_layers,
+        kv_rate: 2 * 2 * n_embd_kv, // K+V, f16
+        total_weight_bytes: file_len - data_offset,
+    })
 }
 
 // ---------------------------------------------------------------------------
 // Cap math and sandbox config
 // ---------------------------------------------------------------------------
 
-/// Per-node `usable_memory_override_bytes` for the distribute scenario:
-/// 70% of the model file size. The scheduler budgets 85% of usable memory,
-/// so one node offers ~59.5% of the file (solo fails: the GGUF's weight
-/// bytes are within a few KB of the file size for these tiny models) while
-/// two pooled nodes offer ~119% (pipeline split fits, ~half per node).
-fn distribute_cap(model_file_bytes: u64) -> u64 {
-    (model_file_bytes as u128 * 7 / 10) as u64
+/// The ctx the distribute phase plans at: the daemon's `ctx_len` default
+/// (onebraind::config; the phase's sandbox configs set no ctx override).
+const M3_DEFAULT_CTX: u32 = 4096;
+
+/// Per-node BUDGET (bytes past the v1 overhead reserve) for the distribute
+/// phase: exactly `n_layers - 1` layer-costs at the default ctx. One layer
+/// short of solo — the head cannot hold all layers (weights + KV always
+/// exceed `n-1` mean layer costs), so auto-distribution must engage — while
+/// two such nodes pool `2(n-1) >= n` layers, and each node's `ceil(n/2)`
+/// share fits its own capacity for every `n >= 2`.
+fn m3_distribute_budget(dims: &SimModelDims) -> u64 {
+    (dims.n_layers - 1) * dims.per_layer_cost(M3_DEFAULT_CTX)
 }
 
-/// What the M3 scheduler will actually budget on a node with `usable` bytes
-/// (the flat 85% utilization ceiling from docs/distributed.md).
-fn scheduler_budget(usable: u64) -> u64 {
-    (usable as u128 * 85 / 100) as u64
+/// The `[debug] usable_memory_override_bytes` value for the distribute
+/// phase: the budget plus the v1 overhead reserve the scheduler subtracts
+/// back out (docs/scheduler-v1.md "Placement algorithm" §1).
+fn m3_distribute_cap(dims: &SimModelDims) -> u64 {
+    V1_OVERHEAD_RESERVE_BYTES + m3_distribute_budget(dims)
 }
 
-/// The sandbox `config.toml`: the pair-sim determinism switches plus the
-/// `[debug]` memory-cap knob when capping (docs/distributed.md, test-only:
-/// the value reported in NodeStatus / used by the head for itself; it never
-/// touches real allocation).
+/// Optional sandbox-config knobs a scenario phase turns on (`None` renders
+/// nothing, keeping the config byte-identical to the pre-M4 one). All
+/// `[debug]` knobs are test-only (docs/distributed.md, docs/scheduler-v1.md):
+/// they change what the node REPORTS and BUDGETS, never real allocation.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct SimKnobs {
+    /// `[debug] usable_memory_override_bytes`: the memory cap.
+    cap_bytes: Option<u64>,
+    /// `[debug] decode_tps_override`: replaces the measured decode
+    /// throughput in this node's profile (M4 asymmetric scenario).
+    decode_tps_override: Option<f64>,
+    /// Top-level `ctx_len`: the context the daemon plans and loads at (the
+    /// load body carries no ctx override, so ctx moves via config+restart).
+    ctx_len: Option<u32>,
+}
+
+impl SimKnobs {
+    /// The M3 shape: a memory cap and nothing else.
+    fn capped(cap_bytes: u64) -> SimKnobs {
+        SimKnobs {
+            cap_bytes: Some(cap_bytes),
+            ..SimKnobs::default()
+        }
+    }
+}
+
+/// The sandbox `config.toml`: the pair-sim determinism switches plus
+/// whatever [`SimKnobs`] the current scenario phase needs.
 fn render_sim_config(
     name: &str,
     port: u16,
     mesh_port: u16,
     netem: bool,
-    cap_bytes: Option<u64>,
+    knobs: SimKnobs,
 ) -> String {
     // The mesh UDP port is pinned so peers' stored addresses stay valid
     // across the restart scenario (with mDNS/relays off there is no other
@@ -356,26 +1002,37 @@ fn render_sim_config(
     let mesh_host = if netem { "0.0.0.0" } else { "127.0.0.1" };
     let mut cfg = format!(
         "node_name = \"{name}\"\n\
-         api_bind = \"127.0.0.1:{port}\"\n\
-         \n\
-         [mesh]\n\
+         api_bind = \"127.0.0.1:{port}\"\n"
+    );
+    if let Some(ctx) = knobs.ctx_len {
+        // Top-level key: must precede the [mesh] table (TOML validity).
+        cfg.push_str(&format!("ctx_len = {ctx}\n"));
+    }
+    cfg.push_str(&format!(
+        "\n[mesh]\n\
          enable_mdns = false\n\
          enable_relays = false\n\
          bind_addr = \"{mesh_host}:{mesh_port}\"\n"
-    );
-    if let Some(cap) = cap_bytes {
-        cfg.push_str(&format!(
-            "\n[debug]\nusable_memory_override_bytes = {cap}\n"
-        ));
+    ));
+    if knobs.cap_bytes.is_some() || knobs.decode_tps_override.is_some() {
+        cfg.push_str("\n[debug]\n");
+        if let Some(cap) = knobs.cap_bytes {
+            cfg.push_str(&format!("usable_memory_override_bytes = {cap}\n"));
+        }
+        if let Some(decode) = knobs.decode_tps_override {
+            // {:?} keeps the decimal point (`100.0`), which TOML requires
+            // for a float value.
+            cfg.push_str(&format!("decode_tps_override = {decode:?}\n"));
+        }
     }
     cfg
 }
 
-fn write_config(node: &Node, mesh_port: u16, netem: bool, cap_bytes: Option<u64>) -> Result<()> {
+fn write_config(node: &Node, mesh_port: u16, netem: bool, knobs: SimKnobs) -> Result<()> {
     let path = node.home.join("config").join("config.toml");
     std::fs::write(
         &path,
-        render_sim_config(node.name, node.port, mesh_port, netem, cap_bytes),
+        render_sim_config(node.name, node.port, mesh_port, netem, knobs),
     )
     .with_context(|| format!("writing {}", path.display()))
 }
@@ -560,8 +1217,9 @@ fn ollama_streams(node: &Node, model: &str) -> Result<()> {
     Ok(())
 }
 
-/// Stop, rewrite the config without the cap, start again, wait healthy.
-fn restart_uncapped(node: &Node, mesh_port: u16, netem: bool) -> Result<()> {
+/// Stop, rewrite the config with the given knobs, start again, wait
+/// healthy. `SimKnobs::default()` is the uncapped restart of the M3 steps.
+fn restart_with(node: &Node, mesh_port: u16, netem: bool, knobs: SimKnobs) -> Result<()> {
     let out = node.onebrain(&["stop"])?;
     if !out.status.success() {
         bail!(
@@ -580,11 +1238,11 @@ fn restart_uncapped(node: &Node, mesh_port: u16, netem: bool) -> Result<()> {
         }
         std::thread::sleep(POLL_INTERVAL);
     }
-    write_config(node, mesh_port, netem, None)?;
+    write_config(node, mesh_port, netem, knobs)?;
     let out = node.onebrain(&["up"])?;
     node.wait_healthy().map_err(|e| {
         anyhow!(
-            "{e:#}\n`onebrain up` (uncapped restart) exit code {:?}\nstdout: {}\nstderr: {}",
+            "{e:#}\n`onebrain up` (restart) exit code {:?}\nstdout: {}\nstderr: {}",
             out.status.code(),
             String::from_utf8_lossy(&out.stdout).trim(),
             String::from_utf8_lossy(&out.stderr).trim()
@@ -862,32 +1520,55 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cap_makes_solo_fail_and_pooled_fit() {
-        // stories260K is ~1.2 MB; sweep a broad size range anyway.
-        for size in [123_456u64, 1_185_376, 5_000_000, 1 << 20, 750_000_000] {
-            let cap = distribute_cap(size);
-            let budget = scheduler_budget(cap);
+    fn m3_cap_makes_solo_fail_and_pooled_fit_under_v1_budgets() {
+        // The primary smoke model plus a sweep of other shapes: for each,
+        // the (n-1)-layer-cost budget must fail solo (weights + KV exceed
+        // it) while two such nodes pool enough capacity, with each node's
+        // ceil(n/2) share within its own capacity.
+        let shapes = [
+            stories260k_dims(),
+            SimModelDims {
+                n_layers: 2,
+                kv_rate: 1152,
+                total_weight_bytes: 8_300_000,
+            },
+            SimModelDims {
+                n_layers: 6,
+                kv_rate: 1152,
+                total_weight_bytes: 8_300_000,
+            },
+            SimModelDims {
+                n_layers: 32,
+                kv_rate: 0, // no KV growth at all still distributes
+                total_weight_bytes: 750_000_000,
+            },
+        ];
+        for dims in shapes {
+            let budget = m3_distribute_budget(&dims);
+            let capacity = budget / dims.per_layer_cost(M3_DEFAULT_CTX);
             assert!(
-                budget < size,
-                "size {size}: one node's 85% budget {budget} must NOT fit the model"
+                budget < dims.required_bytes(M3_DEFAULT_CTX),
+                "{dims:?}: budget {budget} must NOT hold the model solo"
             );
+            assert_eq!(capacity, dims.n_layers - 1, "{dims:?}");
+            assert!(2 * capacity >= dims.n_layers, "{dims:?}: pooled must fit");
             assert!(
-                2 * budget > size,
-                "size {size}: two pooled budgets {} must fit the model",
-                2 * budget
+                capacity >= dims.n_layers.div_ceil(2),
+                "{dims:?}: the bigger half-share must fit one node"
             );
-            // Each node's ~half share fits its own budget (equal caps ⇒
-            // near-equal layer split).
-            assert!(
-                budget > size / 2,
-                "size {size}: half the model must fit one node's budget {budget}"
-            );
+            assert_eq!(m3_distribute_cap(&dims), 536_870_912 + budget);
         }
+        // Pinned numbers for stories260K at the daemon's default ctx 4096:
+        // cost = 234,240 + 128×4096 = 758,528; budget = 4 × cost.
+        let dims = stories260k_dims();
+        assert_eq!(dims.per_layer_cost(M3_DEFAULT_CTX), 758_528);
+        assert_eq!(m3_distribute_budget(&dims), 3_034_112);
+        assert_eq!(dims.required_bytes(M3_DEFAULT_CTX), 3_792_640);
     }
 
     #[test]
     fn sim_config_caps_only_when_asked() {
-        let capped = render_sim_config("sim-a", 12345, 23456, false, Some(830_000));
+        let capped = render_sim_config("sim-a", 12345, 23456, false, SimKnobs::capped(830_000));
         assert!(capped.contains("node_name = \"sim-a\""));
         assert!(capped.contains("api_bind = \"127.0.0.1:12345\""));
         assert!(capped.contains("enable_mdns = false"));
@@ -895,15 +1576,348 @@ mod tests {
         assert!(capped.contains("bind_addr = \"127.0.0.1:23456\""));
         assert!(capped.contains("[debug]"));
         assert!(capped.contains("usable_memory_override_bytes = 830000"));
+        // The M4 knobs stay out unless asked for.
+        assert!(!capped.contains("decode_tps_override"));
+        assert!(!capped.contains("ctx_len"));
         // Top-level keys stay above the tables (TOML validity).
         assert!(capped.find("node_name").unwrap() < capped.find("[mesh]").unwrap());
 
-        let uncapped = render_sim_config("sim-b", 1, 2, false, None);
+        let uncapped = render_sim_config("sim-b", 1, 2, false, SimKnobs::default());
         assert!(!uncapped.contains("[debug]"));
         assert!(!uncapped.contains("usable_memory_override_bytes"));
         // The pinned mesh port survives the uncapped rewrite (restart
         // scenario: stored peer addresses must stay valid).
         assert!(uncapped.contains("bind_addr = \"127.0.0.1:2\""));
+    }
+
+    #[test]
+    fn sim_config_renders_the_m4_knobs() {
+        let cfg = render_sim_config(
+            "sim-a",
+            12345,
+            23456,
+            false,
+            SimKnobs {
+                cap_bytes: Some(546_692_864),
+                decode_tps_override: Some(100.0),
+                ctx_len: Some(16384),
+            },
+        );
+        // ctx_len is a top-level key: it must precede the [mesh] table.
+        assert!(cfg.contains("ctx_len = 16384\n"));
+        assert!(cfg.find("ctx_len").unwrap() < cfg.find("[mesh]").unwrap());
+        // Float syntax: TOML requires the decimal point.
+        assert!(cfg.contains("decode_tps_override = 100.0\n"));
+        assert!(cfg.contains("usable_memory_override_bytes = 546692864\n"));
+        // Both [debug] keys live under one [debug] header.
+        assert_eq!(cfg.matches("[debug]").count(), 1);
+        assert!(cfg.find("[mesh]").unwrap() < cfg.find("[debug]").unwrap());
+
+        // A decode override alone still opens the [debug] table.
+        let cfg = render_sim_config(
+            "sim-b",
+            1,
+            2,
+            false,
+            SimKnobs {
+                decode_tps_override: Some(50.0),
+                ..SimKnobs::default()
+            },
+        );
+        assert!(cfg.contains("[debug]\ndecode_tps_override = 50.0\n"));
+        assert!(!cfg.contains("usable_memory_override_bytes"));
+    }
+
+    // ---- M4 scenario math ------------------------------------------------
+
+    /// stories260K.gguf, the sim's pinned first-choice model: 5 layers,
+    /// n_embd 64, 8 heads / 4 KV heads -> n_embd_kv 32 -> kv_rate 128
+    /// B/token/layer; tensor-data section 1,171,200 B of the 1,185,376 B
+    /// file. These constants pin the whole M4 cap derivation end to end.
+    fn stories260k_dims() -> SimModelDims {
+        SimModelDims {
+            n_layers: 5,
+            kv_rate: 128,
+            total_weight_bytes: 1_171_200,
+        }
+    }
+
+    #[test]
+    fn m4_budget_math_pins_the_stories260k_numbers() {
+        let dims = stories260k_dims();
+        assert_eq!(dims.mean_weight(), 234_240);
+        assert_eq!(dims.required_bytes(M4_CTX_SMALL), 2_481_920);
+        assert_eq!(dims.required_bytes(M4_CTX_BIG), 11_656_960);
+        assert_eq!(dims.per_layer_cost(M4_CTX_BIG), 2_331_392);
+        // 80% of the way from the 2k to the 16k requirement.
+        assert_eq!(m4_budget(&dims), 9_821_952);
+        assert_eq!(m4_cap(&dims), 536_870_912 + 9_821_952);
+        // Per-node layer capacity at 16k: 4 — holds the tilted 3-layer
+        // share without clamping, and two nodes pool 8 >= 5.
+        assert_eq!(m4_budget(&dims) / dims.per_layer_cost(M4_CTX_BIG), 4);
+        check_m4_scenario(&dims).unwrap();
+    }
+
+    #[test]
+    fn m4_score_prediction_tilts_three_to_two() {
+        // docs/scheduler-v1.md §2 with equal caps: factors 1.0 vs 0.75,
+        // quotas 5/1.75 and 5×0.75/1.75.
+        let (fast, slow) = expected_split(5);
+        assert!((fast - 2.857_142_857).abs() < 1e-6);
+        assert!((slow - 2.142_857_143).abs() < 1e-6);
+        assert_eq!(predicted_counts(5), (3, 2));
+        // Largest remainder can also favor the slow node (6 layers:
+        // 3.43/2.57 -> remainders 0.43 vs 0.57).
+        assert_eq!(predicted_counts(6), (3, 3));
+        assert_eq!(predicted_counts(7), (4, 3));
+    }
+
+    #[test]
+    fn m4_check_rejects_indecisive_or_unshiftable_models() {
+        // 6 layers: the 100/50 tilt rounds to 3/3 — MORE cannot be
+        // asserted, so the check must refuse with the remedy.
+        let six = SimModelDims {
+            n_layers: 6,
+            ..stories260k_dims()
+        };
+        let err = check_m4_scenario(&six).unwrap_err().to_string();
+        assert!(err.contains("indecisive"), "got: {err}");
+
+        // KV rate 0: ctx cannot move the memory need at all.
+        let flat = SimModelDims {
+            kv_rate: 0,
+            ..stories260k_dims()
+        };
+        let err = check_m4_scenario(&flat).unwrap_err().to_string();
+        assert!(err.contains("ctx cannot shift"), "got: {err}");
+
+        // One layer cannot split.
+        let one = SimModelDims {
+            n_layers: 1,
+            ..stories260k_dims()
+        };
+        assert!(check_m4_scenario(&one).is_err());
+    }
+
+    #[test]
+    fn m4_plan_helpers_read_the_wire_shape() {
+        let plan = serde_json::json!({
+            "epoch": 9,
+            "strategy": "PipelineParallel",
+            "ctx_len": 16384,
+            "assignments": [
+                {"node": "bbbb", "layers": {"start": 0, "end": 2}, "stage": 0},
+                {"node": "aaaa", "layers": {"start": 2, "end": 5}, "stage": 1}
+            ]
+        });
+        assert_plan_ctx(&plan, 16384).unwrap();
+        assert!(assert_plan_ctx(&plan, 2048).is_err());
+        let (a_layers, b_layers) = layers_by_node(&plan, "aaaa", "bbbb").unwrap();
+        assert_eq!((a_layers, b_layers), (3, 2));
+        // Unknown node ids and missing assignments are loud errors.
+        assert!(layers_by_node(&plan, "aaaa", "cccc").is_err());
+        let solo = serde_json::json!({
+            "ctx_len": 2048,
+            "assignments": [{"node": "aaaa", "layers": {"start": 0, "end": 5}, "stage": 0}]
+        });
+        assert!(layers_by_node(&solo, "aaaa", "bbbb").is_err());
+        assert_eq!(
+            assignment_layers(&solo.assignments().unwrap()[0]).unwrap(),
+            5
+        );
+        assert!(assignment_layers(&serde_json::json!({"layers": {"start": 3, "end": 3}})).is_err());
+    }
+
+    // ---- Minimal GGUF reader ---------------------------------------------
+
+    /// Synthetic GGUF v3 header builder (mirrors the one in
+    /// onebrain-scheduler's dims tests; that builder is test-private).
+    struct Gguf {
+        tensor_count: u64,
+        kv_count: u64,
+        kvs: Vec<u8>,
+        tensors: Vec<u8>,
+    }
+
+    impl Gguf {
+        fn new() -> Gguf {
+            Gguf {
+                tensor_count: 0,
+                kv_count: 0,
+                kvs: Vec::new(),
+                tensors: Vec::new(),
+            }
+        }
+
+        fn string_into(out: &mut Vec<u8>, s: &str) {
+            out.extend((s.len() as u64).to_le_bytes());
+            out.extend(s.as_bytes());
+        }
+
+        fn kv_str(mut self, key: &str, val: &str) -> Gguf {
+            Self::string_into(&mut self.kvs, key);
+            self.kvs.extend(8u32.to_le_bytes()); // string
+            Self::string_into(&mut self.kvs, val);
+            self.kv_count += 1;
+            self
+        }
+
+        fn kv_u32(mut self, key: &str, val: u32) -> Gguf {
+            Self::string_into(&mut self.kvs, key);
+            self.kvs.extend(4u32.to_le_bytes()); // u32
+            self.kvs.extend(val.to_le_bytes());
+            self.kv_count += 1;
+            self
+        }
+
+        /// An array-of-strings KV (like tokenizer.ggml.tokens) — exercises
+        /// the element-by-element array skip.
+        fn kv_str_array(mut self, key: &str, vals: &[&str]) -> Gguf {
+            Self::string_into(&mut self.kvs, key);
+            self.kvs.extend(9u32.to_le_bytes()); // array
+            self.kvs.extend(8u32.to_le_bytes()); // of string
+            self.kvs.extend((vals.len() as u64).to_le_bytes());
+            for v in vals {
+                Self::string_into(&mut self.kvs, v);
+            }
+            self.kv_count += 1;
+            self
+        }
+
+        /// An array-of-f32 KV (like tokenizer scores) — exercises the
+        /// fixed-width block skip.
+        fn kv_f32_array(mut self, key: &str, n: u64) -> Gguf {
+            Self::string_into(&mut self.kvs, key);
+            self.kvs.extend(9u32.to_le_bytes()); // array
+            self.kvs.extend(6u32.to_le_bytes()); // of f32
+            self.kvs.extend(n.to_le_bytes());
+            self.kvs
+                .extend(std::iter::repeat(0u8).take((n * 4) as usize));
+            self.kv_count += 1;
+            self
+        }
+
+        fn tensor(mut self, name: &str, offset: u64) -> Gguf {
+            Self::string_into(&mut self.tensors, name);
+            self.tensors.extend(1u32.to_le_bytes()); // n_dims
+            self.tensors.extend(1u64.to_le_bytes()); // dim[0]
+            self.tensors.extend(0u32.to_le_bytes()); // ggml type
+            self.tensors.extend(offset.to_le_bytes());
+            self.tensor_count += 1;
+            self
+        }
+
+        fn build(self) -> Vec<u8> {
+            let mut buf = Vec::new();
+            buf.extend(0x4655_4747u32.to_le_bytes()); // "GGUF"
+            buf.extend(3u32.to_le_bytes());
+            buf.extend(self.tensor_count.to_le_bytes());
+            buf.extend(self.kv_count.to_le_bytes());
+            buf.extend(&self.kvs);
+            buf.extend(&self.tensors);
+            buf
+        }
+    }
+
+    /// A llama-flavored 2-layer header matching the scheduler's own dims
+    /// test: n_embd 4096, 32 heads / 8 KV heads -> kv_rate 4096.
+    fn two_layer_header() -> Vec<u8> {
+        Gguf::new()
+            .kv_str("general.architecture", "llama")
+            .kv_u32("llama.block_count", 2)
+            .kv_u32("llama.embedding_length", 4096)
+            .kv_u32("llama.attention.head_count", 32)
+            .kv_u32("llama.attention.head_count_kv", 8)
+            .kv_str_array("tokenizer.ggml.tokens", &["<s>", "</s>", "hi"])
+            .kv_f32_array("tokenizer.ggml.scores", 3)
+            .tensor("token_embd.weight", 0)
+            .tensor("blk.0.attn_q.weight", 4096)
+            .tensor("blk.1.attn_q.weight", 8192)
+            .tensor("output.weight", 12288)
+            .build()
+    }
+
+    #[test]
+    fn gguf_reader_matches_the_scheduler_kv_formula() {
+        let header = two_layer_header();
+        // Data starts at the header end aligned up to 32.
+        let data_offset = (header.len() as u64).div_ceil(32) * 32;
+        let dims = parse_gguf_dims(&header, data_offset + 16384).unwrap();
+        assert_eq!(dims.n_layers, 2);
+        // 8 KV heads × (4096/32) head_dim = 1024; × 2 (K+V) × 2 (f16).
+        assert_eq!(dims.kv_rate, 4096);
+        assert_eq!(dims.total_weight_bytes, 16384);
+        assert_eq!(dims.mean_weight(), 8192);
+        // At ctx 2048 one layer's KV is 8 MiB (scheduler dims test parity).
+        assert_eq!(dims.kv_rate * 2048, 8 << 20);
+    }
+
+    #[test]
+    fn gguf_reader_falls_back_toward_n_embd_without_gqa_keys() {
+        // No head_count_kv: n_head_kv = n_head, kv_rate = 4×4096 = 16384.
+        let header = Gguf::new()
+            .kv_str("general.architecture", "llama")
+            .kv_u32("llama.block_count", 1)
+            .kv_u32("llama.embedding_length", 4096)
+            .kv_u32("llama.attention.head_count", 32)
+            .tensor("blk.0.w", 0)
+            .build();
+        let data_offset = (header.len() as u64).div_ceil(32) * 32;
+        let dims = parse_gguf_dims(&header, data_offset + 64).unwrap();
+        assert_eq!(dims.kv_rate, 16384);
+
+        // No head_count at all: n_embd_kv = n_embd.
+        let header = Gguf::new()
+            .kv_str("general.architecture", "llama")
+            .kv_u32("llama.block_count", 1)
+            .kv_u32("llama.embedding_length", 4096)
+            .tensor("blk.0.w", 0)
+            .build();
+        let data_offset = (header.len() as u64).div_ceil(32) * 32;
+        let dims = parse_gguf_dims(&header, data_offset + 64).unwrap();
+        assert_eq!(dims.kv_rate, 16384);
+    }
+
+    #[test]
+    fn gguf_reader_reads_the_real_smoke_model_when_cached() {
+        // Guards the pinned stories260K constants against the actual file
+        // whenever the smoke cache is present; silently skips otherwise
+        // (CI runs `cargo xtask sim`, which exercises this path anyway).
+        let path = crate::workspace_root()
+            .join("target-smoke")
+            .join("stories260K.gguf");
+        if !path.exists() {
+            eprintln!(
+                "skipping: {} not cached (run `cargo xtask smoke` to fetch it)",
+                path.display()
+            );
+            return;
+        }
+        assert_eq!(read_gguf_dims(&path).unwrap(), stories260k_dims());
+    }
+
+    #[test]
+    fn gguf_reader_flags_truncation_and_garbage_differently() {
+        let header = two_layer_header();
+        // A cut-off prefix errors with the truncation marker (so the file
+        // reader knows to fetch a longer prefix)...
+        let err = parse_gguf_dims(&header[..header.len() / 2], 1 << 20).unwrap_err();
+        assert!(format!("{err:#}").contains(GGUF_TRUNCATED), "got: {err:#}");
+        // ...while a wrong magic is terminal.
+        let err = parse_gguf_dims(b"not a gguf file at all", 1 << 20).unwrap_err();
+        assert!(format!("{err:#}").contains("magic"), "got: {err:#}");
+        // Missing required metadata is terminal too, naming the key.
+        let no_embd = Gguf::new()
+            .kv_str("general.architecture", "llama")
+            .kv_u32("llama.block_count", 1)
+            .tensor("blk.0.w", 0)
+            .build();
+        let len = no_embd.len() as u64 + 4096;
+        let err = parse_gguf_dims(&no_embd, len).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("llama.embedding_length"),
+            "got: {err:#}"
+        );
     }
 
     #[test]

@@ -103,7 +103,7 @@ fn main() {
             commands::pair::run(target.as_deref(), code.as_deref(), cli.json)
         }
         Command::Unpair { name } => commands::unpair::run(&name, cli.json),
-        Command::Bench => commands::not_yet("bench", "M4"),
+        Command::Bench => commands::bench::run(cli.json),
     };
 
     if let Err(err) = outcome {
