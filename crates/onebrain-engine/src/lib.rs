@@ -628,6 +628,17 @@ impl<'m> Session<'m> {
                 });
             }
             let piece = self.model.token_to_piece(tok)?;
+            // Confirm-before-send (docs/resilience.md): a token's own
+            // decode must succeed BEFORE its piece is emitted. With a torn
+            // remote (patches/0002), the logits fetch that produced `tok`
+            // can have been silently zeroed — the very next decode on the
+            // dead socket fails, and a piece once streamed cannot be
+            // unstreamed (it would poison both the client text and the
+            // resume prefix). Costs one decode step of first-token latency;
+            // the token sequence is unchanged. Residual: a tear exactly at
+            // the final budgeted token has no confirming decode (the tear
+            // window is one token; documented in patches/README.md).
+            self.decode(&[tok])?;
             generated += 1;
             if on_token(tok, &piece).is_break() {
                 return Ok(GenerationStats {
@@ -636,7 +647,6 @@ impl<'m> Session<'m> {
                     finished: FinishReason::Aborted,
                 });
             }
-            self.decode(&[tok])?;
         }
         Ok(GenerationStats {
             prompt_tokens: prompt_tokens.len(),

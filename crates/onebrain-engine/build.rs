@@ -41,12 +41,15 @@ fn main() {
 
     println!("cargo:rerun-if-changed=shim/ob_shim.c");
     println!("cargo:rerun-if-changed=shim/ob_shim.h");
-    println!(
-        "cargo:rerun-if-changed={}",
-        manifest_dir
-            .join("../../patches/0001-rpc-serve-fd.patch")
-            .display()
-    );
+    for patch in [
+        "0001-rpc-serve-fd.patch",
+        "0002-rpc-client-error-returns.patch",
+    ] {
+        println!(
+            "cargo:rerun-if-changed={}",
+            manifest_dir.join("../../patches").join(patch).display()
+        );
+    }
     println!(
         "cargo:rerun-if-changed={}",
         vendor.join("CMakeLists.txt").display()
@@ -212,28 +215,43 @@ fn main() {
 /// presence of the patched symbol, not git state, so a locally pre-patched
 /// tree (or a re-run) is a no-op.
 fn apply_vendor_patches(manifest_dir: &Path, vendor: &Path) {
-    let header = vendor.join("ggml/include/ggml-rpc.h");
-    let already = std::fs::read_to_string(&header)
-        .map(|s| s.contains("ggml_backend_rpc_serve_fd"))
-        .unwrap_or(false);
-    if already {
-        return;
-    }
-    let patch = manifest_dir.join("../../patches/0001-rpc-serve-fd.patch");
-    let status = Command::new("git")
-        .arg("-C")
-        .arg(vendor)
-        .arg("apply")
-        .arg(&patch)
-        .status();
-    match status {
-        Ok(s) if s.success() => {}
-        other => panic!(
-            "failed to apply vendor patch {} ({other:?}).\n\
-             The vendored llama.cpp tree may be dirty; run \
-             `git -C vendor/llama.cpp checkout -- .` and rebuild.",
-            patch.display()
+    // Each patch declares a marker symbol it introduces; its presence in the
+    // named file means the patch is already applied.
+    let patches: [(&str, &str, &str); 2] = [
+        (
+            "0001-rpc-serve-fd.patch",
+            "ggml/include/ggml-rpc.h",
+            "ggml_backend_rpc_serve_fd",
         ),
+        (
+            "0002-rpc-client-error-returns.patch",
+            "ggml/src/ggml-rpc/ggml-rpc.cpp",
+            "ob_rpc_mark_dead",
+        ),
+    ];
+    for (patch_name, marker_file, marker) in patches {
+        let already = std::fs::read_to_string(vendor.join(marker_file))
+            .map(|s| s.contains(marker))
+            .unwrap_or(false);
+        if already {
+            continue;
+        }
+        let patch = manifest_dir.join("../../patches").join(patch_name);
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(vendor)
+            .arg("apply")
+            .arg(&patch)
+            .status();
+        match status {
+            Ok(s) if s.success() => {}
+            other => panic!(
+                "failed to apply vendor patch {} ({other:?}).\n\
+                 The vendored llama.cpp tree may be dirty; run \
+                 `git -C vendor/llama.cpp checkout -- .` and rebuild.",
+                patch.display()
+            ),
+        }
     }
 }
 

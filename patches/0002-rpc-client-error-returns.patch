@@ -1,0 +1,366 @@
+diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
+index 0e0dbfb..815e9ad 100644
+--- a/ggml/src/ggml-rpc/ggml-rpc.cpp
++++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
+@@ -13,6 +13,7 @@
+ #include <mutex>
+ #include <unordered_map>
+ #include <unordered_set>
++#include <atomic>
+ #include <cstring>
+ #include <fstream>
+ #include <filesystem>
+@@ -26,8 +27,13 @@ static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
+ 
+ namespace fs = std::filesystem;
+ 
+-// macro for nicer error messages on server crash
+-#define RPC_STATUS_ASSERT(x) if (!(x)) GGML_ABORT("Remote RPC server crashed or returned malformed response")
++// onebrain: error-return semantics (patches/0002)
++// Upstream's RPC_STATUS_ASSERT aborted the whole process on any client-side
++// transport failure. OneBrain converts every client path to error returns
++// (GGML_STATUS_FAILED / nullptr / false / zeroed results) so a lost remote
++// server fails the in-flight request, not the process. The first failure on a
++// socket marks it dead; later commands on it fail fast without touching the
++// wire. Server-side paths and the wire format are untouched.
+ 
+ // all RPC structures must be packed
+ #pragma pack(push, 1)
+@@ -298,20 +304,67 @@ static bool parse_endpoint(const std::string & endpoint, std::string & host, int
+     return true;
+ }
+ 
++// onebrain: error-return semantics (patches/0002): registry of client sockets
++// that have seen a transport failure. Keyed by raw pointer with the weak_ptr
++// kept for exact identity — a recycled allocation at the same address cannot
++// lock to the old control block, so stale entries are pruned on lookup.
++static std::mutex ob_rpc_dead_sockets_mutex;
++static std::unordered_map<socket_t *, std::weak_ptr<socket_t>> ob_rpc_dead_sockets;
++
++static void ob_rpc_mark_dead(const socket_ptr & sock) {
++    if (sock == nullptr) {
++        return;
++    }
++    std::lock_guard<std::mutex> lock(ob_rpc_dead_sockets_mutex);
++    ob_rpc_dead_sockets[sock.get()] = sock;
++}
++
++static bool ob_rpc_is_dead(const socket_ptr & sock) {
++    if (sock == nullptr) {
++        return true; // a socket that never connected behaves like a dead one
++    }
++    std::lock_guard<std::mutex> lock(ob_rpc_dead_sockets_mutex);
++    auto it = ob_rpc_dead_sockets.find(sock.get());
++    if (it == ob_rpc_dead_sockets.end()) {
++        return false;
++    }
++    if (it->second.lock() != sock) {
++        ob_rpc_dead_sockets.erase(it); // stale entry from a freed socket
++        return false;
++    }
++    return true;
++}
++
++// onebrain: error-return semantics (patches/0002): log the first client-side
++// transport failure loudly; later ones are debug noise (teardown of a dead
++// session hits several of these on every buffer free).
++static void ob_rpc_log_fail(const char * where) {
++    static std::atomic<bool> ob_rpc_fail_logged{false};
++    if (!ob_rpc_fail_logged.exchange(true)) {
++        GGML_LOG_ERROR("RPC client: transport failure in %s (remote server lost); "
++                       "returning errors instead of aborting\n", where);
++    } else {
++        LOG_DBG("[%s] RPC client transport failure\n", where);
++    }
++}
++
+ // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
+ // No response
+ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size) {
+-    uint8_t cmd_byte = cmd;
+-    if (!sock->send_data(&cmd_byte, sizeof(cmd_byte))) {
+-        return false;
+-    }
+-    if (!sock->send_data(&input_size, sizeof(input_size))) {
++    // onebrain: error-return semantics (patches/0002): fail fast on sockets
++    // that already saw a failure instead of writing into a torn stream.
++    if (ob_rpc_is_dead(sock)) {
+         return false;
+     }
+-    if (!sock->send_data(input, input_size)) {
++    uint8_t cmd_byte = cmd;
++    if (!sock->send_data(&cmd_byte, sizeof(cmd_byte)) ||
++        !sock->send_data(&input_size, sizeof(input_size)) ||
++        !sock->send_data(input, input_size) ||
++        !sock->flush()) {
++        ob_rpc_mark_dead(sock); // onebrain: error-return semantics (patches/0002)
+         return false;
+     }
+-    return sock->flush();
++    return true;
+ }
+ 
+ // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
+@@ -321,13 +374,12 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input,
+         return false;
+     }
+     uint64_t out_size;
+-    if (!sock->recv_data(&out_size, sizeof(out_size))) {
+-        return false;
+-    }
+-    if (out_size != output_size) {
+-        return false;
+-    }
+-    if (!sock->recv_data(output, output_size)) {
++    if (!sock->recv_data(&out_size, sizeof(out_size)) ||
++        out_size != output_size ||
++        !sock->recv_data(output, output_size)) {
++        // onebrain: error-return semantics (patches/0002): a failed or
++        // malformed response leaves the stream desynced — mark the socket.
++        ob_rpc_mark_dead(sock);
+         return false;
+     }
+     return true;
+@@ -345,7 +397,10 @@ static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
+     sock->get_caps(request.conn_caps);
+ 
+     bool status = send_rpc_cmd(sock, RPC_CMD_HELLO, &request, sizeof(request), &response, sizeof(response));
+-    RPC_STATUS_ASSERT(status);
++    if (!status) { // onebrain: error-return semantics (patches/0002)
++        ob_rpc_log_fail(__func__);
++        return false;
++    }
+ 
+     if (response.major != RPC_PROTO_MAJOR_VERSION || response.minor > RPC_PROTO_MINOR_VERSION) {
+         GGML_LOG_ERROR("RPC server version mismatch: %d.%d.%d\n",
+@@ -394,7 +449,12 @@ static void ggml_backend_rpc_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
+     rpc_msg_free_buffer_req request = {ctx->remote_ptr};
+     bool status = send_rpc_cmd(ctx->sock, RPC_CMD_FREE_BUFFER, &request, sizeof(request), nullptr, 0);
+-    RPC_STATUS_ASSERT(status);
++    // onebrain: error-return semantics (patches/0002): teardown tolerates dead
++    // sockets silently — the server frees with the connection; local state
++    // always goes, so freeing a model over dead bridges never aborts.
++    if (!status) {
++        LOG_DBG("[%s] remote free skipped: server unreachable\n", __func__);
++    }
+     delete ctx;
+ }
+ 
+@@ -406,7 +466,12 @@ static void * ggml_backend_rpc_buffer_get_base(ggml_backend_buffer_t buffer) {
+     rpc_msg_buffer_get_base_req request = {ctx->remote_ptr};
+     rpc_msg_buffer_get_base_rsp response;
+     bool status = send_rpc_cmd(ctx->sock, RPC_CMD_BUFFER_GET_BASE, &request, sizeof(request), &response, sizeof(response));
+-    RPC_STATUS_ASSERT(status);
++    if (!status) { // onebrain: error-return semantics (patches/0002)
++        // Residual: ggml_backend_buffer_get_base asserts base != NULL, but the
++        // base is cached at load time — mid-generation this path never runs.
++        ob_rpc_log_fail(__func__);
++        return nullptr;
++    }
+     ctx->base_ptr = reinterpret_cast<void *>(response.base_ptr);
+     return ctx->base_ptr;
+ }
+@@ -468,7 +533,10 @@ static enum ggml_status ggml_backend_rpc_buffer_init_tensor(ggml_backend_buffer_
+         request.tensor = serialize_tensor(tensor);
+ 
+         bool status = send_rpc_cmd(ctx->sock, RPC_CMD_INIT_TENSOR, &request, sizeof(request), nullptr, 0);
+-        RPC_STATUS_ASSERT(status);
++        if (!status) { // onebrain: error-return semantics (patches/0002)
++            ob_rpc_log_fail(__func__);
++            return GGML_STATUS_FAILED;
++        }
+     }
+     return GGML_STATUS_SUCCESS;
+ }
+@@ -483,7 +551,9 @@ static void ggml_backend_rpc_buffer_memset_tensor(
+         /* .value  = */ value,
+     };
+     bool status = send_rpc_cmd(ctx->sock, RPC_CMD_MEMSET_TENSOR, &request, sizeof(request), nullptr, 0);
+-    RPC_STATUS_ASSERT(status);
++    if (!status) { // onebrain: error-return semantics (patches/0002)
++        ob_rpc_log_fail(__func__);
++    }
+ }
+ 
+ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+@@ -496,7 +566,10 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
+         request.hash = fnv_hash((const uint8_t*)data, size);
+         rpc_msg_set_tensor_hash_rsp response;
+         bool status = send_rpc_cmd(ctx->sock, RPC_CMD_SET_TENSOR_HASH, &request, sizeof(request), &response, sizeof(response));
+-        RPC_STATUS_ASSERT(status);
++        if (!status) { // onebrain: error-return semantics (patches/0002)
++            ob_rpc_log_fail(__func__);
++            return;
++        }
+         if (response.result) {
+             // the server has the same data, no need to send it
+             return;
+@@ -509,7 +582,9 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
+     memcpy(input.data() + sizeof(rpc_tensor), &offset, sizeof(offset));
+     memcpy(input.data() + sizeof(rpc_tensor) + sizeof(offset), data, size);
+     bool status = send_rpc_cmd(ctx->sock, RPC_CMD_SET_TENSOR, input.data(), input.size());
+-    RPC_STATUS_ASSERT(status);
++    if (!status) { // onebrain: error-return semantics (patches/0002)
++        ob_rpc_log_fail(__func__);
++    }
+ }
+ 
+ static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+@@ -519,7 +594,13 @@ static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, con
+     request.offset = offset;
+     request.size = size;
+     bool status = send_rpc_cmd(ctx->sock, RPC_CMD_GET_TENSOR, &request, sizeof(request), data, size);
+-    RPC_STATUS_ASSERT(status);
++    if (!status) { // onebrain: error-return semantics (patches/0002)
++        // Zero the destination so callers never read uninitialized memory;
++        // the socket is now marked dead, so the next graph_compute on this
++        // server fails the request properly.
++        memset(data, 0, size);
++        ob_rpc_log_fail(__func__);
++    }
+ }
+ 
+ static bool ggml_backend_rpc_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
+@@ -538,7 +619,10 @@ static bool ggml_backend_rpc_buffer_cpy_tensor(ggml_backend_buffer_t buffer, con
+         request.dst = serialize_tensor(dst);
+         rpc_msg_copy_tensor_rsp response;
+         bool status = send_rpc_cmd(ctx->sock, RPC_CMD_COPY_TENSOR, &request, sizeof(request), &response, sizeof(response));
+-        RPC_STATUS_ASSERT(status);
++        if (!status) { // onebrain: error-return semantics (patches/0002)
++            ob_rpc_log_fail(__func__);
++            return false;
++        }
+         return response.result;
+     }
+     return false;
+@@ -548,7 +632,9 @@ static void ggml_backend_rpc_buffer_clear(ggml_backend_buffer_t buffer, uint8_t
+     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
+     rpc_msg_buffer_clear_req request = {ctx->remote_ptr, value};
+     bool status = send_rpc_cmd(ctx->sock, RPC_CMD_BUFFER_CLEAR, &request, sizeof(request), nullptr, 0);
+-    RPC_STATUS_ASSERT(status);
++    if (!status) { // onebrain: error-return semantics (patches/0002)
++        ob_rpc_log_fail(__func__);
++    }
+ }
+ 
+ static ggml_backend_buffer_i ggml_backend_rpc_buffer_interface = {
+@@ -576,7 +662,12 @@ static ggml_backend_buffer_t ggml_backend_rpc_buffer_type_alloc_buffer(ggml_back
+     rpc_msg_alloc_buffer_rsp response;
+     auto sock = get_socket(buft_ctx->endpoint);
+     bool status = send_rpc_cmd(sock, RPC_CMD_ALLOC_BUFFER, &request, sizeof(request), &response, sizeof(response));
+-    RPC_STATUS_ASSERT(status);
++    if (!status) { // onebrain: error-return semantics (patches/0002)
++        // nullptr also covers a null socket; upstream alloc paths treat a
++        // null buffer as allocation failure and unwind cleanly.
++        ob_rpc_log_fail(__func__);
++        return nullptr;
++    }
+     if (response.remote_ptr != 0) {
+         ggml_backend_buffer_t buffer = ggml_backend_buffer_init(buft,
+             ggml_backend_rpc_buffer_interface,
+@@ -592,7 +683,10 @@ static size_t get_alignment(const std::shared_ptr<socket_t> & sock, uint32_t dev
+     rpc_msg_get_alignment_req request = {device};
+     rpc_msg_get_alignment_rsp response;
+     bool status = send_rpc_cmd(sock, RPC_CMD_GET_ALIGNMENT, &request, sizeof(request), &response, sizeof(response));
+-    RPC_STATUS_ASSERT(status);
++    if (!status) { // onebrain: error-return semantics (patches/0002)
++        ob_rpc_log_fail(__func__);
++        return 0; // never a legal alignment; the caller fails the buffer type
++    }
+     return response.alignment;
+ }
+ 
+@@ -605,7 +699,10 @@ static size_t get_max_size(const std::shared_ptr<socket_t> & sock, uint32_t devi
+     rpc_msg_get_max_size_req request = {device};
+     rpc_msg_get_max_size_rsp response;
+     bool status = send_rpc_cmd(sock, RPC_CMD_GET_MAX_SIZE, &request, sizeof(request), &response, sizeof(response));
+-    RPC_STATUS_ASSERT(status);
++    if (!status) { // onebrain: error-return semantics (patches/0002)
++        ob_rpc_log_fail(__func__);
++        return 0; // never a legal max size; the caller fails the buffer type
++    }
+     return response.max_size;
+ }
+ 
+@@ -644,7 +741,12 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
+         // TODO: cache the alloc responses to avoid extra RPC calls?
+         rpc_msg_get_alloc_size_rsp response;
+         bool status = send_rpc_cmd(sock, RPC_CMD_GET_ALLOC_SIZE, &request, sizeof(request), &response, sizeof(response));
+-        RPC_STATUS_ASSERT(status);
++        if (!status) { // onebrain: error-return semantics (patches/0002)
++            // Fall back to the local size; a dead server fails the subsequent
++            // alloc/compute anyway, and 0 could silently under-allocate.
++            ob_rpc_log_fail(__func__);
++            return ggml_nbytes(tensor);
++        }
+ 
+         return response.alloc_size;
+     }
+@@ -737,14 +839,25 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
+         request.device = rpc_ctx->device;
+         auto sock = get_socket(rpc_ctx->endpoint);
+         bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_RECOMPUTE, &request, sizeof(request));
+-        RPC_STATUS_ASSERT(status);
++        if (!status) { // onebrain: error-return semantics (patches/0002)
++            // A lost server fails this decode: GGML_STATUS_FAILED propagates
++            // out of llama_decode as a fatal return code. Reset the uid so a
++            // retry never takes the recompute shortcut against a fresh server.
++            rpc_dev_ctx->last_graph_uid = 0;
++            ob_rpc_log_fail(__func__);
++            return GGML_STATUS_FAILED;
++        }
+     } else {
+         rpc_dev_ctx->last_graph_uid = cgraph->uid;
+         std::vector<uint8_t> input;
+         serialize_graph(rpc_ctx->device, cgraph, input);
+         auto sock = get_socket(rpc_ctx->endpoint);
+         bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE, input.data(), input.size());
+-        RPC_STATUS_ASSERT(status);
++        if (!status) { // onebrain: error-return semantics (patches/0002)
++            rpc_dev_ctx->last_graph_uid = 0;
++            ob_rpc_log_fail(__func__);
++            return GGML_STATUS_FAILED;
++        }
+     }
+     return GGML_STATUS_SUCCESS;
+ }
+@@ -785,6 +898,10 @@ ggml_backend_buffer_type_t ggml_backend_rpc_buffer_type(const char * endpoint, u
+     }
+     size_t alignment = get_alignment(sock, device);
+     size_t max_size = get_max_size(sock, device);
++    if (alignment == 0 || max_size == 0) { // onebrain: error-return semantics (patches/0002)
++        GGML_LOG_ERROR("Failed to query buffer type properties from %s\n", endpoint);
++        return nullptr;
++    }
+     ggml_backend_rpc_buffer_type_context * buft_ctx = new ggml_backend_rpc_buffer_type_context {
+         /* .endpoint  = */ endpoint,
+         /* .device    = */ device,
+@@ -828,7 +945,12 @@ static void get_device_memory(const std::shared_ptr<socket_t> & sock, uint32_t d
+     request.device = device;
+     rpc_msg_get_device_memory_rsp response;
+     bool status = send_rpc_cmd(sock, RPC_CMD_GET_DEVICE_MEMORY, &request, sizeof(request), &response, sizeof(response));
+-    RPC_STATUS_ASSERT(status);
++    if (!status) { // onebrain: error-return semantics (patches/0002)
++        ob_rpc_log_fail(__func__);
++        *free = 0;
++        *total = 0;
++        return;
++    }
+     *free = response.free_mem;
+     *total = response.total_mem;
+ }
+@@ -2056,7 +2178,12 @@ static uint32_t ggml_backend_rpc_get_device_count(const char * endpoint) {
+     }
+     rpc_msg_device_count_rsp response;
+     bool status = send_rpc_cmd(sock, RPC_CMD_DEVICE_COUNT, nullptr, 0, &response, sizeof(response));
+-    RPC_STATUS_ASSERT(status);
++    if (!status) { // onebrain: error-return semantics (patches/0002)
++        // Zero devices makes ggml_backend_rpc_add_server fail registration
++        // cleanly instead of aborting.
++        ob_rpc_log_fail(__func__);
++        return 0;
++    }
+     return response.device_count;
+ }
+ 
