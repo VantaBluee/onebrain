@@ -162,7 +162,9 @@ pub(crate) struct Node {
     /// `Some(ns)`: wrap subprocesses in `ip netns exec <ns>` and do HTTP via
     /// in-namespace curl (the daemon's loopback is inside the namespace).
     netns: Option<&'static str>,
-    client: reqwest::blocking::Client,
+    /// pub(crate): the M5 chaos section (sim.rs) drives streaming SSE
+    /// requests directly (non-netem only).
+    pub(crate) client: reqwest::blocking::Client,
 }
 
 impl Node {
@@ -225,7 +227,7 @@ impl Node {
             })
     }
 
-    fn token(&self) -> Result<String> {
+    pub(crate) fn token(&self) -> Result<String> {
         let path = self.home.join("config").join("api-token");
         Ok(std::fs::read_to_string(&path)
             .with_context(|| format!("reading {}", path.display()))?
@@ -240,7 +242,7 @@ impl Node {
         serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))
     }
 
-    fn url(&self, path: &str) -> String {
+    pub(crate) fn url(&self, path: &str) -> String {
         format!("http://127.0.0.1:{}{}", self.port, path)
     }
 

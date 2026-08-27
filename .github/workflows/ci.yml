@@ -29,7 +29,9 @@ jobs:
       matrix:
         os: [macos-14, macos-15, ubuntu-22.04, ubuntu-24.04, windows-2022]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    # 75 (was 60): the M5 chaos section adds ~3 min of sim wall time (three
+    # daemons, kill/retry streams, rejoin polling) on the slowest runners.
+    timeout-minutes: 75
     env:
       RUSTFLAGS: -Dwarnings
     defaults:

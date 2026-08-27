@@ -54,9 +54,46 @@
 //!    wall time); the ≥5% rule is covered by the scheduler unit tests
 //!    named in the printed `[SKIP]` line.
 //!
+//! After M4, the M5 **CHAOS** section runs (docs/resilience.md "Sim / DoD
+//! hooks"). Under `--netem` it is skipped with a `[SKIP]` line: the
+//! pair-sim namespace machinery provides exactly two namespaces and the
+//! chaos scenarios need a third daemon; they run in the default loopback
+//! mode on every OS.
+//!
+//! 8.  **chaos setup** — A restarts with the distribute cap plus `[debug]
+//!     decode_delay_ms = 150` (the engine host sleeps per emitted token, so
+//!     a 40-token generation runs ≥ 6 s and the kill lands mid-stream); B
+//!     restarts and a THIRD daemon C starts with the same cap (any two of
+//!     the three hold the model, one alone cannot); C pairs with A.
+//! 9.  **chaos-1 (kill + transparent retry)** — a capped load distributes
+//!     across the head and ONE worker (the plan's assignments say WHICH);
+//!     a streaming OpenAI chat (temperature 0, max_tokens 40) is read on a
+//!     collector thread, the in-epoch worker is killed -9 after ≥ 3
+//!     content chunks, and the SAME stream must complete with
+//!     finish_reason "length" and no error events; status must then show a
+//!     NEW epoch excluding the dead node, and the full streamed text must
+//!     equal a control run made afterwards against the recovered topology
+//!     (greedy determinism — the §9 correctness property under failure).
+//! 10. **chaos-2 (no fallback, typed error)** — the survivors restart with
+//!     the same caps (head + ONE worker required, only one worker left);
+//!     that worker is killed mid-stream again, and the stream must end
+//!     with the structured error naming the lost node and BOTH MB figures
+//!     (docs/resilience.md failure lifecycle step 3); the daemon must stay
+//!     healthy and a fresh load must fail FAST with the planning error
+//!     (both MB figures again) rather than hanging.
+//! 11. **chaos-3 (rejoin ⇒ lazy re-plan)** — the chaos-2 worker revives
+//!     (decode_tps_override 50) and a reload re-establishes a distributed
+//!     epoch; then the chaos-1 dead worker restarts (same home/ports,
+//!     decode_tps_override 100 so the score ranks it first) and the head
+//!     must reach a NEW epoch including it within 45 s with no client
+//!     activity beyond status polling.
+//! 12. **chaos-4 (drain)** — `onebrain stop` on the now-idle other worker:
+//!     it must leave `connected` in the head's peers, and the next plan
+//!     (trigger: a reload) must exclude it while keeping the live worker.
+//!
 //! `--netem` (Linux, root only — SKIP + exit 0 anywhere else): the same
-//! scenario inside the pair-sim network namespaces, shaped to
-//! 1 Gbit / 0.5 ms per direction.
+//! M3/M4 scenario inside the pair-sim network namespaces, shaped to
+//! 1 Gbit / 0.5 ms per direction (chaos skipped, see above).
 //!
 //! One `[PASS]`/`[FAIL]` checklist line per step; daemon-log tails are
 //! dumped on failure; `OB_E2E_SKIP_BUILD=1` skips the inner build.
@@ -69,7 +106,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
 
-use crate::e2e::{dump_daemon_log, locate_onebrain_binary, step};
+use crate::e2e::{dump_daemon_log, kill_hard, locate_onebrain_binary, step};
 use crate::pair_sim::{
     cleanup, is_root, netem_setup, peer_ref, two_free_ports, Node, PeerRef, NS_A, NS_B,
 };
@@ -170,6 +207,8 @@ pub fn run(netem: bool) -> Result<()> {
     // scenario. Picked while the api ports are already released — the same
     // small pick-then-bind race the api ports accept.
     let (mesh_a, mesh_b) = two_free_ports()?;
+    // The third daemon of the M5 chaos section (started there, not here).
+    let (port_c, mesh_c) = two_free_ports()?;
     let base = std::env::temp_dir();
     let run_id = std::process::id();
     let a = Node::new(
@@ -185,12 +224,23 @@ pub fn run(netem: bool) -> Result<()> {
         "sim-b",
         base.join(format!("onebrain-sim-{run_id}-b")),
         port_b,
-        binary,
+        binary.clone(),
         netem.then_some(NS_B),
+    )?;
+    // No namespace for C: the chaos section is skipped under --netem
+    // (module docs), so C only ever runs on the shared loopback.
+    let c = Node::new(
+        "daemon C (worker)",
+        "sim-c",
+        base.join(format!("onebrain-sim-{run_id}-c")),
+        port_c,
+        binary,
+        None,
     )?;
     // Node::new wrote the plain pair-sim config; overwrite with the same
     // switches PLUS the memory cap and pinned mesh port before the daemons
-    // ever start.
+    // ever start. C's config is written by the chaos section before its
+    // first `up`.
     write_config(&a, mesh_a, netem, SimKnobs::capped(cap))?;
     write_config(&b, mesh_b, netem, SimKnobs::capped(cap))?;
     println!(
@@ -201,13 +251,26 @@ pub fn run(netem: bool) -> Result<()> {
         "sandbox B: {} (api {port_b}, mesh {mesh_b})",
         b.home.display()
     );
+    println!(
+        "sandbox C: {} (api {port_c}, mesh {mesh_c}, chaos section only)",
+        c.home.display()
+    );
 
-    let outcome = scenario(&a, &b, &model_path, &dims, mesh_a, mesh_b, netem);
+    let outcome = scenario(
+        &a,
+        &b,
+        &c,
+        &model_path,
+        &dims,
+        (mesh_a, mesh_b, mesh_c),
+        netem,
+    );
     if outcome.is_err() {
         dump_daemon_log(&a.home);
         dump_daemon_log(&b.home);
+        dump_daemon_log(&c.home);
     }
-    cleanup(&[&a, &b], netem);
+    cleanup(&[&a, &b, &c], netem);
     outcome?;
     println!("sim: all steps passed");
     Ok(())
@@ -218,12 +281,13 @@ pub fn run(netem: bool) -> Result<()> {
 fn scenario(
     a: &Node,
     b: &Node,
+    c: &Node,
     model_path: &Path,
     dims: &SimModelDims,
-    mesh_a: u16,
-    mesh_b: u16,
+    mesh: (u16, u16, u16),
     netem: bool,
 ) -> Result<()> {
+    let (mesh_a, mesh_b, _mesh_c) = mesh;
     let model_arg = model_path
         .to_str()
         .context("model path is not valid UTF-8")?;
@@ -376,6 +440,7 @@ fn scenario(
         cap_bytes: Some(m4_cap(dims)),
         decode_tps_override: Some(decode_tps),
         ctx_len: Some(ctx),
+        ..SimKnobs::default()
     };
 
     step(
@@ -504,6 +569,827 @@ fn scenario(
          (crates/onebrain-scheduler/src/v1.rs; docs/scheduler-v1.md \"DoD sim hooks\")"
     );
 
+    // ---- M5 chaos section (docs/resilience.md "Sim / DoD hooks") --------
+    if netem {
+        println!(
+            "[SKIP] chaos (M5) under --netem: the pair-sim machinery provides exactly two \
+             network namespaces and the chaos scenarios need a third daemon; they run in the \
+             default loopback mode on every OS"
+        );
+        return Ok(());
+    }
+    chaos_section(
+        &ChaosEnv {
+            a,
+            b,
+            c,
+            peer_a: &peer_a,
+            peer_b: &peer_b,
+            mesh,
+            model_arg,
+        },
+        dims,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// M5 chaos section (docs/resilience.md "Sim / DoD hooks")
+// ---------------------------------------------------------------------------
+
+/// `[debug] decode_delay_ms` on the head during the chaos phases: the
+/// engine host sleeps this long per emitted token, stretching a 40-token
+/// generation past 6 s so the kill reliably lands mid-stream.
+const CHAOS_DECODE_DELAY_MS: u64 = 150;
+/// `max_tokens` of the chaos generations; the surviving stream must end
+/// with finish_reason "length", i.e. all of them.
+const CHAOS_MAX_TOKENS: u32 = 40;
+/// The kill fires once this many NON-EMPTY content chunks have streamed.
+const CHAOS_KILL_AFTER_CHUNKS: usize = 3;
+/// Between consecutive SSE events of a chaos stream: must cover death
+/// detection, epoch teardown, the re-plan, the distributed reload, and the
+/// prefix re-prefill of the transparent retry.
+const CHAOS_EVENT_TIMEOUT: Duration = Duration::from_secs(90);
+/// Whole-request cap on one chaos stream (kill, retry, and tail included).
+const CHAOS_STREAM_TIMEOUT: Duration = Duration::from_secs(300);
+/// The rejoin lazy re-plan must reach a new epoch within this
+/// (docs/resilience.md scenario 3; "~45 s" in the sim contract).
+const REJOIN_REPLAN_TIMEOUT: Duration = Duration::from_secs(45);
+/// A killed or politely stopped worker must leave `connected` in the
+/// head's peers within this (heartbeat death is 10 s, plus polling slack).
+const PEER_LOSS_TIMEOUT: Duration = Duration::from_secs(30);
+/// A load that cannot plan (no workers left) must fail within this — the
+/// "returns the planning error rather than hanging" assertion.
+const FAST_FAIL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Everything the chaos section needs from the earlier steps.
+struct ChaosEnv<'a> {
+    a: &'a Node,
+    b: &'a Node,
+    c: &'a Node,
+    /// A as its peers list it (`id` = A's endpoint id, used in assignments).
+    peer_a: &'a PeerRef,
+    /// B as A lists it.
+    peer_b: &'a PeerRef,
+    /// Pinned mesh UDP ports of (A, B, C).
+    mesh: (u16, u16, u16),
+    model_arg: &'a str,
+}
+
+/// One chaos worker with everything needed to kill and revive it.
+struct ChaosWorker<'a> {
+    node: &'a Node,
+    mesh_port: u16,
+    peer: &'a PeerRef,
+}
+
+/// The M5 chaos rehearsal (module docs steps 8–12). Runs after the M4
+/// steps, non-netem only; aborts on first failure like the rest.
+fn chaos_section(env: &ChaosEnv, dims: &SimModelDims) -> Result<()> {
+    let (mesh_a, mesh_b, mesh_c) = env.mesh;
+    // The M3 distribute cap already has the chaos-1 shape: each node holds
+    // n-1 of n layers, so ANY TWO of the three hold the model pooled while
+    // one alone cannot (the unit tests pin this per model shape).
+    let cap = m3_distribute_cap(dims);
+    let head_knobs = SimKnobs {
+        cap_bytes: Some(cap),
+        decode_delay_ms: Some(CHAOS_DECODE_DELAY_MS),
+        ..SimKnobs::default()
+    };
+
+    step(
+        "chaos: A+B restarted capped (decode_delay_ms 150 on the head); C up capped",
+        || {
+            // Head first: clean epoch teardown while its worker still lives.
+            restart_with(env.a, mesh_a, false, head_knobs)?;
+            restart_with(env.b, mesh_b, false, SimKnobs::capped(cap))?;
+            start_with(env.c, mesh_c, false, SimKnobs::capped(cap))
+        },
+    )?;
+
+    let peer_c = step(
+        "chaos: C paired with A; both worker links connected",
+        || {
+            let (_a_as_c_sees_it, peer_c) = pair(env.a, env.c)?;
+            wait_connected(env.a, env.c, env.peer_a, &peer_c, "after pairing C")?;
+            wait_connected(
+                env.a,
+                env.b,
+                env.peer_a,
+                env.peer_b,
+                "after the chaos restart",
+            )?;
+            Ok(peer_c)
+        },
+    )?;
+
+    // ---- chaos-1: kill mid-generation, the SAME stream completes --------
+    let plan1 = step(
+        "chaos-1: capped 3-node load distributes across the head + ONE worker",
+        || {
+            let plan = load_model(env.a, &json!({ "model": env.model_arg, "explain": true }))?;
+            assert_distributed(&plan)?;
+            if !assignment_node_ids(&plan)
+                .iter()
+                .any(|id| id == &env.peer_a.id)
+            {
+                bail!("the head is not in the plan's assignments: {plan}");
+            }
+            Ok(plan)
+        },
+    )?;
+    let epoch1 = plan_epoch(&plan1)?;
+    // The plan says WHICH worker holds a shard (the scheduler picks one of
+    // {B, C}); the other is the survivor the retry must re-plan onto.
+    let in_epoch = epoch_worker_ids(&plan1, &[env.peer_b.id.as_str(), peer_c.id.as_str()])?;
+    let victim_id = in_epoch[0].clone();
+    let (victim, survivor) = if victim_id == env.peer_b.id {
+        (
+            ChaosWorker {
+                node: env.b,
+                mesh_port: mesh_b,
+                peer: env.peer_b,
+            },
+            ChaosWorker {
+                node: env.c,
+                mesh_port: mesh_c,
+                peer: &peer_c,
+            },
+        )
+    } else {
+        (
+            ChaosWorker {
+                node: env.c,
+                mesh_port: mesh_c,
+                peer: &peer_c,
+            },
+            ChaosWorker {
+                node: env.b,
+                mesh_port: mesh_b,
+                peer: env.peer_b,
+            },
+        )
+    };
+    println!(
+        "       epoch {epoch1}: in-epoch worker is {} ({} worker assignment(s))",
+        victim.node.label,
+        in_epoch.len(),
+    );
+
+    let model = model_name(env.a)?;
+    let watch = step(
+        "chaos-1: kill -9 the in-epoch worker mid-stream; the SAME stream completes (finish_reason length)",
+        || {
+            let pid = daemon_pid(victim.node)?;
+            let watch = run_chaos_stream(env.a, &model, || {
+                kill_hard(pid)?;
+                println!(
+                    "       killed {} (pid {pid}) after {CHAOS_KILL_AFTER_CHUNKS} content chunks",
+                    victim.node.label
+                );
+                Ok(())
+            })?;
+            if watch.kill_at != Some(CHAOS_KILL_AFTER_CHUNKS) {
+                bail!(
+                    "the kill never fired: only {} content chunks arrived before the stream \
+                     ended (errors: {:?})",
+                    watch.pieces.len(),
+                    watch.errors
+                );
+            }
+            if !watch.errors.is_empty() {
+                bail!(
+                    "the retry must be transparent, but the stream carried error events: {:?}",
+                    watch.errors
+                );
+            }
+            if !watch.done {
+                bail!("the stream ended without `data: [DONE]`");
+            }
+            if !watch.finish.iter().any(|f| f == "length") {
+                bail!(
+                    "no chunk carried finish_reason \"length\" (saw {:?}) — the stream did \
+                     not run to max_tokens",
+                    watch.finish
+                );
+            }
+            if watch.pieces_after_kill() == 0 {
+                bail!("no content chunks arrived after the kill — the retry never resumed");
+            }
+            Ok(watch)
+        },
+    )?;
+    println!(
+        "       {CHAOS_KILL_AFTER_CHUNKS} chunks before the kill + {} after",
+        watch.pieces_after_kill()
+    );
+
+    step(
+        "chaos-1: a NEW epoch is active excluding the dead node",
+        || {
+            let plan = wait_for_plan(
+                env.a,
+                Duration::from_secs(10),
+                "a new epoch excluding the dead worker",
+                |p| {
+                    plan_epoch(p).ok() != Some(epoch1)
+                        && !assignment_node_ids(p).iter().any(|id| id == &victim_id)
+                },
+            )?;
+            assert_distributed(&plan)?;
+            if !assignment_node_ids(&plan)
+                .iter()
+                .any(|id| id == &survivor.peer.id)
+            {
+                bail!(
+                    "the recovery plan does not include the surviving worker {}: {plan}",
+                    survivor.node.label
+                );
+            }
+            Ok(())
+        },
+    )?;
+
+    step(
+        "chaos-1: streamed text equals a control run on the recovered topology (greedy)",
+        || {
+            let (text, tokens, finish) = chat_full(env.a, &model, CHAOS_MAX_TOKENS)?;
+            if finish.as_deref() != Some("length") {
+                bail!("control run finished with {finish:?}, expected \"length\"");
+            }
+            if tokens != Some(u64::from(CHAOS_MAX_TOKENS)) {
+                bail!("control run generated {tokens:?} completion tokens, expected {CHAOS_MAX_TOKENS}");
+            }
+            let streamed = watch.text();
+            if text != streamed {
+                bail!(
+                    "retried stream and control run differ:\n  stream:  {streamed:?}\n  \
+                     control: {text:?}"
+                );
+            }
+            Ok(())
+        },
+    )?;
+
+    // ---- chaos-2: kill with no fallback -> structured typed error -------
+    step(
+        "chaos-2: survivors restarted capped; load distributes across the head + the ONLY worker",
+        || {
+            restart_with(env.a, mesh_a, false, head_knobs)?;
+            restart_with(
+                survivor.node,
+                survivor.mesh_port,
+                false,
+                SimKnobs::capped(cap),
+            )?;
+            wait_connected(
+                env.a,
+                survivor.node,
+                env.peer_a,
+                survivor.peer,
+                "after the chaos-2 restart",
+            )?;
+            let plan = load_model(env.a, &json!({ "model": env.model_arg, "explain": true }))?;
+            assert_distributed(&plan)?;
+            if !assignment_node_ids(&plan)
+                .iter()
+                .any(|id| id == &survivor.peer.id)
+            {
+                bail!(
+                    "the chaos-2 plan does not include {}: {plan}",
+                    survivor.node.label
+                );
+            }
+            Ok(())
+        },
+    )?;
+
+    step(
+        "chaos-2: kill with no fallback -> structured error naming the node + both MB figures",
+        || {
+            let pid = daemon_pid(survivor.node)?;
+            let watch = run_chaos_stream(env.a, &model, || {
+                kill_hard(pid)?;
+                println!(
+                    "       killed {} (pid {pid}) after {CHAOS_KILL_AFTER_CHUNKS} content chunks",
+                    survivor.node.label
+                );
+                Ok(())
+            })?;
+            if watch.kill_at.is_none() {
+                bail!(
+                    "the kill never fired: only {} content chunks arrived (errors: {:?})",
+                    watch.pieces.len(),
+                    watch.errors
+                );
+            }
+            if watch.finish.iter().any(|f| f == "length") {
+                bail!(
+                    "the stream ran to completion, but no fallback exists — it must end with \
+                     the structured error"
+                );
+            }
+            if watch.errors.is_empty() {
+                bail!(
+                    "the stream ended with no error event ({} chunks, done={}, finish {:?})",
+                    watch.pieces.len(),
+                    watch.done,
+                    watch.finish
+                );
+            }
+            structured_loss_check(
+                &watch.errors.join("\n"),
+                survivor.node.name,
+                &survivor.peer.id,
+            )
+        },
+    )?;
+
+    step(
+        "chaos-2: daemon stays healthy; a fresh load fails fast with the planning error",
+        || {
+            env.a.wait_peer(
+                &survivor.peer.id,
+                PEER_LOSS_TIMEOUT,
+                "the killed worker leaving connected",
+                |p| p["state"] != "connected",
+            )?;
+            env.a.try_status()?;
+            let started = Instant::now();
+            let outcome = load_model(env.a, &json!({ "model": env.model_arg }));
+            let elapsed = started.elapsed();
+            let Err(e) = outcome else {
+                bail!(
+                    "the fresh load succeeded, but every worker is dead — it must fail with \
+                     the planning error"
+                );
+            };
+            if elapsed > FAST_FAIL_TIMEOUT {
+                bail!(
+                    "the failing load took {elapsed:?} (over {FAST_FAIL_TIMEOUT:?}); it must \
+                     fail fast, not hang"
+                );
+            }
+            let message = format!("{e:#}");
+            if count_mb_figures(&message) < 2 {
+                bail!("the planning error lacks the two MB figures (needs/have): {message}");
+            }
+            Ok(())
+        },
+    )?;
+
+    // ---- chaos-3: rejoin triggers a lazy re-plan ------------------------
+    let epoch2 = step(
+        "chaos-3 setup: revive the chaos-2 worker (slow) and reload distributed",
+        || {
+            start_with(
+                survivor.node,
+                survivor.mesh_port,
+                false,
+                SimKnobs {
+                    cap_bytes: Some(cap),
+                    decode_tps_override: Some(M4_DECODE_SLOW),
+                    ..SimKnobs::default()
+                },
+            )?;
+            wait_connected(
+                env.a,
+                survivor.node,
+                env.peer_a,
+                survivor.peer,
+                "after reviving the chaos-2 worker",
+            )?;
+            let plan = load_model(env.a, &json!({ "model": env.model_arg }))?;
+            assert_distributed(&plan)?;
+            if !assignment_node_ids(&plan)
+                .iter()
+                .any(|id| id == &survivor.peer.id)
+            {
+                bail!(
+                    "the re-established plan does not include {}: {plan}",
+                    survivor.node.label
+                );
+            }
+            plan_epoch(&plan)
+        },
+    )?;
+
+    step(
+        "chaos-3: the chaos-1 dead worker restarts -> lazy re-plan reaches a NEW epoch including it",
+        || {
+            // decode_tps_override 100 vs the survivor's 50: the rejoiner
+            // ranks first in the scheduler's score order (equal caps), so
+            // the re-planned epoch deterministically picks it
+            // (docs/scheduler-v1.md "Placement algorithm" §2).
+            start_with(
+                victim.node,
+                victim.mesh_port,
+                false,
+                SimKnobs {
+                    cap_bytes: Some(cap),
+                    decode_tps_override: Some(M4_DECODE_FAST),
+                    ..SimKnobs::default()
+                },
+            )?;
+            let plan = wait_for_plan(
+                env.a,
+                REJOIN_REPLAN_TIMEOUT,
+                "a new epoch including the rejoined worker",
+                |p| {
+                    plan_epoch(p).ok() != Some(epoch2)
+                        && assignment_node_ids(p).iter().any(|id| id == &victim_id)
+                },
+            )?;
+            println!(
+                "       rejoin re-plan: epoch {epoch2} -> {}",
+                plan_epoch(&plan).unwrap_or(0)
+            );
+            Ok(())
+        },
+    )?;
+
+    // ---- chaos-4: polite drain via `onebrain stop` ----------------------
+    step(
+        "chaos-4: `onebrain stop` on the idle worker; it leaves connected on the head",
+        || {
+            let out = survivor.node.onebrain(&["stop"])?;
+            if !out.status.success() {
+                bail!(
+                    "`onebrain stop` on {} failed: {}",
+                    survivor.node.label,
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+            }
+            let deadline = Instant::now() + STOP_TIMEOUT;
+            while survivor.node.try_status().is_ok() {
+                if Instant::now() >= deadline {
+                    bail!(
+                        "{} still answering {STOP_TIMEOUT:?} after `onebrain stop`",
+                        survivor.node.label
+                    );
+                }
+                std::thread::sleep(POLL_INTERVAL);
+            }
+            env.a.wait_peer(
+                &survivor.peer.id,
+                PEER_LOSS_TIMEOUT,
+                "the stopped worker leaving connected",
+                |p| p["state"] != "connected",
+            )?;
+            Ok(())
+        },
+    )?;
+
+    step(
+        "chaos-4: the head's next plan excludes the drained worker",
+        || {
+            let plan = load_model(env.a, &json!({ "model": env.model_arg, "explain": true }))?;
+            assert_distributed(&plan)?;
+            let ids = assignment_node_ids(&plan);
+            if ids.iter().any(|id| id == &survivor.peer.id) {
+                bail!(
+                    "the new plan still includes the stopped worker {}: {plan}",
+                    survivor.node.label
+                );
+            }
+            if !ids.iter().any(|id| id == &victim_id) {
+                bail!(
+                    "the new plan does not include the remaining live worker {}: {plan}",
+                    victim.node.label
+                );
+            }
+            Ok(())
+        },
+    )?;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Chaos support: SSE stream watching, kill-window logic, error shape checks
+// ---------------------------------------------------------------------------
+
+/// What one chaos SSE stream produced, fed event by event through
+/// [`StreamWatch::observe`] (pure logic — unit-tested with fixtures).
+#[derive(Debug, Default)]
+struct StreamWatch {
+    /// Kill trigger: fire after this many non-empty content chunks.
+    kill_after: usize,
+    /// Non-empty content chunks, in arrival order.
+    pieces: Vec<String>,
+    /// `Some(n)`: the kill fired after piece `n` (== `kill_after`).
+    kill_at: Option<usize>,
+    /// Every non-null finish_reason seen.
+    finish: Vec<String>,
+    /// Every SSE error event's message (plus unparsable payloads).
+    errors: Vec<String>,
+    /// `data: [DONE]` arrived.
+    done: bool,
+}
+
+/// What the driver should do after feeding one event to the watch.
+#[derive(Debug, PartialEq, Eq)]
+enum StreamAction {
+    Continue,
+    /// The kill window just opened: hard-kill the target NOW.
+    KillNow,
+    /// `[DONE]` arrived; stop reading.
+    Finished,
+}
+
+impl StreamWatch {
+    fn new(kill_after: usize) -> StreamWatch {
+        StreamWatch {
+            kill_after,
+            ..StreamWatch::default()
+        }
+    }
+
+    fn observe(&mut self, payload: &str) -> StreamAction {
+        if payload == "[DONE]" {
+            self.done = true;
+            return StreamAction::Finished;
+        }
+        let Ok(event) = serde_json::from_str::<Value>(payload) else {
+            self.errors
+                .push(format!("unparsable SSE payload: {payload}"));
+            return StreamAction::Continue;
+        };
+        if let Some(message) = event.pointer("/error/message").and_then(Value::as_str) {
+            self.errors.push(message.to_string());
+            return StreamAction::Continue;
+        }
+        if let Some(reason) = event
+            .pointer("/choices/0/finish_reason")
+            .and_then(Value::as_str)
+        {
+            self.finish.push(reason.to_string());
+        }
+        if let Some(content) = event
+            .pointer("/choices/0/delta/content")
+            .and_then(Value::as_str)
+        {
+            if !content.is_empty() {
+                self.pieces.push(content.to_string());
+                if self.kill_at.is_none() && self.pieces.len() >= self.kill_after {
+                    self.kill_at = Some(self.pieces.len());
+                    return StreamAction::KillNow;
+                }
+            }
+        }
+        StreamAction::Continue
+    }
+
+    /// All streamed text in order (the retry never re-sends sent pieces).
+    fn text(&self) -> String {
+        self.pieces.concat()
+    }
+
+    fn pieces_after_kill(&self) -> usize {
+        self.kill_at.map_or(0, |at| self.pieces.len() - at)
+    }
+}
+
+/// Open a streaming OpenAI chat completion (temperature 0, fixed prompt,
+/// [`CHAOS_MAX_TOKENS`]) and read its SSE events on a collector thread:
+/// each `data:` payload arrives on the returned channel; the thread ends
+/// with the stream. Non-netem only (the chaos section guards this).
+fn open_chat_stream(node: &Node, model: &str) -> Result<std::sync::mpsc::Receiver<String>> {
+    let body = json!({
+        "model": model,
+        "messages": [{ "role": "user", "content": PROMPT }],
+        "stream": true,
+        "temperature": 0,
+        "max_tokens": CHAOS_MAX_TOKENS,
+    });
+    let resp = node
+        .client
+        .post(node.url("/v1/chat/completions"))
+        .bearer_auth(node.token()?)
+        .json(&body)
+        .timeout(CHAOS_STREAM_TIMEOUT)
+        .send()
+        .with_context(|| {
+            format!(
+                "POST /v1/chat/completions (stream) on {} failed",
+                node.label
+            )
+        })?;
+    if !resp.status().is_success() {
+        let code = resp.status();
+        let text = resp.text().unwrap_or_default();
+        bail!(
+            "streaming chat on {} answered HTTP {code}: {text}",
+            node.label
+        );
+    }
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(resp).lines() {
+            let Ok(line) = line else { break };
+            let Some(payload) = line.strip_prefix("data:") else {
+                continue;
+            };
+            let payload = payload.trim();
+            if payload.is_empty() {
+                continue;
+            }
+            if tx.send(payload.to_string()).is_err() {
+                break;
+            }
+        }
+    });
+    Ok(rx)
+}
+
+/// Drive one chaos stream: collect chunks, invoke `kill` once the window
+/// opens ([`CHAOS_KILL_AFTER_CHUNKS`] content chunks seen), and read on to
+/// `[DONE]` / stream end. The caller judges the returned [`StreamWatch`].
+fn run_chaos_stream(
+    node: &Node,
+    model: &str,
+    kill: impl FnOnce() -> Result<()>,
+) -> Result<StreamWatch> {
+    let rx = open_chat_stream(node, model)?;
+    let mut watch = StreamWatch::new(CHAOS_KILL_AFTER_CHUNKS);
+    let mut kill = Some(kill);
+    loop {
+        match rx.recv_timeout(CHAOS_EVENT_TIMEOUT) {
+            Ok(payload) => match watch.observe(&payload) {
+                StreamAction::Continue => {}
+                StreamAction::KillNow => {
+                    if let Some(kill) = kill.take() {
+                        kill()?;
+                    }
+                }
+                StreamAction::Finished => break,
+            },
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => bail!(
+                "no SSE event within {CHAOS_EVENT_TIMEOUT:?} ({} content chunks so far, kill \
+                 fired: {}, errors: {:?})",
+                watch.pieces.len(),
+                watch.kill_at.is_some(),
+                watch.errors
+            ),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    Ok(watch)
+}
+
+/// One non-streaming greedy chat completion with `max_tokens`; returns
+/// (text, usage.completion_tokens, finish_reason) — the chaos control run.
+fn chat_full(
+    node: &Node,
+    model: &str,
+    max_tokens: u32,
+) -> Result<(String, Option<u64>, Option<String>)> {
+    let body = json!({
+        "model": model,
+        "messages": [{ "role": "user", "content": PROMPT }],
+        "stream": false,
+        "temperature": 0,
+        "max_tokens": max_tokens,
+    });
+    let v = node.post_json("/v1/chat/completions", &body, GEN_TIMEOUT)?;
+    let text = v
+        .pointer("/choices/0/message/content")
+        .and_then(Value::as_str)
+        .with_context(|| format!("chat response lacks choices[0].message.content: {v}"))?
+        .to_string();
+    let tokens = v
+        .pointer("/usage/completion_tokens")
+        .and_then(Value::as_u64);
+    let finish = v
+        .pointer("/choices/0/finish_reason")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    Ok((text, tokens, finish))
+}
+
+/// The daemon's pid from its `daemon.json` (read at kill time).
+fn daemon_pid(node: &Node) -> Result<u32> {
+    Ok(node.daemon_json()?["pid"]
+        .as_u64()
+        .with_context(|| format!("{}: daemon.json has no numeric `pid`", node.label))?
+        as u32)
+}
+
+/// Poll the head's active plan until `pred` holds; the timeout error
+/// carries the last plan view. A temporarily missing plan (mid-swap) keeps
+/// polling rather than failing.
+fn wait_for_plan(
+    node: &Node,
+    window: Duration,
+    what: &str,
+    pred: impl Fn(&Value) -> bool,
+) -> Result<Value> {
+    let deadline = Instant::now() + window;
+    let mut last;
+    loop {
+        match active_plan(node) {
+            Ok(plan) if pred(&plan) => return Ok(plan),
+            Ok(plan) => last = plan.to_string(),
+            Err(e) => last = format!("(status/plan fetch failed: {e:#})"),
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "{}: no {what} within {window:?}; last plan view: {last}",
+                node.label
+            );
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// The plan's epoch number (Epoch serializes as its inner u64).
+fn plan_epoch(plan: &Value) -> Result<u64> {
+    plan["epoch"]
+        .as_u64()
+        .with_context(|| format!("plan lacks a numeric `epoch`: {plan}"))
+}
+
+/// Node ids of every assignment, in stage order (missing/odd shapes yield
+/// an empty list — the callers' membership checks then fail loudly).
+fn assignment_node_ids(plan: &Value) -> Vec<String> {
+    plan["assignments"]
+        .as_array()
+        .map(|asgs| {
+            asgs.iter()
+                .filter_map(|a| a["node"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Which of the known workers hold an assignment in this plan. Empty = a
+/// loud error (a distributed plan must involve at least one worker).
+fn epoch_worker_ids(plan: &Value, worker_ids: &[&str]) -> Result<Vec<String>> {
+    let in_epoch: Vec<String> = assignment_node_ids(plan)
+        .into_iter()
+        .filter(|id| worker_ids.contains(&id.as_str()))
+        .collect();
+    if in_epoch.is_empty() {
+        bail!(
+            "no known worker appears in the plan's assignments (workers: {worker_ids:?}): {plan}"
+        );
+    }
+    Ok(in_epoch)
+}
+
+/// A distributed plan: PipelineParallel with at least two assignments (the
+/// chaos section's id-based membership checks carry the specifics).
+fn assert_distributed(plan: &Value) -> Result<()> {
+    if norm_strategy(plan) != "pipelineparallel" {
+        bail!(
+            "plan strategy is {}, expected PipelineParallel: {plan}",
+            plan["strategy"]
+        );
+    }
+    if plan.assignments()?.len() < 2 {
+        bail!("distributed plan has fewer than 2 assignments: {plan}");
+    }
+    Ok(())
+}
+
+/// Count `<digits>[ ]MB` figures in an error message — the structured-loss
+/// and DoesNotFit contracts both carry exactly two (needs X MB, have Y MB).
+fn count_mb_figures(text: &str) -> usize {
+    let bytes = text.as_bytes();
+    let mut count = 0;
+    let mut from = 0;
+    while let Some(pos) = text[from..].find("MB") {
+        let at = from + pos;
+        let mut j = at;
+        if j > 0 && bytes[j - 1] == b' ' {
+            j -= 1;
+        }
+        if j > 0 && bytes[j - 1].is_ascii_digit() {
+            count += 1;
+        }
+        from = at + 2;
+    }
+    count
+}
+
+/// The chaos-2 stream must end with the structured error of the failure
+/// lifecycle (docs/resilience.md step 3): it names the lost node (by name
+/// or id) and carries BOTH MB figures.
+fn structured_loss_check(text: &str, node_name: &str, node_id: &str) -> Result<()> {
+    if !text.contains("lost") {
+        bail!("the error does not say the node was lost: {text:?}");
+    }
+    let short_id: String = node_id.chars().take(8).collect();
+    if !(text.contains(node_name) || text.contains(&short_id)) {
+        bail!("the error does not name the lost node {node_name:?} (id {short_id}…): {text:?}");
+    }
+    let figures = count_mb_figures(text);
+    if figures < 2 {
+        bail!(
+            "the error carries {figures} MB figure(s), expected both (needs X MB, have Y MB): \
+             {text:?}"
+        );
+    }
     Ok(())
 }
 
@@ -972,6 +1858,10 @@ struct SimKnobs {
     /// Top-level `ctx_len`: the context the daemon plans and loads at (the
     /// load body carries no ctx override, so ctx moves via config+restart).
     ctx_len: Option<u32>,
+    /// `[debug] decode_delay_ms`: the engine host sleeps this long per
+    /// emitted token (docs/resilience.md sim hooks — keeps a tiny model's
+    /// stream open long enough to kill a worker mid-generation).
+    decode_delay_ms: Option<u64>,
 }
 
 impl SimKnobs {
@@ -1014,7 +1904,10 @@ fn render_sim_config(
          enable_relays = false\n\
          bind_addr = \"{mesh_host}:{mesh_port}\"\n"
     ));
-    if knobs.cap_bytes.is_some() || knobs.decode_tps_override.is_some() {
+    if knobs.cap_bytes.is_some()
+        || knobs.decode_tps_override.is_some()
+        || knobs.decode_delay_ms.is_some()
+    {
         cfg.push_str("\n[debug]\n");
         if let Some(cap) = knobs.cap_bytes {
             cfg.push_str(&format!("usable_memory_override_bytes = {cap}\n"));
@@ -1023,6 +1916,9 @@ fn render_sim_config(
             // {:?} keeps the decimal point (`100.0`), which TOML requires
             // for a float value.
             cfg.push_str(&format!("decode_tps_override = {decode:?}\n"));
+        }
+        if let Some(delay) = knobs.decode_delay_ms {
+            cfg.push_str(&format!("decode_delay_ms = {delay}\n"));
         }
     }
     cfg
@@ -1238,11 +2134,18 @@ fn restart_with(node: &Node, mesh_port: u16, netem: bool, knobs: SimKnobs) -> Re
         }
         std::thread::sleep(POLL_INTERVAL);
     }
+    start_with(node, mesh_port, netem, knobs)
+}
+
+/// Write the sandbox config and start a daemon that is NOT currently
+/// running (a fresh node, or one that was killed -9 / stopped) — the
+/// bottom half of [`restart_with`], and the chaos section's revive path.
+fn start_with(node: &Node, mesh_port: u16, netem: bool, knobs: SimKnobs) -> Result<()> {
     write_config(node, mesh_port, netem, knobs)?;
     let out = node.onebrain(&["up"])?;
     node.wait_healthy().map_err(|e| {
         anyhow!(
-            "{e:#}\n`onebrain up` (restart) exit code {:?}\nstdout: {}\nstderr: {}",
+            "{e:#}\n`onebrain up` exit code {:?}\nstdout: {}\nstderr: {}",
             out.status.code(),
             String::from_utf8_lossy(&out.stdout).trim(),
             String::from_utf8_lossy(&out.stderr).trim()
@@ -1601,6 +2504,7 @@ mod tests {
                 cap_bytes: Some(546_692_864),
                 decode_tps_override: Some(100.0),
                 ctx_len: Some(16384),
+                ..SimKnobs::default()
             },
         );
         // ctx_len is a top-level key: it must precede the [mesh] table.
@@ -2092,6 +2996,174 @@ onebrain 4242 user   11u  IPv4 0xdeadbeef      0t0  TCP 10.0.0.5:52001->1.2.3.4:
             .to_string();
         assert!(err.contains("unexpected loopback listener"), "got: {err}");
         check_listeners(&[api, extra], 7, 1000, "A", true).unwrap();
+    }
+
+    // ---- M5 chaos helpers ------------------------------------------------
+
+    fn content_chunk(piece: &str) -> String {
+        serde_json::json!({
+            "choices": [{ "index": 0, "delta": { "content": piece }, "finish_reason": null }]
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn stream_watch_kill_window_fires_once_at_the_third_chunk() {
+        let mut w = StreamWatch::new(3);
+        let role = serde_json::json!({
+            "choices": [{ "index": 0, "delta": { "role": "assistant" }, "finish_reason": null }]
+        })
+        .to_string();
+        assert_eq!(w.observe(&role), StreamAction::Continue);
+        assert_eq!(w.observe(&content_chunk("Once")), StreamAction::Continue);
+        assert_eq!(w.observe(&content_chunk(" upon")), StreamAction::Continue);
+        // Empty content chunks do not count toward the kill window.
+        assert_eq!(w.observe(&content_chunk("")), StreamAction::Continue);
+        assert_eq!(w.observe(&content_chunk(" a")), StreamAction::KillNow);
+        assert_eq!(w.kill_at, Some(3));
+        // Later chunks never re-trigger the kill.
+        assert_eq!(w.observe(&content_chunk(" time")), StreamAction::Continue);
+        let final_chunk = serde_json::json!({
+            "choices": [{ "index": 0, "delta": {}, "finish_reason": "length" }]
+        })
+        .to_string();
+        assert_eq!(w.observe(&final_chunk), StreamAction::Continue);
+        assert_eq!(w.observe("[DONE]"), StreamAction::Finished);
+        assert!(w.done);
+        assert_eq!(w.text(), "Once upon a time");
+        assert_eq!(w.pieces_after_kill(), 1);
+        assert_eq!(w.finish, vec!["length".to_string()]);
+        assert!(w.errors.is_empty());
+    }
+
+    #[test]
+    fn stream_watch_records_error_events_and_unparsable_payloads() {
+        let mut w = StreamWatch::new(3);
+        assert_eq!(w.observe(&content_chunk("Hi")), StreamAction::Continue);
+        let err = serde_json::json!({
+            "error": { "message": "the node 'sim-c' was lost mid-generation", "type": "api_error" }
+        })
+        .to_string();
+        assert_eq!(w.observe(&err), StreamAction::Continue);
+        assert_eq!(w.observe("not json"), StreamAction::Continue);
+        assert_eq!(w.observe("[DONE]"), StreamAction::Finished);
+        assert_eq!(w.errors.len(), 2);
+        assert!(w.errors[0].contains("lost"));
+        assert!(w.finish.is_empty());
+        // The kill window never opened; nothing counts as "after the kill".
+        assert_eq!(w.kill_at, None);
+        assert_eq!(w.pieces_after_kill(), 0);
+    }
+
+    #[test]
+    fn mb_figure_counting() {
+        // The failure-lifecycle message (docs/resilience.md step 3).
+        let contract = "the node 'sim-b' was lost mid-generation and the remaining nodes \
+                        cannot hold the model (needs 1210 MB, have 890 MB); reconnect the \
+                        node or choose a smaller model";
+        assert_eq!(count_mb_figures(contract), 2);
+        // The scheduler's DoesNotFit display (onebrain-scheduler).
+        let planning = "model needs 1210 MB pooled but the cluster has 890 MB usable; add a \
+                        node, choose a smaller quant, or lower the context length";
+        assert_eq!(count_mb_figures(planning), 2);
+        assert_eq!(count_mb_figures("no figures here"), 0);
+        assert_eq!(count_mb_figures("MB MB MB"), 0);
+        assert_eq!(count_mb_figures("5MB and 12 MB"), 2);
+        assert_eq!(count_mb_figures(""), 0);
+    }
+
+    #[test]
+    fn structured_loss_check_enforces_name_and_both_figures() {
+        let id = "deadbeefcafe0123";
+        let good = "the node 'sim-c' was lost mid-generation and the remaining nodes cannot \
+                    hold the model (needs 1210 MB, have 890 MB); reconnect the node or \
+                    choose a smaller model";
+        structured_loss_check(good, "sim-c", id).unwrap();
+        // Naming by (shortened) id instead of name is accepted too.
+        let by_id = good.replace("sim-c", "deadbeef");
+        structured_loss_check(&by_id, "sim-c", id).unwrap();
+        // Not marked as lost.
+        assert!(structured_loss_check(
+            "something else about sim-c (needs 1 MB, have 2 MB)",
+            "sim-c",
+            id
+        )
+        .is_err());
+        // Wrong node name.
+        assert!(structured_loss_check(&good.replace("sim-c", "sim-x"), "sim-c", id).is_err());
+        // Only one MB figure.
+        assert!(structured_loss_check(
+            "the node 'sim-c' was lost mid-generation (needs 1210 MB)",
+            "sim-c",
+            id
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn chaos_plan_helpers_identify_epoch_workers() {
+        let plan = serde_json::json!({
+            "epoch": 12,
+            "strategy": "PipelineParallel",
+            "assignments": [
+                {"node": "bbbb", "layers": {"start": 0, "end": 3}, "stage": 0},
+                {"node": "aaaa", "layers": {"start": 3, "end": 5}, "stage": 1}
+            ]
+        });
+        assert_eq!(plan_epoch(&plan).unwrap(), 12);
+        assert_eq!(
+            assignment_node_ids(&plan),
+            vec!["bbbb".to_string(), "aaaa".to_string()]
+        );
+        assert_eq!(
+            epoch_worker_ids(&plan, &["bbbb", "cccc"]).unwrap(),
+            vec!["bbbb".to_string()]
+        );
+        // No known worker in the plan is a loud error.
+        assert!(epoch_worker_ids(&plan, &["cccc", "dddd"]).is_err());
+        // A plan without a numeric epoch is a loud error.
+        assert!(plan_epoch(&serde_json::json!({"assignments": []})).is_err());
+        assert_distributed(&plan).unwrap();
+        assert!(assert_distributed(&serde_json::json!({
+            "strategy": "Solo",
+            "assignments": [{"node": "aaaa", "layers": {"start": 0, "end": 5}, "stage": 0}]
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn sim_config_renders_the_chaos_decode_delay() {
+        let cfg = render_sim_config(
+            "sim-a",
+            1,
+            2,
+            false,
+            SimKnobs {
+                cap_bytes: Some(1_000_000),
+                decode_delay_ms: Some(150),
+                ..SimKnobs::default()
+            },
+        );
+        assert!(cfg.contains("[debug]"));
+        assert!(cfg.contains("decode_delay_ms = 150\n"));
+        assert!(cfg.contains("usable_memory_override_bytes = 1000000\n"));
+        // The delay alone still opens the [debug] table.
+        let cfg = render_sim_config(
+            "sim-a",
+            1,
+            2,
+            false,
+            SimKnobs {
+                decode_delay_ms: Some(150),
+                ..SimKnobs::default()
+            },
+        );
+        assert!(cfg.contains("[debug]\ndecode_delay_ms = 150\n"));
+        // And stays out entirely when unset (the M3/M4 configs).
+        assert!(
+            !render_sim_config("sim-a", 1, 2, false, SimKnobs::default())
+                .contains("decode_delay_ms")
+        );
     }
 
     #[test]
