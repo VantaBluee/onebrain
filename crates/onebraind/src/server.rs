@@ -290,26 +290,45 @@ async fn drive_load(state: Arc<InternalState>, body: LoadBody, tx: LineSender) {
         .await;
         return;
     };
-    let peers = match state.mesh.peers().await {
-        Ok(p) => p,
-        Err(e) => {
-            emit_error(&tx, e.to_string()).await;
-            return;
-        }
-    };
     // Workers eligible for this plan: connected peers that reported a
     // budget via NodeStatus, in the mesh's (name-sorted, deterministic)
-    // order.
-    let workers: Vec<NodeBudget> = peers
-        .iter()
-        .filter(|p| p.state == PeerState::Connected)
-        .filter_map(|p| {
-            p.usable_memory_bytes.map(|bytes| NodeBudget {
-                node: NodeId(p.id.clone()),
-                usable_memory_bytes: bytes,
-            })
-        })
-        .collect();
+    // order. A peer can be Connected before its NodeStatus lands (heartbeat
+    // and control streams race — observed on slow CI runners when a load
+    // follows pairing within milliseconds), so wait briefly for budgets of
+    // connected peers instead of silently planning without them.
+    let budget_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let workers: Vec<NodeBudget> = loop {
+        let peers = match state.mesh.peers().await {
+            Ok(p) => p,
+            Err(e) => {
+                emit_error(&tx, e.to_string()).await;
+                return;
+            }
+        };
+        let connected: Vec<_> = peers
+            .iter()
+            .filter(|p| p.state == PeerState::Connected)
+            .collect();
+        let missing = connected.iter().any(|p| p.usable_memory_bytes.is_none());
+        if !missing || std::time::Instant::now() >= budget_deadline {
+            if missing {
+                tracing::warn!(
+                    "planning without budgets from some connected peers \
+                     (NodeStatus never arrived); they are excluded from this plan"
+                );
+            }
+            break connected
+                .into_iter()
+                .filter_map(|p| {
+                    p.usable_memory_bytes.map(|bytes| NodeBudget {
+                        node: NodeId(p.id.clone()),
+                        usable_memory_bytes: bytes,
+                    })
+                })
+                .collect();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    };
     let header_path = local.path.clone();
     let n_layers =
         match tokio::task::spawn_blocking(move || crate::cluster::gguf_layer_count(&header_path))

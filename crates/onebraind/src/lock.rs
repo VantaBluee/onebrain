@@ -59,6 +59,20 @@ impl Drop for DaemonLock {
     }
 }
 
+/// Whether the daemon lock is currently free (acquire-and-release probe).
+/// Used by `onebrain stop` to wait for the old process to fully exit —
+/// the API endpoint disappears before teardown finishes, and only the
+/// lock's release proves the next `up` can succeed.
+pub fn lock_is_free(run_dir: &Path) -> bool {
+    match DaemonLock::acquire(run_dir) {
+        Ok(guard) => {
+            drop(guard);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
 fn lock_path(run_dir: &Path) -> PathBuf {
     run_dir.join("daemon.lock")
 }

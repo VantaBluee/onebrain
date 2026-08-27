@@ -1,6 +1,8 @@
-//! `onebrain stop`: ask the daemon to shut down gracefully, then wait (5 s)
-//! for its health endpoint to disappear. Idempotent: stopping a stopped
-//! daemon reports that and succeeds.
+//! `onebrain stop`: ask the daemon to shut down gracefully, wait (5 s) for
+//! its health endpoint to disappear, then wait (10 s) for the single-
+//! instance LOCK to free — the endpoint dies early in teardown, and only
+//! the released lock proves an immediate `onebrain up` will succeed.
+//! Idempotent: stopping a stopped daemon reports that and succeeds.
 
 use std::time::{Duration, Instant};
 
@@ -47,6 +49,25 @@ pub fn run(json: bool) -> Result<(), CliError> {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         if client.status().is_err() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            return Err(CliError(format!(
+                "the daemon acknowledged shutdown but was still answering after 5s; \
+                 check `onebrain status`, and as a last resort end process {}",
+                client.state().pid
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    }
+
+    // The endpoint is gone, but teardown (engine free, mesh close, thread
+    // joins) continues for a moment; only the freed lock means the process
+    // is truly out of the way.
+    let run_dir = paths.data_dir.join("run");
+    let lock_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if onebraind::lock::lock_is_free(&run_dir) {
             if json {
                 println!("{}", serde_json::json!({ "status": "stopped" }));
             } else {
@@ -54,10 +75,10 @@ pub fn run(json: bool) -> Result<(), CliError> {
             }
             return Ok(());
         }
-        if Instant::now() >= deadline {
+        if Instant::now() >= lock_deadline {
             return Err(CliError(format!(
-                "the daemon acknowledged shutdown but was still answering after 5s; \
-                 check `onebrain status`, and as a last resort end process {}",
+                "the daemon stopped answering but its instance lock stayed held for 10s; \
+                 it may be finishing teardown — retry, or as a last resort end process {}",
                 client.state().pid
             )));
         }

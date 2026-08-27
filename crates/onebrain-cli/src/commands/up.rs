@@ -28,8 +28,43 @@ pub fn ensure_up(paths: &AppPaths) -> Result<UpOutcome, CliError> {
             });
         }
     }
-    let (child, log_path) = spawn_daemon(paths)?;
-    poll_until_healthy(paths, child, &log_path)
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let (mut child, log_path) = spawn_daemon(paths)?;
+    loop {
+        // Re-read daemon.json every attempt: the fresh daemon overwrites
+        // any stale state file once its listener binds.
+        if let Ok(client) = DaemonClient::from_paths(paths) {
+            if client.status().is_ok() {
+                return Ok(UpOutcome {
+                    client,
+                    started: true,
+                });
+            }
+        }
+        if let Ok(Some(code)) = child.try_wait() {
+            // A daemon that loses the single-instance race with a
+            // predecessor still finishing its teardown exits immediately;
+            // that resolves within moments, so respawn inside the budget
+            // instead of failing the whole `up`.
+            if Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(300));
+                let (respawned, _) = spawn_daemon(paths)?;
+                child = respawned;
+                continue;
+            }
+            return Err(CliError(format!(
+                "the daemon exited during startup ({code}); see the log at {}",
+                log_path.display()
+            )));
+        }
+        if Instant::now() >= deadline {
+            return Err(CliError(format!(
+                "the daemon did not become healthy within 10s; see the log at {}",
+                log_path.display()
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
 }
 
 pub fn run(json: bool) -> Result<(), CliError> {
@@ -154,38 +189,5 @@ fn unshare_std_handles() {
                 SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0);
             }
         }
-    }
-}
-
-fn poll_until_healthy(
-    paths: &AppPaths,
-    mut child: Child,
-    log_path: &std::path::Path,
-) -> Result<UpOutcome, CliError> {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        // Re-read daemon.json every attempt: the fresh daemon overwrites
-        // any stale state file once its listener binds.
-        if let Ok(client) = DaemonClient::from_paths(paths) {
-            if client.status().is_ok() {
-                return Ok(UpOutcome {
-                    client,
-                    started: true,
-                });
-            }
-        }
-        if let Ok(Some(code)) = child.try_wait() {
-            return Err(CliError(format!(
-                "the daemon exited during startup ({code}); see the log at {}",
-                log_path.display()
-            )));
-        }
-        if Instant::now() >= deadline {
-            return Err(CliError(format!(
-                "the daemon did not become healthy within 10s; see the log at {}",
-                log_path.display()
-            )));
-        }
-        std::thread::sleep(Duration::from_millis(200));
     }
 }

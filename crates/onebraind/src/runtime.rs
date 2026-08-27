@@ -148,10 +148,14 @@ pub fn run_blocking() -> Result<(), DaemonError> {
             // the rest; peers see a clean close instead of a timeout.
             let _ = runtime.block_on(mesh.shutdown());
             // The mesh close drops the cluster task's channels; give it a
-            // bounded window to join its worker serve threads.
+            // SHORT bounded window to join its worker serve threads. This
+            // window sits between "API endpoint gone" and "lock released",
+            // and `onebrain stop` callers immediately re-`up` — every
+            // second here is user-visible restart latency (a lingering
+            // reconnect-loop sleep must never hold the lock for 10s).
             if let Some(task) = cluster_task {
                 let _ = runtime
-                    .block_on(async { tokio::time::timeout(Duration::from_secs(10), task).await });
+                    .block_on(async { tokio::time::timeout(Duration::from_secs(2), task).await });
             }
             served
         }
