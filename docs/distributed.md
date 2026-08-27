@@ -21,10 +21,16 @@ listener exists anywhere**, verified by a socket-scan test.
   disabled in M3); pump bytes 1:1 between the other end and the mesh
   stream. Serve returns when the stream closes → session over, thread
   joins.
-- **Head side** (per remote node in the plan): open an `rpc` stream to the
-  peer, create the same loopback pair trick in reverse (listener :0,
-  accept-once, close listener), pump, and register the endpoint with
-  `ob_rpc_add_server("127.0.0.1:<port>")` → remote devices. The RPC
+- **Head side** (per remote node in the plan): bind a loopback listener on
+  127.0.0.1:0 and **keep accepting for the epoch's lifetime**, opening one
+  fresh mesh `rpc` stream per accepted connection; register the endpoint
+  with `ob_rpc_add_server("127.0.0.1:<port>")` → remote devices. (Amended
+  from "accept-once", which failed empirically: the RPC client dials the
+  endpoint string repeatedly — a registration probe that closes instantly,
+  device-property queries during load, then the buffer/compute connection —
+  six sequential connections observed per load. The listener is loopback-
+  only, exists only while its epoch is active, and its teardown aborts all
+  in-flight pumps.) The RPC
   protocol's own HELLO (v5.1) runs inside; version skew is *pre-empted* by
   our engine-build-hash handshake at mesh connect (identical builds ⇒
   identical RPC protocol), so the silent-vanish failure mode upstream has
@@ -69,8 +75,12 @@ M3 — weights flow through RPC set_tensor from the head, see ADR 0004) →
 epoch active → open rpc streams → `ob_model_load_with_devices`. Any nack
 or timeout (15 s) aborts activation with a typed error naming the node.
 Workers fence: streams and ops for epochs ≠ active are rejected (close 4).
-Epoch teardown (new plan, `stop`, model unload) closes rpc streams first,
-then frees the model.
+Epoch teardown (new plan, `stop`, model unload) is role-asymmetric: the
+**head frees the model first** — freeing sends remote FREE_BUFFER commands
+over the still-standing bridges, and GGML aborts the process on a torn
+stream — then closes bridges and streams. Workers keep the contract order:
+their serve sessions end when the streams close, then threads join.
+(Amended: the original "close streams first" wording was head-unsafe.)
 
 ## Engine surface additions (shim + safe wrappers)
 
@@ -113,9 +123,10 @@ then frees the model.
      the same prompt** (the correctness property of §9).
   2. **Auto-solo**: uncapped → plan is Solo, no rpc streams opened
      (assert via status + socket scan).
-  3. **Socket scan**: while a distributed generation runs, enumerate
-     listening TCP sockets of every daemon pid: none on non-loopback
-     interfaces, and no loopback listener persists post-handshake.
+  3. **Socket scan**: enumerate listening TCP sockets of every daemon pid.
+     Non-loopback listeners are forbidden at all times. While a distributed
+     session is active, the head's per-epoch loopback bridge listener is
+     expected; once the session ends, only the api binds may remain.
   4. `--nodes 2` on the uncapped pair forces distribution; `--explain`
      lines present in both modes.
 - Linux CI leg reuses the netem namespace machinery from pair-sim at

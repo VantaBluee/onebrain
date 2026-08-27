@@ -2642,6 +2642,7 @@ dependencies = [
  "onebrain-mesh",
  "onebrain-models",
  "onebrain-proto",
+ "onebrain-scheduler",
  "reqwest",
  "serde",
  "serde_json",

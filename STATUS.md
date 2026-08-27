@@ -94,10 +94,41 @@ fmt, clippy, tests, CPU smoke inference with a tiny GGUF on all three OSes;
 - [ ] Windows CI e2e SSE timeout under diagnosis (daemon-log dump now
       wired into the harness for the next run)
 
+## M3 — Distributed inference v1 (implementation complete; CI proof pending)
+
+- [x] Engine substrate: vendored llama.cpp patched (additive ~84 lines,
+      `patches/0001-rpc-serve-fd.patch`, upstreaming note) so GGML RPC
+      sessions run over caller-owned sockets — no listener anywhere;
+      GGML_RPC on, RDMA negotiation off
+- [x] Engine surface: `ob_rpc_serve_fd` / `RemoteServer` registration /
+      `Model::load_distributed` with explicit devices + tensor_split; the
+      in-process loopback test proves distributed greedy tokens ==
+      solo ground truth
+- [x] Scheduler v1-lite: auto-solo short-circuit, memory-proportional
+      contiguous ranges (largest-remainder, zero-layer drop), `--nodes`,
+      `--explain` prose with binding-constraint naming
+- [x] Mesh typed streams (`StreamHeader{kind, epoch}`), NodeStatus budgets,
+      epoch fencing (close code 4), plan proposal/ack over control streams
+- [x] Daemon orchestration: worker ServeShard (socketpair + serve thread
+      per rpc stream), head accept-loop bridges (one mesh stream per RPC
+      client connection — empirical fix over the contracted accept-once,
+      recorded in docs + ADR 0004), role-correct teardown ordering
+- [x] Restart resilience found + fixed en route (M2 DoD hardening):
+      persisted peer addressing + reconnect loop with backoff; pinned
+      `[mesh] bind_addr` config; integration-tested
+- [x] `cargo xtask sim`: distribute (auto-engage) → socket scans →
+      byte-identical §9 correctness vs solo → forced `--nodes 2`; wired
+      into CI on all three OSes + the Linux netem leg
+- [ ] Sim green on macOS + Linux via CI
+- [ ] Manual two-machine checklists (Mac+Windows, Mac+Linux) — documented,
+      to run when hardware is available (recorded here per the M3 DoD)
+- [ ] Shard-only weight fetch deferred to M6 by design (ADR 0004: GGML RPC
+      is head-push; M6 pre-seeds worker tensor caches for transfer economy)
+
 ## Upcoming
-- **M3 — Distributed inference v1** (pipeline split over authed mesh)
-- M4 scheduler v1 · M5 resilience · M6 model logistics · M7 performance ·
-  M8 product polish. Details in the spec.
+- **M4 — Scheduler v1** (contract drafted: docs/scheduler-v1.md) ·
+  M5 resilience · M6 model logistics · M7 performance · M8 product polish.
+  Details in the spec.
 
 ## Dev environment notes (this machine: Windows 11)
 

@@ -10,6 +10,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 M0 (skeleton & CI) complete locally; M1 (excellent single-node) implemented,
 cross-OS CI proof in flight.
 
+### Added — M3
+
+- Distributed inference v1: pipeline layer-split across paired nodes with
+  GGML RPC tunneled through the authenticated mesh — no TCP listener is
+  ever exposed (socket-scan-asserted); a minimal additive vendor patch
+  (`patches/0001`) serves RPC sessions over caller-owned sockets.
+- Auto-solo placement: models that fit one node never distribute; `onebrain
+  run --nodes N` forces a split and `--explain` prints why the plan looks
+  the way it does, node by node.
+- Plan epochs end-to-end: proposals, acks, fencing of stale epochs, and
+  clean teardown; workers preempt local models to serve shards.
+- Correctness proof in CI: distributed greedy generation is byte-identical
+  to single-node output on the same prompt (`cargo xtask sim`, all OSes,
+  plus a netem-shaped Linux leg).
+- Paired daemons now reconnect after restarts: peer addresses persist in
+  the store and a backoff reconnect loop re-forms links without re-pairing;
+  `[mesh] bind_addr` can pin the mesh port.
+
 ### Added — M2
 
 - Mesh & pairing on iroh: per-device Ed25519 identities, `onebrain pair`
