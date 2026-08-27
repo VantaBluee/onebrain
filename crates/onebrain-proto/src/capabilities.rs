@@ -25,9 +25,9 @@ impl Capabilities {
 
     /// The capabilities this build of OneBrain implements.
     pub fn current() -> Self {
-        // M0: no distributed features are implemented yet; bits light up as
-        // milestones land so that mixed-version clusters degrade gracefully.
-        Capabilities(0)
+        // Bits light up as milestones land so that mixed-version clusters
+        // degrade gracefully. M3: pipeline-parallel inference.
+        Capabilities(Self::PIPELINE_PARALLEL)
     }
 
     pub fn supports(&self, bit: u64) -> bool {
