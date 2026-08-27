@@ -154,8 +154,8 @@ pub fn run(netem: bool) -> Result<()> {
     // Node::new wrote the plain pair-sim config; overwrite with the same
     // switches PLUS the memory cap and pinned mesh port before the daemons
     // ever start.
-    write_config(&a, mesh_a, Some(cap))?;
-    write_config(&b, mesh_b, Some(cap))?;
+    write_config(&a, mesh_a, netem, Some(cap))?;
+    write_config(&b, mesh_b, netem, Some(cap))?;
     println!(
         "sandbox A: {} (api {port_a}, mesh {mesh_a})",
         a.home.display()
@@ -165,7 +165,7 @@ pub fn run(netem: bool) -> Result<()> {
         b.home.display()
     );
 
-    let outcome = scenario(&a, &b, &model_path, mesh_a, mesh_b);
+    let outcome = scenario(&a, &b, &model_path, mesh_a, mesh_b, netem);
     if outcome.is_err() {
         dump_daemon_log(&a.home);
         dump_daemon_log(&b.home);
@@ -178,7 +178,14 @@ pub fn run(netem: bool) -> Result<()> {
 
 /// The whole rehearsal. Steps abort on first failure (later ones depend on
 /// earlier ones); `cleanup` runs in `run` regardless.
-fn scenario(a: &Node, b: &Node, model_path: &Path, mesh_a: u16, mesh_b: u16) -> Result<()> {
+fn scenario(
+    a: &Node,
+    b: &Node,
+    model_path: &Path,
+    mesh_a: u16,
+    mesh_b: u16,
+    netem: bool,
+) -> Result<()> {
     let model_arg = model_path
         .to_str()
         .context("model path is not valid UTF-8")?;
@@ -257,7 +264,7 @@ fn scenario(a: &Node, b: &Node, model_path: &Path, mesh_a: u16, mesh_b: u16) -> 
             // Head first: its epoch teardown closes the rpc streams before the
             // worker goes away, so nothing tears mid-session.
             for (node, mesh_port) in [(a, mesh_a), (b, mesh_b)] {
-                restart_uncapped(node, mesh_port)?;
+                restart_uncapped(node, mesh_port, netem)?;
             }
             wait_connected(a, b, &peer_a, &peer_b, "after the uncapped restart")
         },
@@ -333,10 +340,20 @@ fn scheduler_budget(usable: u64) -> u64 {
 /// `[debug]` memory-cap knob when capping (docs/distributed.md, test-only:
 /// the value reported in NodeStatus / used by the head for itself; it never
 /// touches real allocation).
-fn render_sim_config(name: &str, port: u16, mesh_port: u16, cap_bytes: Option<u64>) -> String {
+fn render_sim_config(
+    name: &str,
+    port: u16,
+    mesh_port: u16,
+    netem: bool,
+    cap_bytes: Option<u64>,
+) -> String {
     // The mesh UDP port is pinned so peers' stored addresses stay valid
     // across the restart scenario (with mDNS/relays off there is no other
-    // way for a restarted daemon to be found).
+    // way for a restarted daemon to be found). Under netem each daemon
+    // lives in its own namespace whose loopback is ISOLATED — the mesh
+    // must bind all interfaces so the veth address carries the traffic;
+    // loopback-only is fine (and tighter) on a shared host.
+    let mesh_host = if netem { "0.0.0.0" } else { "127.0.0.1" };
     let mut cfg = format!(
         "node_name = \"{name}\"\n\
          api_bind = \"127.0.0.1:{port}\"\n\
@@ -344,7 +361,7 @@ fn render_sim_config(name: &str, port: u16, mesh_port: u16, cap_bytes: Option<u6
          [mesh]\n\
          enable_mdns = false\n\
          enable_relays = false\n\
-         bind_addr = \"127.0.0.1:{mesh_port}\"\n"
+         bind_addr = \"{mesh_host}:{mesh_port}\"\n"
     );
     if let Some(cap) = cap_bytes {
         cfg.push_str(&format!(
@@ -354,11 +371,11 @@ fn render_sim_config(name: &str, port: u16, mesh_port: u16, cap_bytes: Option<u6
     cfg
 }
 
-fn write_config(node: &Node, mesh_port: u16, cap_bytes: Option<u64>) -> Result<()> {
+fn write_config(node: &Node, mesh_port: u16, netem: bool, cap_bytes: Option<u64>) -> Result<()> {
     let path = node.home.join("config").join("config.toml");
     std::fs::write(
         &path,
-        render_sim_config(node.name, node.port, mesh_port, cap_bytes),
+        render_sim_config(node.name, node.port, mesh_port, netem, cap_bytes),
     )
     .with_context(|| format!("writing {}", path.display()))
 }
@@ -544,7 +561,7 @@ fn ollama_streams(node: &Node, model: &str) -> Result<()> {
 }
 
 /// Stop, rewrite the config without the cap, start again, wait healthy.
-fn restart_uncapped(node: &Node, mesh_port: u16) -> Result<()> {
+fn restart_uncapped(node: &Node, mesh_port: u16, netem: bool) -> Result<()> {
     let out = node.onebrain(&["stop"])?;
     if !out.status.success() {
         bail!(
@@ -563,7 +580,7 @@ fn restart_uncapped(node: &Node, mesh_port: u16) -> Result<()> {
         }
         std::thread::sleep(POLL_INTERVAL);
     }
-    write_config(node, mesh_port, None)?;
+    write_config(node, mesh_port, netem, None)?;
     let out = node.onebrain(&["up"])?;
     node.wait_healthy().map_err(|e| {
         anyhow!(
@@ -870,7 +887,7 @@ mod tests {
 
     #[test]
     fn sim_config_caps_only_when_asked() {
-        let capped = render_sim_config("sim-a", 12345, 23456, Some(830_000));
+        let capped = render_sim_config("sim-a", 12345, 23456, false, Some(830_000));
         assert!(capped.contains("node_name = \"sim-a\""));
         assert!(capped.contains("api_bind = \"127.0.0.1:12345\""));
         assert!(capped.contains("enable_mdns = false"));
@@ -881,7 +898,7 @@ mod tests {
         // Top-level keys stay above the tables (TOML validity).
         assert!(capped.find("node_name").unwrap() < capped.find("[mesh]").unwrap());
 
-        let uncapped = render_sim_config("sim-b", 1, 2, None);
+        let uncapped = render_sim_config("sim-b", 1, 2, false, None);
         assert!(!uncapped.contains("[debug]"));
         assert!(!uncapped.contains("usable_memory_override_bytes"));
         // The pinned mesh port survives the uncapped rewrite (restart
