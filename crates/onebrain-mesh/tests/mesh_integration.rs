@@ -202,7 +202,16 @@ async fn wrong_code_burns_an_attempt_and_leaves_stores_empty() {
         .await
         .expect("correct code pairs after a burned attempt");
     assert_eq!(info.name, "host-node");
-    assert_eq!(host.peers().await.unwrap().len(), 1);
+    // The joiner's return races the host's own store write by a few ms
+    // (the host persists on its pairing task); poll instead of asserting
+    // instantly.
+    wait_for_peer(
+        &host,
+        "host persists the joiner after the successful attempt",
+        Duration::from_secs(10),
+        |p| p.name == "joiner-node",
+    )
+    .await;
 
     host.shutdown().await.unwrap();
     joiner.shutdown().await.unwrap();
