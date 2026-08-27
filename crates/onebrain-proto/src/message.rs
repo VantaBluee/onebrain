@@ -91,9 +91,26 @@ pub enum Message {
     /// budget against. `usable_memory_bytes` is measured free memory of the
     /// chosen device minus a fixed OS reserve — never total RAM (§3
     /// auto-solo rule). Gated on the `PIPELINE_PARALLEL` capability bit.
+    ///
+    /// M4 (`PROTO_VERSION` 2) added the microbench profile fields in place —
+    /// an exception to the "new fields need a new message kind" rule that is
+    /// legal because the engine build-hash gate guarantees both ends of any
+    /// cluster run the same build (docs/scheduler-v1.md); the version bump
+    /// keeps the handshake refusal message truthful for genuinely mixed
+    /// builds. `None` means the node has not run its profile yet (the
+    /// scheduler then falls back to memory-only weighting).
     NodeStatus {
         usable_memory_bytes: u64,
         devices: Vec<DeviceBrief>,
+        /// Measured prefill throughput (tokens/sec) from the compute
+        /// microbench, if profiled.
+        prefill_tps: Option<f64>,
+        /// Measured decode throughput (tokens/sec) from the compute
+        /// microbench, if profiled.
+        decode_tps: Option<f64>,
+        /// Measured sequential disk read rate (MB/s), if profiled. An upper
+        /// bound (OS page cache); used only for relative ordering.
+        disk_mbps: Option<f64>,
     },
 }
 
@@ -159,6 +176,9 @@ mod tests {
                     total_bytes: 32 << 30,
                 },
             ],
+            prefill_tps: Some(812.5),
+            decode_tps: Some(41.25),
+            disk_mbps: Some(1732.0),
         });
         let bytes = crate::encode(&env).unwrap();
         let back: Envelope = crate::decode(&bytes).unwrap();
@@ -166,11 +186,47 @@ mod tests {
             Message::NodeStatus {
                 usable_memory_bytes,
                 devices,
+                prefill_tps,
+                decode_tps,
+                disk_mbps,
             } => {
                 assert_eq!(usable_memory_bytes, 12 << 30);
                 assert_eq!(devices.len(), 2);
                 assert_eq!(devices[0].kind, "cuda");
                 assert_eq!(devices[1].free_bytes, 20 << 30);
+                assert_eq!(prefill_tps, Some(812.5));
+                assert_eq!(decode_tps, Some(41.25));
+                assert_eq!(disk_mbps, Some(1732.0));
+            }
+            other => panic!("expected NodeStatus, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn node_status_roundtrip_unprofiled() {
+        // A node that has not run its microbench yet reports None for every
+        // profile field; the scheduler treats that as memory-only weighting.
+        let env = Envelope::new(Message::NodeStatus {
+            usable_memory_bytes: 8 << 30,
+            devices: vec![],
+            prefill_tps: None,
+            decode_tps: None,
+            disk_mbps: None,
+        });
+        let bytes = crate::encode(&env).unwrap();
+        let back: Envelope = crate::decode(&bytes).unwrap();
+        match back.message {
+            Message::NodeStatus {
+                usable_memory_bytes,
+                prefill_tps,
+                decode_tps,
+                disk_mbps,
+                ..
+            } => {
+                assert_eq!(usable_memory_bytes, 8 << 30);
+                assert_eq!(prefill_tps, None);
+                assert_eq!(decode_tps, None);
+                assert_eq!(disk_mbps, None);
             }
             other => panic!("expected NodeStatus, got {other:?}"),
         }

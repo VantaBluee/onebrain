@@ -18,7 +18,16 @@ pub const PRODUCT_NAME: &str = "OneBrain";
 /// Wire protocol version. Bumped on any breaking change to the types in this
 /// crate. Nodes with different protocol versions refuse to form a cluster and
 /// tell the user which node to update (see `handshake`).
-pub const PROTO_VERSION: u16 = 1;
+///
+/// History:
+/// - `1` — M0–M3: handshake, pairing, plans, heartbeats, `NodeStatus`
+///   (memory + devices), tunneled engine frames.
+/// - `2` — M4: `NodeStatus` gained `prefill_tps`, `decode_tps`, and
+///   `disk_mbps` in place (docs/scheduler-v1.md). An in-place field change
+///   is legal here because the engine build-hash gate already forces every
+///   cluster to be same-build; this bump exists so the refusal message
+///   stays truthful when genuinely mixed builds meet.
+pub const PROTO_VERSION: u16 = 2;
 
 /// Errors produced while encoding or decoding protocol messages.
 #[derive(Debug, thiserror::Error)]

@@ -1,21 +1,50 @@
 //! Placement: decide which layers run on which nodes.
 //!
-//! M3 ships scheduler v1-lite per `docs/distributed.md`: the auto-solo
-//! short-circuit (§1.4 — if the model fits one node's usable memory, never
-//! distribute), and otherwise pipeline-parallel contiguous layer ranges
-//! proportional to usable memory over `[workers..., head]` — head last, so
-//! the head owns the tail layers and sampling stays local. Full v1 (compute
-//! scores, real KV accounting, link-aware boundaries) is M4; the prima.cpp
-//! style cost-model search is M7.
+//! M4 ships scheduler v1 proper per the binding contract in
+//! `docs/scheduler-v1.md`:
 //!
-//! # Memory budgeting (M3 rule)
+//! - [`profile`] — the real [`profile::ComputeProfile`] producer (compute
+//!   microbench + disk probe) and `profile.toml` persistence;
+//! - [`dims`] — [`ModelDims`]: per-layer weight bytes and the KV growth
+//!   rate from the GGUF header ([`model_dims`]);
+//! - [`v1`] — [`plan_v1`]: KV budgeting at the requested context,
+//!   memory-and-compute layer shares, boundary-on-fastest-link stage
+//!   ordering, and the ≥5% third-node rule.
+//!
+//! The prima.cpp-style cost-model search is M7.
+//!
+//! # The M3 compatibility path ([`plan`] / [`PlanInput`])
+//!
+//! [`plan`] keeps the M3 "v1-lite" behavior *unchanged* (flat 85% ceiling,
+//! memory-only proportions — the rules below) because its caller
+//! (`onebraind`) still builds the M3-shaped [`PlanInput`] and the cluster
+//! sim's memory caps are calibrated against the 85% rule. The M4
+//! integration phase switches `onebraind` to [`plan_v1`] with a real
+//! [`PlanRequest`]; [`PlanRequest`] implements `From<&PlanInput>` for the
+//! transition (with the documented caveats on synthesized dims). Once that
+//! lands, [`plan`] and the ceiling go away.
+//!
+//! # Memory budgeting (M3 rule, compat path only)
 //!
 //! KV-cache and runtime overhead are modeled by a flat utilization ceiling:
 //! a node's *budget* is 85% of its reported `usable_memory_bytes`; the 15%
 //! reserve stands in for KV at the requested context length plus engine
-//! overhead. Real per-range KV accounting at `ctx_len` replaces this in M4.
-//! `ctx_len` is therefore recorded in the plan but does not yet influence
-//! placement.
+//! overhead. `ctx_len` is recorded in the plan but does not influence this
+//! path; [`plan_v1`] does the real KV accounting.
+
+pub mod dims;
+pub mod profile;
+pub mod v1;
+
+pub use dims::{model_dims, ModelDims};
+pub use profile::{
+    load_profile, measure_compute, measure_disk, save_profile, ComputeProfile, ProfileError,
+    StoredProfile,
+};
+pub use v1::{
+    node_budget, node_layer_capacity, plan_v1, LinkRtt, NodeCaps, PlanRequest, ADDED_NODE_TPT_GAIN,
+    DEFAULT_LINK_RTT_MS, EXACT_ORDER_MAX_NODES, OVERHEAD_RESERVE_BYTES,
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -41,6 +70,16 @@ pub enum ScheduleError {
          plus this one); pair more devices with `onebrain pair` or lower --nodes"
     )]
     NotEnoughNodes { requested: u32, available: u32 },
+    #[error(
+        "the model's GGUF header is missing {key}, so its memory footprint cannot be \
+         computed; the file may be corrupt — re-download it with `onebrain pull`"
+    )]
+    MissingMetadata { key: String },
+    #[error(
+        "cannot derive the model's dimensions from its GGUF header: {detail}; re-download \
+         the model with `onebrain pull`"
+    )]
+    BadModel { detail: String },
 }
 
 /// A node's measured capabilities, filled by pairing-time profiling and
@@ -118,16 +157,21 @@ fn budget(usable_memory_bytes: u64) -> u64 {
     (usable_memory_bytes as u128 * UTILIZATION_CEILING_PCT as u128 / 100) as u64
 }
 
-fn mb_ceil(bytes: u64) -> u64 {
+pub(crate) fn mb_ceil(bytes: u64) -> u64 {
     bytes.div_ceil(MIB)
 }
 
-fn mb_floor(bytes: u64) -> u64 {
+pub(crate) fn mb_floor(bytes: u64) -> u64 {
     bytes / MIB
 }
 
 /// Compute a placement per the M3 v1-lite rules (see module docs and
 /// `docs/distributed.md` "Placement").
+///
+/// This is the M3 compatibility entry point: behavior is intentionally
+/// unchanged (85% ceiling, memory-only shares) so existing callers and the
+/// sim's calibrated memory caps keep working until the integration phase
+/// switches them to [`plan_v1`] — which is the real M4 scheduler.
 pub fn plan(input: &PlanInput) -> Result<PlannedPlacement, ScheduleError> {
     let available = input.workers.len() as u32 + 1;
     let forced = match input.forced_nodes {

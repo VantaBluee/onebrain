@@ -10,6 +10,12 @@ rust-version.workspace = true
 [dependencies]
 onebrain-proto = { workspace = true }
 onebrain-mesh = { workspace = true }
+onebrain-engine = { workspace = true }
+onebrain-models = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
+toml = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
