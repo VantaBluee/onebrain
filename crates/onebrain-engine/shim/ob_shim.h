@@ -55,6 +55,49 @@ int32_t ob_dev_info(int32_t i, char * name, size_t name_len,
                     char * desc, size_t desc_len,
                     uint64_t * free_mem, uint64_t * total_mem);
 
+// ---- distributed inference: GGML RPC over caller-owned sockets ----
+// (docs/distributed.md, ADR 0004). Sessions are tunneled through
+// authenticated mesh streams by the daemon; nothing here binds or listens.
+
+// Serve exactly one GGML RPC session over an already-connected socket
+// (Unix fd / Windows SOCKET, widened to long long). Blocks the calling
+// thread until the peer closes the connection; the socket is closed before
+// returning, so ownership of the handle transfers here. `dev_index` selects
+// the serving device from the ob_dev_* enumeration; `n_threads` must be
+// >= 1. The RPC tensor cache stays disabled in M3 (ADR 0004). Returns 0
+// after a served session, or -1 on invalid arguments — the socket is closed
+// on that path too, so the bridging peer sees EOF instead of a hang.
+int32_t ob_rpc_serve_fd(long long fd, int32_t n_threads, int32_t dev_index);
+
+// Register a remote RPC server endpoint ("host:port"). Returns a slot
+// handle >= 0, -1 when the endpoint is unreachable or spoke a different
+// protocol (an engine version mismatch is indistinguishable from connect
+// failure here; the mesh build-hash handshake pre-empts it), or -2 when the
+// slot table (GGML_RPC_MAX_SERVERS) is full. Re-registering an endpoint
+// string returns its existing slot; the underlying registration lives for
+// the process (upstream caches it), so new epochs should bridge through
+// fresh ephemeral ports. NOT thread-safe against itself — the Rust wrapper
+// serializes calls.
+int32_t ob_rpc_add_server(const char * endpoint);
+
+// Number of devices exposed by a registered server slot, or -1 for an
+// invalid slot. Cheap: counts were fetched at registration.
+int32_t ob_rpc_server_device_count(int32_t slot);
+
+// Load a model across an explicit device list: each slot's remote devices
+// in slots[] order, then — when use_local_device — the best local device
+// (GPU, else integrated GPU, else CPU). tensor_split[i] is the layer
+// proportion for device i in that order; n_split must equal the total
+// device count (NULL/0 lets llama.cpp probe free memory instead, which is
+// a live network round trip per remote device — never do that from
+// placement code). split_mode is always LAYER; weights are memory-mapped
+// locally and pushed to remote devices through the RPC sessions at load.
+// Returns NULL on failure.
+ob_model * ob_model_load_devices(const char * path,
+                                 const int32_t * slots, int32_t n_slots,
+                                 const float * tensor_split, int32_t n_split,
+                                 bool use_local_device, int32_t n_gpu_layers);
+
 // ---- model metadata & chat template ----
 // GGUF metadata value by key; returns length or -1 (see llama_model_meta_val_str).
 int32_t ob_model_meta(const ob_model * m, const char * key, char * buf, size_t buf_size);

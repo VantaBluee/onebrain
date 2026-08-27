@@ -64,6 +64,21 @@ extern "C" {
         total_mem: *mut u64,
     ) -> i32;
 
+    // Distributed inference (docs/distributed.md). ob_rpc_add_server is not
+    // thread-safe against itself; rpc.rs serializes registration.
+    pub fn ob_rpc_serve_fd(fd: i64, n_threads: i32, dev_index: i32) -> i32;
+    pub fn ob_rpc_add_server(endpoint: *const c_char) -> i32;
+    pub fn ob_rpc_server_device_count(slot: i32) -> i32;
+    pub fn ob_model_load_devices(
+        path: *const c_char,
+        slots: *const i32,
+        n_slots: i32,
+        tensor_split: *const f32,
+        n_split: i32,
+        use_local_device: bool,
+        n_gpu_layers: i32,
+    ) -> *mut ObModel;
+
     pub fn ob_model_meta(
         m: *const ObModel,
         key: *const c_char,

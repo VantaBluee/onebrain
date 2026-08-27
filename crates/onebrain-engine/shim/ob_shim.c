@@ -4,9 +4,19 @@
 
 #include "llama.h"
 #include "ggml-backend.h"
+#include "ggml-rpc.h"
 
 #include <stdlib.h>
 #include <string.h>
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <winsock2.h>
+#else
+#include <unistd.h>
+#endif
 
 struct ob_model {
     struct llama_model * model;
@@ -256,6 +266,156 @@ int32_t ob_dev_info(int32_t i, char * name, size_t name_len,
         *total_mem = (uint64_t) total_b;
     }
     return (int32_t) ggml_backend_dev_type(dev);
+}
+
+// ---- distributed inference: GGML RPC over caller-owned sockets ----
+
+static void ob_close_raw_socket(long long fd) {
+#ifdef _WIN32
+    closesocket((SOCKET) fd);
+#else
+    close((int) fd);
+#endif
+}
+
+int32_t ob_rpc_serve_fd(long long fd, int32_t n_threads, int32_t dev_index) {
+    if (n_threads < 1 || dev_index < 0 || (size_t) dev_index >= ggml_backend_dev_count()) {
+        // Close the socket so the bridging peer sees EOF instead of a hang.
+        ob_close_raw_socket(fd);
+        return -1;
+    }
+    ggml_backend_dev_t devices[1] = { ggml_backend_dev_get((size_t) dev_index) };
+    // cache_dir stays NULL until M6 wires the reaper + pre-seeding (ADR 0004).
+    ggml_backend_rpc_serve_fd(fd, /*cache_dir=*/NULL, (size_t) n_threads, 1, devices);
+    return 0;
+}
+
+// Registered remote servers. Slots are never reused within a process;
+// upstream caches registrations per endpoint string for the process
+// lifetime anyway (ggml-rpc.cpp reg_map), so a slot handle can stay a plain
+// index. Registration is serialized by the Rust wrapper.
+static ggml_backend_reg_t ob_rpc_servers[GGML_RPC_MAX_SERVERS];
+static int32_t ob_rpc_servers_len = 0;
+
+int32_t ob_rpc_add_server(const char * endpoint) {
+    if (endpoint == NULL) {
+        return -1;
+    }
+    ggml_backend_reg_t reg = ggml_backend_rpc_add_server(endpoint);
+    if (reg == NULL) {
+        return -1;
+    }
+    // The same endpoint string returns the same cached reg: keep slots
+    // idempotent instead of burning table entries.
+    for (int32_t i = 0; i < ob_rpc_servers_len; i++) {
+        if (ob_rpc_servers[i] == reg) {
+            return i;
+        }
+    }
+    if (ob_rpc_servers_len >= GGML_RPC_MAX_SERVERS) {
+        return -2;
+    }
+    ob_rpc_servers[ob_rpc_servers_len] = reg;
+    return ob_rpc_servers_len++;
+}
+
+int32_t ob_rpc_server_device_count(int32_t slot) {
+    if (slot < 0 || slot >= ob_rpc_servers_len) {
+        return -1;
+    }
+    return (int32_t) ggml_backend_reg_dev_count(ob_rpc_servers[slot]);
+}
+
+ob_model * ob_model_load_devices(const char * path,
+                                 const int32_t * slots, int32_t n_slots,
+                                 const float * tensor_split, int32_t n_split,
+                                 bool use_local_device, int32_t n_gpu_layers) {
+    if (path == NULL || n_slots < 0 || (n_slots > 0 && slots == NULL)) {
+        return NULL;
+    }
+    const size_t max_devices = llama_max_devices();
+
+    // devices[] is NULL-terminated per llama_model_params; tensor_split is
+    // read to llama_max_devices() entries by the loader, so allocate both
+    // at that size.
+    ggml_backend_dev_t * devices =
+        calloc(max_devices + 1, sizeof(ggml_backend_dev_t));
+    float * split = calloc(max_devices, sizeof(float));
+    if (devices == NULL || split == NULL) {
+        free(devices);
+        free(split);
+        return NULL;
+    }
+
+    size_t n_devices = 0;
+    bool ok = true;
+    for (int32_t i = 0; ok && i < n_slots; i++) {
+        int32_t slot = slots[i];
+        if (slot < 0 || slot >= ob_rpc_servers_len) {
+            ok = false;
+            break;
+        }
+        ggml_backend_reg_t reg = ob_rpc_servers[slot];
+        size_t count = ggml_backend_reg_dev_count(reg);
+        for (size_t d = 0; d < count; d++) {
+            if (n_devices >= max_devices) {
+                ok = false;
+                break;
+            }
+            devices[n_devices++] = ggml_backend_reg_dev_get(reg, d);
+        }
+    }
+    if (ok && use_local_device) {
+        ggml_backend_dev_t local = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+        if (local == NULL) {
+            local = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU);
+        }
+        if (local == NULL) {
+            local = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        }
+        if (local == NULL || n_devices >= max_devices) {
+            ok = false;
+        } else {
+            devices[n_devices++] = local;
+        }
+    }
+    // The placement contract: tensor_split entries map 1:1 onto devices[].
+    if (n_devices == 0 || (n_split > 0 && (size_t) n_split != n_devices)) {
+        ok = false;
+    }
+    if (!ok) {
+        free(devices);
+        free(split);
+        return NULL;
+    }
+    devices[n_devices] = NULL;
+
+    struct llama_model_params params = llama_model_default_params();
+    params.devices = devices;
+    params.n_gpu_layers = n_gpu_layers;
+    params.split_mode = LLAMA_SPLIT_MODE_LAYER;
+    if (n_split > 0) {
+        memcpy(split, tensor_split, (size_t) n_split * sizeof(float));
+        params.tensor_split = split;
+    }
+
+    struct llama_model * model = llama_model_load_from_file(path, params);
+    // The loader copies both arrays (devices into model->devices,
+    // tensor_split into the model's owned vector) before returning.
+    free(devices);
+    free(split);
+    if (model == NULL) {
+        return NULL;
+    }
+
+    ob_model * m = calloc(1, sizeof(ob_model));
+    if (m == NULL) {
+        llama_model_free(model);
+        return NULL;
+    }
+    m->model = model;
+    m->vocab = llama_model_get_vocab(model);
+    return m;
 }
 
 int32_t ob_model_meta(const ob_model * m, const char * key, char * buf, size_t buf_size) {

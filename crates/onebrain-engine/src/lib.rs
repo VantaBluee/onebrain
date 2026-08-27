@@ -5,6 +5,7 @@
 //! load a GGUF, tokenize, greedy generation, and the engine build hash that
 //! nodes compare at handshake. Distributed execution arrives in M3.
 
+pub mod rpc;
 mod sys;
 
 use std::ffi::{CStr, CString};
@@ -38,6 +39,42 @@ pub enum EngineError {
     BadUtf8,
     #[error("the model's chat template could not be applied")]
     ChatTemplate,
+    #[error("RPC endpoint contains an interior NUL byte: {0}")]
+    BadEndpoint(String),
+    #[error(
+        "could not register the RPC server at {endpoint}: connection failed or the peer \
+         spoke a different RPC protocol. Check the bridge is running; a version mismatch \
+         looks identical to connect failure here, so verify both nodes report the same \
+         engine build hash (`onebrain doctor`)."
+    )]
+    RpcConnect { endpoint: String },
+    #[error(
+        "too many RPC servers registered in this process (max {max}). \
+         Reduce the number of remote nodes in the plan."
+    )]
+    RpcServerLimit { max: u32 },
+    #[error(
+        "RPC serve device index {index} is out of range (this node has {count} devices). \
+         Use an index from the local device enumeration (`onebrain doctor` lists them)."
+    )]
+    RpcDeviceIndex { index: i32, count: i32 },
+    #[error(
+        "failed to create the local RPC bridge socket: {source}. Check that local \
+         firewall or endpoint-security software allows loopback connections for this process."
+    )]
+    SocketPair { source: std::io::Error },
+    #[error(
+        "tensor_split has {got} entries but the plan spans {expected} devices; the \
+         scheduler must emit exactly one fraction per device (remote devices in server \
+         order, then the local device)."
+    )]
+    TensorSplit { expected: usize, got: usize },
+    #[error(
+        "failed to load model from {path} across {n_devices} devices. Check every RPC \
+         bridge is connected and each node has enough free memory for its layer range; \
+         `onebrain status` shows the active plan."
+    )]
+    DistributedLoad { path: String, n_devices: usize },
 }
 
 /// The engine build identity exchanged at handshake: vendored llama.cpp
@@ -198,6 +235,78 @@ impl Model {
             unsafe { sys::ob_model_load(cpath.as_ptr(), params.n_gpu_layers, params.use_mmap) };
         if ptr.is_null() {
             return Err(EngineError::ModelLoad { path: path_str });
+        }
+        Ok(Model {
+            ptr,
+            path: path_str,
+        })
+    }
+
+    /// Load a model split across remote RPC servers plus (optionally) this
+    /// node's own device, per the M3 placement contract
+    /// (docs/distributed.md): the device order is every server's devices in
+    /// `servers` order, then the local device when `use_local_device`;
+    /// `tensor_split[i]` is device i's layer proportion and must have
+    /// exactly one entry per device — llama.cpp's own free-memory probing
+    /// (a live network round trip per remote device) never drives
+    /// placement. Split mode is always by layer.
+    ///
+    /// The returned [`Model`] is the ordinary model type (same sessions,
+    /// same drop/free path); weights are memory-mapped locally and pushed
+    /// to remote devices during this call, so `params.use_mmap` is ignored
+    /// here (distributed loads always map the local file).
+    pub fn load_distributed(
+        path: &Path,
+        servers: &[&rpc::RemoteServer],
+        tensor_split: &[f32],
+        use_local_device: bool,
+        params: &ModelParams,
+    ) -> Result<Model, EngineError> {
+        init();
+        let n_devices = servers
+            .iter()
+            .map(|s| s.device_count().max(0) as usize)
+            .sum::<usize>()
+            + usize::from(use_local_device);
+        if tensor_split.len() != n_devices {
+            return Err(EngineError::TensorSplit {
+                expected: n_devices,
+                got: tensor_split.len(),
+            });
+        }
+        if !params.use_mmap {
+            tracing::warn!(
+                "distributed loads always memory-map the local weights; use_mmap=false ignored"
+            );
+        }
+        let path_str = path.to_string_lossy().into_owned();
+        let cpath =
+            CString::new(path_str.clone()).map_err(|_| EngineError::BadPath(path_str.clone()))?;
+        let slots: Vec<i32> = servers.iter().map(|s| s.slot()).collect();
+        tracing::info!(
+            path = %path_str,
+            n_servers = servers.len(),
+            n_devices,
+            ?tensor_split,
+            use_local_device,
+            "loading model across devices"
+        );
+        let ptr = unsafe {
+            sys::ob_model_load_devices(
+                cpath.as_ptr(),
+                slots.as_ptr(),
+                slots.len() as i32,
+                tensor_split.as_ptr(),
+                tensor_split.len() as i32,
+                use_local_device,
+                params.n_gpu_layers,
+            )
+        };
+        if ptr.is_null() {
+            return Err(EngineError::DistributedLoad {
+                path: path_str,
+                n_devices,
+            });
         }
         Ok(Model {
             ptr,
