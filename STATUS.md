@@ -4,7 +4,7 @@ Working file for resuming work across sessions. Update on every milestone
 item completed. Spec: the build prompt (§8 milestones); decisions live in
 `docs/decisions/`.
 
-## Current: M0 — Skeleton & CI (in progress)
+## M0 — Skeleton & CI (DoD MET 2026-08-27: green matrix run 33045749556)
 
 - [x] Workspace scaffolded per §3 (proto, mesh, engine, scheduler, models,
       api, dash, onebraind, onebrain-cli, xtask)
@@ -32,16 +32,15 @@ item completed. Spec: the build prompt (§8 milestones); decisions live in
 - [x] Docs: README, CHANGELOG, ADRs 0001–0003, dual licenses
 - [x] Initial commits (5, conventional; note: the vendor submodule pin rode
       in the scaffolding commit)
-- [ ] GitHub repository + first push + green CI matrix on all three OSes
-      (**needs the user**: repo creation/authorization; the macOS/Linux legs
-      of the DoD can only be proven by CI)
+- [x] GitHub repository (github.com/VantaBluee/onebrain, public) + green
+      CI matrix on all three OSes (run 33045749556, 2026-08-27)
 
 ### M0 Definition of Done
 Green Actions matrix (macos-14/15, ubuntu-22.04/24.04, windows-2022):
 fmt, clippy, tests, CPU smoke inference with a tiny GGUF on all three OSes;
 `cargo xtask dist` artifacts with `onebrain --version` working per OS.
 
-## M1 — Excellent single-node (implementation complete; CI proof pending)
+## M1 — Excellent single-node (DoD components proven in CI 2026-08-27)
 
 - [x] Engine: device enumeration, session reset, sampler chains, chat
       templating (with clean no-template fallback), streaming generate
@@ -62,13 +61,13 @@ fmt, clippy, tests, CPU smoke inference with a tiny GGUF on all three OSes;
       restart, graceful stop, lock release (11/11 steps)
 - [x] Fixed on the way: Windows handle-inheritance leak in `onebrain up`
       (captured-output callers would hang forever; see up.rs)
-- [ ] e2e green on macOS + Linux via CI (step added to the test job)
+- [x] e2e green on all three OSes via CI
 - [ ] Manual: unmodified OpenAI SDK script (scripts/check_openai_sdk.py)
       against a real model — run per OS before tagging
 - [ ] /v1/embeddings implementation (deferred within M1; endpoint returns a
       clean 501 with remedy until then)
 
-## M2 — Mesh & pairing (implementation complete; CI proof pending)
+## M2 — Mesh & pairing (CI proof met 2026-08-27, incl. netem leg)
 
 - [x] Device identity: Ed25519 iroh key at `<config_dir>/device-key`,
       never regenerated silently, never leaves the machine
@@ -88,13 +87,14 @@ fmt, clippy, tests, CPU smoke inference with a tiny GGUF on all three OSes;
       both report connected with RTT/bandwidth, unpair degrades — 10/10
       steps green on Windows; netem variant (Linux namespaces, 1 Gbit /
       0.5 ms shaping) wired into CI
-- [ ] pair-sim green on macOS + Linux via CI; netem leg green
+- [x] pair-sim green on all three OSes via CI; netem leg green
 - [ ] Manual two-machine checklist (incl. real mDNS discovery + daemon
       restart survival): run before tagging
-- [ ] Windows CI e2e SSE timeout under diagnosis (daemon-log dump now
-      wired into the harness for the next run)
+- [x] (resolved) Windows CI e2e SSE timeout — gone once the redundant
+      inner rebuild was skipped; restart survival hardened in M3 with the
+      reconnect loop
 
-## M3 — Distributed inference v1 (implementation complete; CI proof pending)
+## M3 — Distributed inference v1 (CI proof met 2026-08-27: sim green on all three OSes + netem)
 
 - [x] Engine substrate: vendored llama.cpp patched (additive ~84 lines,
       `patches/0001-rpc-serve-fd.patch`, upstreaming note) so GGML RPC
@@ -119,7 +119,7 @@ fmt, clippy, tests, CPU smoke inference with a tiny GGUF on all three OSes;
 - [x] `cargo xtask sim`: distribute (auto-engage) → socket scans →
       byte-identical §9 correctness vs solo → forced `--nodes 2`; wired
       into CI on all three OSes + the Linux netem leg
-- [ ] Sim green on macOS + Linux via CI
+- [x] Sim green on macOS + Linux + Windows via CI (run 33045749556)
 - [ ] Manual two-machine checklists (Mac+Windows, Mac+Linux) — documented,
       to run when hardware is available (recorded here per the M3 DoD)
 - [ ] Shard-only weight fetch deferred to M6 by design (ADR 0004: GGML RPC

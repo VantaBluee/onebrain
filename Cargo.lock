@@ -2620,10 +2620,14 @@ dependencies = [
 name = "onebrain-scheduler"
 version = "0.1.0"
 dependencies = [
+ "onebrain-engine",
  "onebrain-mesh",
+ "onebrain-models",
  "onebrain-proto",
  "serde",
+ "tempfile",
  "thiserror 2.0.20",
+ "toml",
  "tracing",
 ]
 

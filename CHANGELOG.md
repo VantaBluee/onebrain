@@ -10,6 +10,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 M0 (skeleton & CI) complete locally; M1 (excellent single-node) implemented,
 cross-OS CI proof in flight.
 
+### Added — M4
+
+- Scheduler v1: placement now budgets KV cache from the model's real GGUF
+  metadata at the requested context length (16k contexts visibly shrink
+  per-node layer counts, and can force distribution a 2k context avoids),
+  weighs nodes by measured compute (decode tok/s) on top of memory, and
+  orders pipeline stages to put boundaries on the fastest links.
+- Device profiles: `onebrain bench` measures prefill/decode throughput on
+  a tiny model, disk read speed, and every paired link's RTT/bandwidth —
+  one-page report, persisted, and shared with peers for planning.
+- Plans report a predicted relative cost and `--explain` now names KV
+  budgets, per-boundary RTTs, and why each node was included or excluded.
+- Wire protocol v2 (profile fields in NodeStatus; same-build clusters only,
+  enforced by the engine build-hash handshake since M2).
+
 ### Added — M3
 
 - Distributed inference v1: pipeline layer-split across paired nodes with
