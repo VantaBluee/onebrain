@@ -1215,8 +1215,7 @@ impl GgufBuilder {
         self.kvs.extend(9u32.to_le_bytes()); // array
         self.kvs.extend(6u32.to_le_bytes()); // of f32
         self.kvs.extend(n.to_le_bytes());
-        self.kvs
-            .extend(std::iter::repeat(0u8).take((n * 4) as usize));
+        self.kvs.extend(std::iter::repeat_n(0u8, (n * 4) as usize));
         self.kv_count += 1;
     }
 
@@ -1290,7 +1289,7 @@ fn build_m6_model() -> Vec<u8> {
     tokens.extend((0u32..256).map(|b| format!("<0x{b:02X}>")));
     // SPM token types: 2 = unknown, 3 = control, 6 = byte.
     let mut types: Vec<i32> = vec![2, 3, 3];
-    types.extend(std::iter::repeat(6).take(256));
+    types.extend(std::iter::repeat_n(6, 256));
     g.kv_str_array("tokenizer.ggml.tokens", &tokens);
     g.kv_f32_array_zeroed("tokenizer.ggml.scores", u64::from(M6_VOCAB));
     g.kv_i32_array("tokenizer.ggml.token_type", &types);
@@ -3419,8 +3418,7 @@ mod tests {
             self.kvs.extend(9u32.to_le_bytes()); // array
             self.kvs.extend(6u32.to_le_bytes()); // of f32
             self.kvs.extend(n.to_le_bytes());
-            self.kvs
-                .extend(std::iter::repeat(0u8).take((n * 4) as usize));
+            self.kvs.extend(std::iter::repeat_n(0u8, (n * 4) as usize));
             self.kv_count += 1;
             self
         }
