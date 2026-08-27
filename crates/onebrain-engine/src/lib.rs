@@ -6,6 +6,7 @@
 //! nodes compare at handshake. Distributed execution arrives in M3.
 
 pub mod rpc;
+pub mod rpc_cache;
 mod sys;
 
 use std::ffi::{CStr, CString};
@@ -75,6 +76,28 @@ pub enum EngineError {
          `onebrain status` shows the active plan."
     )]
     DistributedLoad { path: String, n_devices: usize },
+    #[error(
+        "split model load was given an empty part list; a split cache entry must name \
+         every part in order (`onebrain ls` shows the parts an entry holds)."
+    )]
+    NoSplitParts,
+    #[error(
+        "failed to load split model ({n_parts} parts, first part {first}). Check that \
+         every part file exists, the parts come from the same split set, and they are \
+         listed in split order (part -00001- first); `onebrain doctor` shows free memory."
+    )]
+    SplitLoad { first: String, n_parts: usize },
+    #[error("RPC tensor cache directory path contains an interior NUL byte: {0}")]
+    BadCacheDir(String),
+    #[error(
+        "failed to create the RPC tensor cache directory {path}: {source}. Check \
+         permissions under the data dir; the cache is optional — serve without one to \
+         fall back to full weight pushes."
+    )]
+    RpcCacheDir {
+        path: String,
+        source: std::io::Error,
+    },
 }
 
 /// The engine build identity exchanged at handshake: vendored llama.cpp
@@ -128,6 +151,24 @@ unsafe fn cstr_to_string(p: *const std::os::raw::c_char) -> String {
         return String::new();
     }
     CStr::from_ptr(p).to_string_lossy().into_owned()
+}
+
+/// Convert a non-empty part-path list into C strings (plus the lossy display
+/// strings for errors/logs). The typed errors match the single-path loaders:
+/// empty list and interior NUL both fail before any FFI call.
+fn cstring_paths(paths: &[&Path]) -> Result<(Vec<CString>, Vec<String>), EngineError> {
+    if paths.is_empty() {
+        return Err(EngineError::NoSplitParts);
+    }
+    let path_strs: Vec<String> = paths
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    let cpaths: Vec<CString> = path_strs
+        .iter()
+        .map(|s| CString::new(s.clone()).map_err(|_| EngineError::BadPath(s.clone())))
+        .collect::<Result<_, _>>()?;
+    Ok((cpaths, path_strs))
 }
 
 /// What kind of compute device a backend exposes.
@@ -242,6 +283,36 @@ impl Model {
         })
     }
 
+    /// Load a model stored as multiple split-GGUF parts (docs/logistics.md
+    /// "Split-GGUF"): `paths` must list every part in split order (part
+    /// `-00001-` first). Wraps `llama_model_load_from_splits`, so parts with
+    /// non-standard names load too as long as the order is right. The
+    /// returned model is the ordinary [`Model`]; [`Model::path`] reports the
+    /// first part.
+    pub fn load_splits(paths: &[&Path], params: &ModelParams) -> Result<Model, EngineError> {
+        init();
+        let (cpaths, path_strs) = cstring_paths(paths)?;
+        let ptrs: Vec<*const std::os::raw::c_char> = cpaths.iter().map(|c| c.as_ptr()).collect();
+        let ptr = unsafe {
+            sys::ob_model_load_splits(
+                ptrs.as_ptr(),
+                ptrs.len(),
+                params.n_gpu_layers,
+                params.use_mmap,
+            )
+        };
+        if ptr.is_null() {
+            return Err(EngineError::SplitLoad {
+                first: path_strs[0].clone(),
+                n_parts: paths.len(),
+            });
+        }
+        Ok(Model {
+            ptr,
+            path: path_strs[0].clone(),
+        })
+    }
+
     /// Load a model split across remote RPC servers plus (optionally) this
     /// node's own device, per the M3 placement contract
     /// (docs/distributed.md): the device order is every server's devices in
@@ -257,6 +328,22 @@ impl Model {
     /// here (distributed loads always map the local file).
     pub fn load_distributed(
         path: &Path,
+        servers: &[&rpc::RemoteServer],
+        tensor_split: &[f32],
+        use_local_device: bool,
+        params: &ModelParams,
+    ) -> Result<Model, EngineError> {
+        Self::load_distributed_splits(&[path], servers, tensor_split, use_local_device, params)
+    }
+
+    /// [`Model::load_distributed`] for a split-GGUF model: identical
+    /// placement contract, but the local weights come from `paths` — every
+    /// part, in split order, as in [`Model::load_splits`]. A single-element
+    /// `paths` behaves exactly like `load_distributed` (which delegates
+    /// here), so the daemon can call this unconditionally with whatever part
+    /// list the cache entry holds. [`Model::path`] reports the first part.
+    pub fn load_distributed_splits(
+        paths: &[&Path],
         servers: &[&rpc::RemoteServer],
         tensor_split: &[f32],
         use_local_device: bool,
@@ -279,12 +366,12 @@ impl Model {
                 "distributed loads always memory-map the local weights; use_mmap=false ignored"
             );
         }
-        let path_str = path.to_string_lossy().into_owned();
-        let cpath =
-            CString::new(path_str.clone()).map_err(|_| EngineError::BadPath(path_str.clone()))?;
+        let (cpaths, path_strs) = cstring_paths(paths)?;
+        let ptrs: Vec<*const std::os::raw::c_char> = cpaths.iter().map(|c| c.as_ptr()).collect();
         let slots: Vec<i32> = servers.iter().map(|s| s.slot()).collect();
         tracing::info!(
-            path = %path_str,
+            path = %path_strs[0],
+            n_parts = paths.len(),
             n_servers = servers.len(),
             n_devices,
             ?tensor_split,
@@ -292,8 +379,9 @@ impl Model {
             "loading model across devices"
         );
         let ptr = unsafe {
-            sys::ob_model_load_devices(
-                cpath.as_ptr(),
+            sys::ob_model_load_splits_devices(
+                ptrs.as_ptr(),
+                ptrs.len(),
                 slots.as_ptr(),
                 slots.len() as i32,
                 tensor_split.as_ptr(),
@@ -304,13 +392,13 @@ impl Model {
         };
         if ptr.is_null() {
             return Err(EngineError::DistributedLoad {
-                path: path_str,
+                path: path_strs[0].clone(),
                 n_devices,
             });
         }
         Ok(Model {
             ptr,
-            path: path_str,
+            path: path_strs[0].clone(),
         })
     }
 
@@ -702,12 +790,77 @@ mod tests {
         assert!(cpu.total_bytes > 0, "CPU device must report memory");
     }
 
+    /// Split load with no parts must fail typed before any FFI call.
+    #[test]
+    fn load_splits_empty_list_is_typed_error() {
+        match Model::load_splits(&[], &ModelParams::default()) {
+            Err(EngineError::NoSplitParts) => {}
+            Err(other) => panic!("expected NoSplitParts, got {other:?}"),
+            Ok(_) => panic!("expected NoSplitParts, got a loaded model"),
+        }
+    }
+
+    /// Split load over nonexistent parts must fail with the typed split
+    /// error (naming the first part and the part count), not an abort.
+    #[test]
+    fn load_splits_missing_parts_is_typed_error() {
+        let parts = [
+            Path::new("definitely-missing-00001-of-00002.gguf"),
+            Path::new("definitely-missing-00002-of-00002.gguf"),
+        ];
+        match Model::load_splits(&parts, &ModelParams::default()) {
+            Err(EngineError::SplitLoad { first, n_parts }) => {
+                assert_eq!(n_parts, 2);
+                assert!(first.contains("00001-of-00002"));
+            }
+            Err(other) => panic!("expected SplitLoad, got {other:?}"),
+            Ok(_) => panic!("expected SplitLoad, got a loaded model"),
+        }
+    }
+
     #[test]
     fn build_hash_is_stamped() {
         let h = engine_build_hash();
         assert!(h.0.starts_with("llama.cpp-"));
         assert!(h.0.contains("cpu"));
         assert!(!llama_commit().is_empty());
+    }
+
+    /// The splits entry point over a single part must behave exactly like
+    /// the plain load (the vendored loader ignores the splits list when the
+    /// GGUF carries no split metadata): same layer count, same greedy
+    /// tokens. A true multi-part parity test needs a gguf-split'd model and
+    /// lives with the downloader's split fixtures (docs/logistics.md DoD).
+    #[test]
+    fn smoke_load_splits_single_part_parity() {
+        let Ok(model_path) = std::env::var("OB_SMOKE_MODEL") else {
+            eprintln!("OB_SMOKE_MODEL not set; skipping split-load smoke test");
+            return;
+        };
+        let path = Path::new(&model_path);
+        let solo = Model::load(path, &ModelParams::default()).expect("plain load");
+        let split = Model::load_splits(&[path], &ModelParams::default()).expect("splits load");
+        assert_eq!(solo.n_layer(), split.n_layer());
+        assert_eq!(split.path(), path.to_string_lossy());
+
+        let prompt = solo.tokenize("Once upon a time", true).unwrap();
+        let gen = |model: &Model| {
+            let mut session = Session::new(
+                model,
+                &SessionParams {
+                    n_ctx: 256,
+                    n_batch: 64,
+                    n_threads: 0,
+                },
+            )
+            .unwrap();
+            session.generate_greedy(&prompt, 8, |_, _| {}).unwrap()
+        };
+        assert_eq!(
+            gen(&solo),
+            gen(&split),
+            "single-part split load must generate identical greedy tokens"
+        );
     }
 
     /// End-to-end smoke: requires a real tiny GGUF, so it only runs when

@@ -28,6 +28,14 @@ const char * ob_system_info(void);
 // ---- model ----
 // Returns NULL on failure. n_gpu_layers < 0 offloads everything supported.
 ob_model * ob_model_load(const char * path, int32_t n_gpu_layers, bool use_mmap);
+// Load a model stored as multiple split-GGUF parts (docs/logistics.md
+// "Split-GGUF"). `paths` must list every part in split order (part 1 first —
+// the `-%05d-of-%05d.gguf` convention); wraps llama_model_load_from_splits,
+// so custom part names are accepted as long as the order is right. Same
+// params semantics as ob_model_load. Returns NULL on failure (missing part,
+// wrong order, or parts from different split sets).
+ob_model * ob_model_load_splits(const char ** paths, size_t n_paths,
+                                int32_t n_gpu_layers, bool use_mmap);
 void ob_model_free(ob_model * m);
 int32_t  ob_model_n_layer(const ob_model * m);
 int32_t  ob_model_n_embd(const ob_model * m);
@@ -64,10 +72,19 @@ int32_t ob_dev_info(int32_t i, char * name, size_t name_len,
 // thread until the peer closes the connection; the socket is closed before
 // returning, so ownership of the handle transfers here. `dev_index` selects
 // the serving device from the ob_dev_* enumeration; `n_threads` must be
-// >= 1. The RPC tensor cache stays disabled in M3 (ADR 0004). Returns 0
-// after a served session, or -1 on invalid arguments — the socket is closed
-// on that path too, so the bridging peer sees EOF instead of a hang.
-int32_t ob_rpc_serve_fd(long long fd, int32_t n_threads, int32_t dev_index);
+// >= 1. `cache_dir` (nullable / empty = no cache) points the session at a
+// local tensor-cache directory: SET_TENSOR_HASH requests are answered from
+// files named by the FNV-1a-64 of the tensor payload (16 lowercase hex
+// digits, no extension — see src/rpc_cache.rs), letting a pre-seeded worker
+// skip the head's weight push for every tensor over the protocol's 10 MiB
+// hash threshold; incoming >threshold SET_TENSOR payloads are also saved
+// there. The directory must already exist (the Rust wrapper creates it);
+// the C side never creates or evicts — the daemon's reaper owns lifetime
+// (docs/logistics.md "RPC tensor-cache pre-seeding"). Returns 0 after a
+// served session, or -1 on invalid arguments — the socket is closed on
+// that path too, so the bridging peer sees EOF instead of a hang.
+int32_t ob_rpc_serve_fd(long long fd, const char * cache_dir,
+                        int32_t n_threads, int32_t dev_index);
 
 // Register a remote RPC server endpoint ("host:port"). Returns a slot
 // handle >= 0, -1 when the endpoint is unreachable or spoke a different
@@ -97,6 +114,15 @@ ob_model * ob_model_load_devices(const char * path,
                                  const int32_t * slots, int32_t n_slots,
                                  const float * tensor_split, int32_t n_split,
                                  bool use_local_device, int32_t n_gpu_layers);
+
+// ob_model_load_devices for a split-GGUF model: identical placement
+// contract, but the local weights come from `paths` (every part, in split
+// order, as in ob_model_load_splits). n_paths == 1 behaves exactly like
+// ob_model_load_devices.
+ob_model * ob_model_load_splits_devices(const char ** paths, size_t n_paths,
+                                        const int32_t * slots, int32_t n_slots,
+                                        const float * tensor_split, int32_t n_split,
+                                        bool use_local_device, int32_t n_gpu_layers);
 
 // ---- model metadata & chat template ----
 // GGUF metadata value by key; returns length or -1 (see llama_model_meta_val_str).

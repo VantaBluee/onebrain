@@ -61,18 +61,12 @@ const char * ob_system_info(void) {
     return llama_print_system_info();
 }
 
-ob_model * ob_model_load(const char * path, int32_t n_gpu_layers, bool use_mmap) {
-    struct llama_model_params params = llama_model_default_params();
-    params.n_gpu_layers = n_gpu_layers;
-    if (!use_mmap) {
-        params.load_mode = LLAMA_LOAD_MODE_NONE;
-    }
-
-    struct llama_model * model = llama_model_load_from_file(path, params);
+// Wrap a freshly loaded llama_model in the shim handle; frees the model on
+// allocation failure so no load path can leak it.
+static ob_model * ob_wrap_model(struct llama_model * model) {
     if (model == NULL) {
         return NULL;
     }
-
     ob_model * m = calloc(1, sizeof(ob_model));
     if (m == NULL) {
         llama_model_free(model);
@@ -81,6 +75,30 @@ ob_model * ob_model_load(const char * path, int32_t n_gpu_layers, bool use_mmap)
     m->model = model;
     m->vocab = llama_model_get_vocab(model);
     return m;
+}
+
+ob_model * ob_model_load(const char * path, int32_t n_gpu_layers, bool use_mmap) {
+    struct llama_model_params params = llama_model_default_params();
+    params.n_gpu_layers = n_gpu_layers;
+    if (!use_mmap) {
+        params.load_mode = LLAMA_LOAD_MODE_NONE;
+    }
+
+    return ob_wrap_model(llama_model_load_from_file(path, params));
+}
+
+ob_model * ob_model_load_splits(const char ** paths, size_t n_paths,
+                                int32_t n_gpu_layers, bool use_mmap) {
+    if (paths == NULL || n_paths == 0) {
+        return NULL;
+    }
+    struct llama_model_params params = llama_model_default_params();
+    params.n_gpu_layers = n_gpu_layers;
+    if (!use_mmap) {
+        params.load_mode = LLAMA_LOAD_MODE_NONE;
+    }
+
+    return ob_wrap_model(llama_model_load_from_splits(paths, n_paths, params));
 }
 
 void ob_model_free(ob_model * m) {
@@ -278,15 +296,21 @@ static void ob_close_raw_socket(long long fd) {
 #endif
 }
 
-int32_t ob_rpc_serve_fd(long long fd, int32_t n_threads, int32_t dev_index) {
+int32_t ob_rpc_serve_fd(long long fd, const char * cache_dir,
+                        int32_t n_threads, int32_t dev_index) {
     if (n_threads < 1 || dev_index < 0 || (size_t) dev_index >= ggml_backend_dev_count()) {
         // Close the socket so the bridging peer sees EOF instead of a hang.
         ob_close_raw_socket(fd);
         return -1;
     }
     ggml_backend_dev_t devices[1] = { ggml_backend_dev_get((size_t) dev_index) };
-    // cache_dir stays NULL until M6 wires the reaper + pre-seeding (ADR 0004).
-    ggml_backend_rpc_serve_fd(fd, /*cache_dir=*/NULL, (size_t) n_threads, 1, devices);
+    // Empty string means "no cache" like NULL does: the serve session builds
+    // cache paths by naive concatenation, so "" would resolve hash files
+    // against the process cwd.
+    if (cache_dir != NULL && cache_dir[0] == '\0') {
+        cache_dir = NULL;
+    }
+    ggml_backend_rpc_serve_fd(fd, cache_dir, (size_t) n_threads, 1, devices);
     return 0;
 }
 
@@ -326,11 +350,16 @@ int32_t ob_rpc_server_device_count(int32_t slot) {
     return (int32_t) ggml_backend_reg_dev_count(ob_rpc_servers[slot]);
 }
 
-ob_model * ob_model_load_devices(const char * path,
-                                 const int32_t * slots, int32_t n_slots,
-                                 const float * tensor_split, int32_t n_split,
-                                 bool use_local_device, int32_t n_gpu_layers) {
-    if (path == NULL || n_slots < 0 || (n_slots > 0 && slots == NULL)) {
+// Shared implementation for ob_model_load_devices (n_paths == 1) and
+// ob_model_load_splits_devices: build the explicit device list from the
+// registered server slots (+ optionally the best local device), then load
+// either the single file or the split set across it.
+static ob_model * ob_load_devices_impl(const char ** paths, size_t n_paths,
+                                       const int32_t * slots, int32_t n_slots,
+                                       const float * tensor_split, int32_t n_split,
+                                       bool use_local_device, int32_t n_gpu_layers) {
+    if (paths == NULL || n_paths == 0 || paths[0] == NULL || n_slots < 0 ||
+        (n_slots > 0 && slots == NULL)) {
         return NULL;
     }
     const size_t max_devices = llama_max_devices();
@@ -399,23 +428,31 @@ ob_model * ob_model_load_devices(const char * path,
         params.tensor_split = split;
     }
 
-    struct llama_model * model = llama_model_load_from_file(path, params);
+    struct llama_model * model = n_paths == 1
+        ? llama_model_load_from_file(paths[0], params)
+        : llama_model_load_from_splits(paths, n_paths, params);
     // The loader copies both arrays (devices into model->devices,
     // tensor_split into the model's owned vector) before returning.
     free(devices);
     free(split);
-    if (model == NULL) {
-        return NULL;
-    }
+    return ob_wrap_model(model);
+}
 
-    ob_model * m = calloc(1, sizeof(ob_model));
-    if (m == NULL) {
-        llama_model_free(model);
-        return NULL;
-    }
-    m->model = model;
-    m->vocab = llama_model_get_vocab(model);
-    return m;
+ob_model * ob_model_load_devices(const char * path,
+                                 const int32_t * slots, int32_t n_slots,
+                                 const float * tensor_split, int32_t n_split,
+                                 bool use_local_device, int32_t n_gpu_layers) {
+    const char * paths[1] = { path };
+    return ob_load_devices_impl(paths, path == NULL ? 0 : 1, slots, n_slots,
+                                tensor_split, n_split, use_local_device, n_gpu_layers);
+}
+
+ob_model * ob_model_load_splits_devices(const char ** paths, size_t n_paths,
+                                        const int32_t * slots, int32_t n_slots,
+                                        const float * tensor_split, int32_t n_split,
+                                        bool use_local_device, int32_t n_gpu_layers) {
+    return ob_load_devices_impl(paths, n_paths, slots, n_slots,
+                                tensor_split, n_split, use_local_device, n_gpu_layers);
 }
 
 int32_t ob_model_meta(const ob_model * m, const char * key, char * buf, size_t buf_size) {

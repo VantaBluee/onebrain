@@ -14,6 +14,10 @@ OneBrain workers serve inference over sockets bridged 1:1 to authenticated
 QUIC streams, so nothing is reachable off-box (spec §1.3/§10). Also exposes
 `socket_t::from_fd` and factors backend init out of
 `ggml_backend_rpc_start_server` (no behavior change to existing paths).
+The signature mirrors `ggml_backend_rpc_start_server` including the
+nullable `cache_dir` (upstream's tensor cache); M3 always passed NULL, and
+M6 threads it through the shim's `ob_rpc_serve_fd` for tensor-cache
+pre-seeding (docs/logistics.md) — no patch change was needed for that.
 
 Upstreaming note: generally useful for anyone embedding the RPC server
 behind their own transport/auth (the README itself warns the TCP listener

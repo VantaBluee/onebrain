@@ -119,14 +119,24 @@ pub struct RpcServeSession {
 impl RpcServeSession {
     /// Spawn the serve thread. `raw_fd` comes from
     /// [`SocketPair::into_parts`]; ownership transfers here on success and
-    /// the handle is closed on the error path too, so the peer never hangs.
-    /// `n_threads <= 0` picks the machine's available parallelism;
+    /// the handle is closed on every error path too, so the peer never
+    /// hangs. `n_threads <= 0` picks the machine's available parallelism;
     /// `dev_index` indexes the local device enumeration
     /// ([`crate::devices`]) — CPU in M3.
+    ///
+    /// `cache_dir` (None = no cache) points the session at the local RPC
+    /// tensor cache (docs/logistics.md "RPC tensor-cache pre-seeding"): the
+    /// serve loop answers `SET_TENSOR_HASH` from files named per
+    /// [`crate::rpc_cache::rpc_cache_filename`], so a pre-seeded worker
+    /// skips the head's push for every tensor over
+    /// [`crate::rpc_cache::RPC_HASH_THRESHOLD`]. The directory is created
+    /// here if missing; eviction is the daemon reaper's job, never this
+    /// session's.
     pub fn spawn(
         raw_fd: i64,
         n_threads: i32,
         dev_index: i32,
+        cache_dir: Option<&std::path::Path>,
     ) -> Result<RpcServeSession, EngineError> {
         init();
         let dev_count = unsafe { sys::ob_dev_count() };
@@ -137,6 +147,30 @@ impl RpcServeSession {
                 count: dev_count,
             });
         }
+        // Resolve the cache dir to a CString up front (the serve thread
+        // outlives this call) and make sure it exists — the C side only
+        // opens files inside it, it never creates the directory.
+        let cache_dir_c = match cache_dir {
+            None => None,
+            Some(dir) => {
+                let dir_str = dir.to_string_lossy().into_owned();
+                let cdir = match std::ffi::CString::new(dir_str.clone()) {
+                    Ok(c) => c,
+                    Err(_) => {
+                        close_raw(raw_fd);
+                        return Err(EngineError::BadCacheDir(dir_str));
+                    }
+                };
+                if let Err(source) = std::fs::create_dir_all(dir) {
+                    close_raw(raw_fd);
+                    return Err(EngineError::RpcCacheDir {
+                        path: dir_str,
+                        source,
+                    });
+                }
+                Some(cdir)
+            }
+        };
         let n_threads = if n_threads > 0 {
             n_threads
         } else {
@@ -145,8 +179,19 @@ impl RpcServeSession {
         let handle = thread::Builder::new()
             .name("ob-rpc-serve".into())
             .spawn(move || {
-                tracing::debug!(raw_fd, n_threads, dev_index, "rpc serve session starting");
-                let status = unsafe { sys::ob_rpc_serve_fd(raw_fd, n_threads, dev_index) };
+                let with_cache = cache_dir_c.is_some();
+                tracing::debug!(
+                    raw_fd,
+                    n_threads,
+                    dev_index,
+                    with_cache,
+                    "rpc serve session starting"
+                );
+                let cache_ptr = cache_dir_c
+                    .as_ref()
+                    .map_or(std::ptr::null(), |c| c.as_ptr());
+                let status =
+                    unsafe { sys::ob_rpc_serve_fd(raw_fd, cache_ptr, n_threads, dev_index) };
                 tracing::debug!(raw_fd, status, "rpc serve session ended");
                 status
             })
@@ -191,9 +236,23 @@ pub struct RpcSession {
 impl RpcSession {
     /// Create the socket pair and start serving one RPC session on a
     /// dedicated thread (CPU device by default in M3 — pass its index).
+    /// No tensor cache; see [`RpcSession::start_with_cache`].
     pub fn start(n_threads: i32, dev_index: i32) -> Result<RpcSession, EngineError> {
+        Self::start_with_cache(n_threads, dev_index, None)
+    }
+
+    /// [`RpcSession::start`] with an optional RPC tensor-cache directory
+    /// (`<data_dir>/rpc-cache/` in the daemon): the session then answers
+    /// `SET_TENSOR_HASH` from pre-seeded files (see [`crate::rpc_cache`])
+    /// and the head's weight push skips every cached tensor. The directory
+    /// is created if missing.
+    pub fn start_with_cache(
+        n_threads: i32,
+        dev_index: i32,
+        cache_dir: Option<&std::path::Path>,
+    ) -> Result<RpcSession, EngineError> {
         let (raw, bridge) = SocketPair::new()?.into_parts();
-        let serve = RpcServeSession::spawn(raw, n_threads, dev_index)?;
+        let serve = RpcServeSession::spawn(raw, n_threads, dev_index, cache_dir)?;
         Ok(RpcSession {
             serve: Some(serve),
             bridge: Some(bridge),

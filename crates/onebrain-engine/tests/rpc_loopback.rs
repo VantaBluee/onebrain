@@ -9,8 +9,8 @@
 //! "Devices:"); that noise is expected in this test's output.
 
 use std::io;
-use std::net::TcpListener;
-use std::path::Path;
+use std::net::{Shutdown, TcpListener};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -42,7 +42,7 @@ struct LoopbackBridge {
 }
 
 impl LoopbackBridge {
-    fn spawn(dev_index: i32) -> LoopbackBridge {
+    fn spawn(dev_index: i32, cache_dir: Option<PathBuf>) -> LoopbackBridge {
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback listener");
         listener
             .set_nonblocking(true)
@@ -59,8 +59,8 @@ impl LoopbackBridge {
                         conn.set_nonblocking(false).expect("blocking conn");
                         conn.set_nodelay(true).ok();
                         let (raw, bridge) = SocketPair::new().expect("socket pair").into_parts();
-                        let serve =
-                            RpcServeSession::spawn(raw, 2, dev_index).expect("spawn serve session");
+                        let serve = RpcServeSession::spawn(raw, 2, dev_index, cache_dir.as_deref())
+                            .expect("spawn serve session");
                         let p = pump(conn, bridge).expect("spawn pump");
                         sessions.push((serve, p));
                     }
@@ -124,7 +124,7 @@ fn rpc_loopback_roundtrip() {
     };
     assert!(!solo_tokens.is_empty(), "solo baseline generated no tokens");
 
-    let bridge = LoopbackBridge::spawn(dev_index);
+    let bridge = LoopbackBridge::spawn(dev_index, None);
     let endpoint = format!("127.0.0.1:{}", bridge.port);
 
     let server = RemoteServer::register(&endpoint).expect("register bridged rpc server");
@@ -159,6 +159,118 @@ fn rpc_loopback_roundtrip() {
         );
         p.join();
     }
+}
+
+/// Serving with a tensor-cache directory (M6): the full loopback flow —
+/// register, distributed load, greedy generation with parity against a solo
+/// load — must work unchanged with `cache_dir` set, and anything the serve
+/// session writes into the cache must carry the protocol's 16-hex FNV name.
+/// stories260K has no tensor over the 10 MiB hash threshold, so the cache
+/// typically stays empty here; the real pre-seed skip proof is the daemon
+/// sim (docs/logistics.md DoD) — this test pins "cache_dir set != crash".
+#[test]
+fn rpc_serve_with_cache_dir_smoke() {
+    let Ok(model_path) = std::env::var("OB_SMOKE_MODEL") else {
+        eprintln!("OB_SMOKE_MODEL not set; skipping rpc cache-dir smoke test");
+        return;
+    };
+    let model_path = Path::new(&model_path);
+    let dev_index = cpu_device_index();
+
+    let solo_tokens = {
+        let solo = Model::load(model_path, &ModelParams::default()).expect("solo load");
+        greedy_tokens(&solo, 8)
+    };
+
+    let cache_root = tempfile::tempdir().expect("create temp cache dir");
+    let cache_dir = cache_root.path().join("rpc-cache");
+    let bridge = LoopbackBridge::spawn(dev_index, Some(cache_dir.clone()));
+    let endpoint = format!("127.0.0.1:{}", bridge.port);
+
+    let server = RemoteServer::register(&endpoint).expect("register bridged rpc server");
+    let model = Model::load_distributed(
+        model_path,
+        &[&server],
+        &[0.5, 0.5],
+        /*use_local_device=*/ true,
+        &ModelParams::default(),
+    )
+    .expect("distributed load with cache_dir set");
+
+    let dist_tokens = greedy_tokens(&model, 8);
+    assert_eq!(
+        dist_tokens, solo_tokens,
+        "a caching serve session must not change generated tokens"
+    );
+
+    drop(model);
+    for (i, (serve, p)) in bridge.finish().into_iter().enumerate() {
+        assert!(
+            serve.join_timeout(Duration::from_secs(5)).is_ok(),
+            "caching serve session {i} did not end within 5s"
+        );
+        p.join();
+    }
+
+    // The spawn created the directory even though nothing may have been
+    // cached; any file that DID land must be named by the FNV-1a-64 hex key.
+    assert!(cache_dir.is_dir(), "serve spawn must create the cache dir");
+    for entry in std::fs::read_dir(&cache_dir).expect("read cache dir") {
+        let name = entry.expect("cache dir entry").file_name();
+        let name = name.to_string_lossy();
+        assert_eq!(
+            name.len(),
+            16,
+            "cache file name must be 16 hex chars: {name}"
+        );
+        assert!(
+            name.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "cache file name must be lowercase hex: {name}"
+        );
+    }
+}
+
+/// Cheap no-model checks of the cache-dir plumbing: spawn must create a
+/// nested cache directory before serving, the session must end on peer EOF,
+/// and a NUL-bearing cache path must fail typed (with the socket closed, so
+/// the bridge end sees EOF instead of a hang).
+#[test]
+fn serve_creates_cache_dir_and_rejects_nul() {
+    let dev_index = cpu_device_index();
+    let cache_root = tempfile::tempdir().expect("create temp cache root");
+
+    // Nested path that does not exist yet.
+    let nested = cache_root.path().join("deep").join("rpc-cache");
+    let (raw, bridge) = SocketPair::new().expect("socket pair").into_parts();
+    let serve =
+        RpcServeSession::spawn(raw, 1, dev_index, Some(&nested)).expect("spawn with nested dir");
+    assert!(nested.is_dir(), "spawn must create the cache dir eagerly");
+    // Close the bridge end: the serve loop sees EOF on its first read and
+    // must return promptly.
+    let _ = bridge.shutdown(Shutdown::Both);
+    drop(bridge);
+    assert!(
+        serve.join_timeout(Duration::from_secs(5)).is_ok(),
+        "serve session must end when the bridge end closes"
+    );
+
+    // Interior NUL in the cache path: typed error, and the serve end is
+    // closed so the bridge end reads EOF rather than hanging.
+    let path_with_nul = PathBuf::from(format!("{}\0x", cache_root.path().display()));
+    let (raw, mut bridge) = SocketPair::new().expect("socket pair").into_parts();
+    match RpcServeSession::spawn(raw, 1, dev_index, Some(&path_with_nul)) {
+        Err(EngineError::BadCacheDir(_)) => {}
+        Err(other) => panic!("expected Err(BadCacheDir), got Err({other:?})"),
+        Ok(_) => panic!("expected Err(BadCacheDir), got a running session"),
+    }
+    let mut buf = [0u8; 1];
+    use std::io::Read as _;
+    assert_eq!(
+        bridge.read(&mut buf).expect("read after serve-side close"),
+        0,
+        "bridge end must see EOF after the failed spawn"
+    );
 }
 
 /// Registering against a port nothing listens on must fail with the typed

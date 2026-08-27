@@ -63,7 +63,8 @@ impl KillableBridge {
                             .push(conn.try_clone().expect("clone kill handle"));
                         let (raw, bridge) = SocketPair::new().expect("socket pair").into_parts();
                         let serve =
-                            RpcServeSession::spawn(raw, 2, dev_index).expect("spawn serve session");
+                            RpcServeSession::spawn(raw, 2, dev_index, /*cache_dir=*/ None)
+                                .expect("spawn serve session");
                         let p = pump(conn, bridge).expect("spawn pump");
                         sessions.push((serve, p));
                     }
