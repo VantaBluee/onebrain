@@ -5,7 +5,8 @@
 //! process cannot stop the daemon or swap models without reading the token
 //! file (same-user filesystem access).
 
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -21,12 +22,14 @@ use onebrain_mesh::{MeshError, MeshHandle, PairEvent, PairTarget, PeerState, Pee
 use onebrain_models::registry::{ModelRef, Resolved};
 use onebrain_proto::message::{Envelope, Message};
 use onebrain_proto::plan::{Assignment, NodeId, Plan, Strategy};
-use onebrain_scheduler::{ComputeProfile, LinkRtt, NodeCaps, PlanRequest, StoredProfile};
+use onebrain_scheduler::{
+    ComputeProfile, LinkRtt, NodeCaps, PlanRequest, ScheduleError, StoredProfile,
+};
 use tokio::sync::{mpsc, oneshot, Notify};
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::cluster::{ActivePlanView, ClusterState};
-use crate::engine_host::{EngineHost, HostMsg, LoadProgress, ProgressThrottle};
+use crate::cluster::{ActivePlanView, ClusterState, LoadedSource};
+use crate::engine_host::{EngineHost, HostMsg, LoadProgress, LoadedModel, ProgressThrottle};
 
 /// Registry id of the microbench test model (docs/scheduler-v1.md
 /// "Profiles"): pulled through the normal registry path on first bench —
@@ -64,6 +67,12 @@ pub struct InternalState {
     pub decode_tps_override: Option<f64>,
     /// The persisted device profile, shared with the `NodeStatus` provider.
     pub profile: SharedProfile,
+    /// Battery probe for the drain policy (docs/resilience.md); same
+    /// instance the `NodeStatus` provider uses so head and workers apply
+    /// one policy.
+    pub battery_probe: Arc<dyn crate::power::BatteryProbe + Send + Sync>,
+    /// `config.battery_drain_threshold`.
+    pub battery_threshold: u8,
     /// Where `POST /api/internal/bench` persists the profile
     /// (`<config_dir>/profile.toml`).
     pub profile_path: PathBuf,
@@ -333,6 +342,11 @@ async fn bench(State(state): State<Arc<InternalState>>) -> Response {
             // The test-only override wins wherever decode is reported.
             decode_tps: Some(state.decode_tps_override.unwrap_or(stored.decode_tps)),
             disk_mbps: Some(stored.disk_mbps),
+            draining: crate::power::battery_status(
+                state.battery_probe.as_ref(),
+                state.battery_threshold,
+            )
+            .draining,
         });
         for peer in &connected {
             if let Err(err) = state.mesh.send_control(&peer.id, envelope.clone()).await {
@@ -345,10 +359,22 @@ async fn bench(State(state): State<Arc<InternalState>>) -> Response {
 }
 
 /// A model reference resolved to a local file (downloaded if needed).
-struct LocalModel {
-    path: PathBuf,
-    name: String,
-    size_bytes: u64,
+pub(crate) struct LocalModel {
+    pub(crate) path: PathBuf,
+    pub(crate) name: String,
+    pub(crate) size_bytes: u64,
+}
+
+impl From<&LoadedSource> for LocalModel {
+    /// The supervisor's reload path rebuilds the local-model view from the
+    /// recorded source of the model that was loaded (M5).
+    fn from(source: &LoadedSource) -> LocalModel {
+        LocalModel {
+            path: source.path.clone(),
+            name: source.name.clone(),
+            size_bytes: source.size_bytes,
+        }
+    }
 }
 
 /// Resolve + download the reference, emitting `downloading` lines. `None`
@@ -440,27 +466,72 @@ async fn ensure_local(
     }
 }
 
-async fn drive_load(state: Arc<InternalState>, body: LoadBody, tx: LineSender) {
-    // Phase A: the head holds the full GGUF (ADR 0004 head-push weight
-    // flow) — make it local before planning needs its header.
-    let Some(local) = ensure_local(&state, &body.model, &tx).await else {
-        return;
-    };
+/// How a planning attempt failed (factored from `drive_load` for the M5
+/// supervisor, docs/resilience.md step 3: the retry path needs the
+/// infeasible case STRUCTURED — the typed lost-node error carries both MB
+/// numbers — while every other failure stays a user-facing string).
+#[derive(Debug)]
+pub(crate) enum PlanLoadError {
+    /// The model does not fit the eligible node set pooled.
+    DoesNotFit {
+        required_mb: u64,
+        available_mb: u64,
+        /// The scheduler's own user-facing message (used verbatim by the
+        /// normal load path).
+        message: String,
+    },
+    /// Anything else (mesh failures, header parse, other scheduler errors).
+    Other(String),
+}
 
-    // Phase B: plan (M4 scheduler v1: real model dims, device profiles, and
-    // measured link RTTs — docs/scheduler-v1.md).
-    let _ = emit(&tx, serde_json::json!({ "status": "planning" })).await;
+impl PlanLoadError {
+    pub(crate) fn into_message(self) -> String {
+        match self {
+            PlanLoadError::DoesNotFit { message, .. } => message,
+            PlanLoadError::Other(message) => message,
+        }
+    }
+}
+
+/// A stamped placement, ready to activate (factored from `drive_load`).
+pub(crate) struct PlannedLoad {
+    /// The plan with `model` set and — for a distributed plan — a freshly
+    /// stamped epoch.
+    pub(crate) plan: Plan,
+    pub(crate) tensor_split: Vec<f32>,
+    pub(crate) explanation: String,
+    /// Present exactly on distributed plans (the relative comparison
+    /// metric, never a latency promise — §1.6).
+    pub(crate) predicted_tpt_ms: Option<f64>,
+    /// This node's mesh endpoint id (the head).
+    pub(crate) own_id: String,
+}
+
+/// Plan a load of the already-local model at `path` (M4 scheduler v1: real
+/// model dims, device profiles, measured link RTTs — docs/scheduler-v1.md).
+/// Shared by the normal load flow, the M5 supervisor's retry re-plan, and
+/// the lazy rejoin re-plan. Eligible workers are the Connected peers that
+/// reported a budget, minus `exclude` (nodes lost to the failed epoch);
+/// with `exclude_draining` the retry path drops draining peers entirely
+/// (docs/resilience.md step 3: "dead/suspect/draining excluded") instead of
+/// leaving them to the scheduler's include-only-if-infeasible rule.
+pub(crate) async fn plan_load(
+    state: &Arc<InternalState>,
+    model_name: &str,
+    path: &Path,
+    size_bytes: u64,
+    forced_nodes: Option<u32>,
+    exclude: &HashSet<String>,
+    exclude_draining: bool,
+) -> Result<PlannedLoad, PlanLoadError> {
     let override_bytes = state.usable_memory_override;
     let head_status =
         tokio::task::spawn_blocking(move || crate::cluster::local_node_status(override_bytes))
             .await;
     let Ok((head_usable, _devices)) = head_status else {
-        emit_error(
-            &tx,
+        return Err(PlanLoadError::Other(
             "measuring local memory failed; retry the load".to_string(),
-        )
-        .await;
-        return;
+        ));
     };
     // Workers eligible for this plan: connected peers that reported a
     // budget via NodeStatus, in the mesh's (name-sorted, deterministic)
@@ -472,14 +543,13 @@ async fn drive_load(state: Arc<InternalState>, body: LoadBody, tx: LineSender) {
     let peers: Vec<PeerStatus> = loop {
         let all = match state.mesh.peers().await {
             Ok(p) => p,
-            Err(e) => {
-                emit_error(&tx, e.to_string()).await;
-                return;
-            }
+            Err(e) => return Err(PlanLoadError::Other(e.to_string())),
         };
         let connected: Vec<PeerStatus> = all
             .into_iter()
             .filter(|p| p.state == PeerState::Connected)
+            .filter(|p| !exclude.contains(&p.id))
+            .filter(|p| !(exclude_draining && p.draining))
             .collect();
         let missing = connected.iter().any(|p| p.usable_memory_bytes.is_none());
         if !missing || std::time::Instant::now() >= budget_deadline {
@@ -495,31 +565,22 @@ async fn drive_load(state: Arc<InternalState>, body: LoadBody, tx: LineSender) {
     };
     // Model dims (per-layer weight bytes + KV growth rate) from the real
     // GGUF header — replaces the M3 layer-count-only read.
-    let header_path = local.path.clone();
+    let header_path = path.to_path_buf();
     let header =
         match tokio::task::spawn_blocking(move || crate::cluster::read_gguf_header(&header_path))
             .await
         {
             Ok(Ok(header)) => header,
-            Ok(Err(message)) => {
-                emit_error(&tx, message).await;
-                return;
-            }
+            Ok(Err(message)) => return Err(PlanLoadError::Other(message)),
             Err(_) => {
-                emit_error(
-                    &tx,
+                return Err(PlanLoadError::Other(
                     "reading the model header failed; retry the load".to_string(),
-                )
-                .await;
-                return;
+                ))
             }
         };
-    let dims = match onebrain_scheduler::model_dims(&header, local.size_bytes) {
+    let dims = match onebrain_scheduler::model_dims(&header, size_bytes) {
         Ok(dims) => dims,
-        Err(e) => {
-            emit_error(&tx, e.to_string()).await;
-            return;
-        }
+        Err(e) => return Err(PlanLoadError::Other(e.to_string())),
     };
     let own_id = state.mesh.endpoint_id().to_string();
     // Head compute profile: the persisted local profile, with the test-only
@@ -556,6 +617,7 @@ async fn drive_load(state: Arc<InternalState>, body: LoadBody, tx: LineSender) {
                     prefill_tps: p.prefill_tps.unwrap_or(0.0),
                     decode_tps: decode,
                 }),
+            draining: p.draining,
         });
         // Head <-> worker RTT from the heartbeat EWMA. Worker <-> worker
         // links are not measured in M4 and are omitted — the scheduler
@@ -573,33 +635,89 @@ async fn drive_load(state: Arc<InternalState>, body: LoadBody, tx: LineSender) {
             node: NodeId(own_id.clone()),
             usable_memory_bytes: head_usable,
             compute: head_compute,
+            // One policy for head and workers: a draining head still
+            // participates when nothing fits without it (scheduler rule).
+            draining: crate::power::battery_status(
+                state.battery_probe.as_ref(),
+                state.battery_threshold,
+            )
+            .draining,
         },
         workers,
         dims,
         ctx_len: state.ctx_len,
-        forced_nodes: body.nodes,
+        forced_nodes,
         links,
     };
     let placed = match onebrain_scheduler::plan_v1(&request) {
         Ok(p) => p,
-        Err(e) => {
-            emit_error(&tx, e.to_string()).await;
-            return;
+        Err(e @ ScheduleError::DoesNotFit { .. }) => {
+            let ScheduleError::DoesNotFit {
+                required_mb,
+                available_mb,
+            } = e
+            else {
+                unreachable!("matched DoesNotFit above");
+            };
+            return Err(PlanLoadError::DoesNotFit {
+                required_mb,
+                available_mb,
+                message: e.to_string(),
+            });
         }
+        Err(e) => return Err(PlanLoadError::Other(e.to_string())),
     };
     let mut plan = placed.plan;
-    plan.model = local.name.clone();
+    plan.model = model_name.to_string();
     let solo = plan.strategy == Strategy::Solo;
     if !solo {
         plan.epoch = state.cluster.next_epoch();
     }
-    let predicted = (!solo).then(|| predicted_tpt_ms(&plan.assignments, &request));
-    let mut plan_json = serde_json::to_value(&plan).unwrap_or_else(|_| serde_json::json!({}));
-    if let Some(tpt) = predicted {
+    let predicted_tpt_ms = (!solo).then(|| predicted_tpt_ms(&plan.assignments, &request));
+    Ok(PlannedLoad {
+        plan,
+        tensor_split: placed.tensor_split,
+        explanation: placed.explanation,
+        predicted_tpt_ms,
+        own_id,
+    })
+}
+
+async fn drive_load(state: Arc<InternalState>, body: LoadBody, tx: LineSender) {
+    // Phase A: the head holds the full GGUF (ADR 0004 head-push weight
+    // flow) — make it local before planning needs its header.
+    let Some(local) = ensure_local(&state, &body.model, &tx).await else {
+        return;
+    };
+
+    // Phase B: plan (M4 scheduler v1 — factored into `plan_load`, shared
+    // with the M5 supervisor's re-plan paths).
+    let _ = emit(&tx, serde_json::json!({ "status": "planning" })).await;
+    let planned = match plan_load(
+        &state,
+        &local.name,
+        &local.path,
+        local.size_bytes,
+        body.nodes,
+        &HashSet::new(),
+        false,
+    )
+    .await
+    {
+        Ok(planned) => planned,
+        Err(e) => {
+            emit_error(&tx, e.into_message()).await;
+            return;
+        }
+    };
+    let solo = planned.plan.strategy == Strategy::Solo;
+    let mut plan_json =
+        serde_json::to_value(&planned.plan).unwrap_or_else(|_| serde_json::json!({}));
+    if let Some(tpt) = planned.predicted_tpt_ms {
         plan_json["predicted_tpt_ms"] = serde_json::json!(tpt);
     }
     if body.explain {
-        plan_json["explanation"] = serde_json::json!(placed.explanation);
+        plan_json["explanation"] = serde_json::json!(planned.explanation);
     }
     if !emit(
         &tx,
@@ -612,20 +730,19 @@ async fn drive_load(state: Arc<InternalState>, body: LoadBody, tx: LineSender) {
     }
 
     if solo {
-        solo_load(&state, &body.model, plan, placed.explanation, &tx).await;
+        solo_load(&state, &body.model, &local, planned, &tx).await;
     } else {
-        distributed_load(
-            &state,
-            body.model,
-            local,
-            plan,
-            placed.tensor_split,
-            placed.explanation,
-            predicted,
-            own_id,
-            &tx,
-        )
-        .await;
+        let _ = emit(&tx, serde_json::json!({ "status": "loading" })).await;
+        match activate_distributed_plan(&state, &body.model, &local, planned).await {
+            Ok(model) => {
+                let _ = emit(
+                    &tx,
+                    serde_json::json!({ "status": "ready", "model": model }),
+                )
+                .await;
+            }
+            Err(message) => emit_error(&tx, message).await,
+        }
     }
 }
 
@@ -678,13 +795,40 @@ fn predicted_tpt_ms(assignments: &[Assignment], request: &PlanRequest) -> f64 {
     compute_ms + boundary_ms
 }
 
+/// Install the head-side state of a freshly ready SOLO load: the active
+/// plan view, the loaded-model source (M5 — the supervisor's re-plan paths
+/// read it), and the teardown of any replaced distributed plan's bridges
+/// (they are stale — the host dropped that model during the swap, ADR 0004
+/// ordering: model freed first, bridges closed after).
+fn install_solo_active(
+    state: &Arc<InternalState>,
+    reference: &str,
+    local: &LocalModel,
+    plan: Plan,
+    explanation: String,
+) {
+    state.cluster.set_active(Some(ActivePlanView {
+        role: "head",
+        plan,
+        explanation: Some(explanation),
+        predicted_tpt_ms: None,
+    }));
+    state.cluster.teardown_head_bridges();
+    state.cluster.note_loaded(LoadedSource {
+        reference: reference.to_string(),
+        name: local.name.clone(),
+        path: local.path.clone(),
+        size_bytes: local.size_bytes,
+    });
+}
+
 /// The unchanged single-node path: the engine host resolves the (already
 /// cached) reference, loads, and answers; progress is forwarded as NDJSON.
 async fn solo_load(
     state: &Arc<InternalState>,
     reference: &str,
-    plan: Plan,
-    explanation: String,
+    local: &LocalModel,
+    planned: PlannedLoad,
     tx: &LineSender,
 ) {
     let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<LoadProgress>();
@@ -716,20 +860,18 @@ async fn solo_load(
     }
     match resp_rx.await {
         Ok(Ok(model)) => {
-            state.cluster.set_active(Some(ActivePlanView {
-                role: "head",
-                plan,
-                explanation: Some(explanation),
-                predicted_tpt_ms: None,
-            }));
-            // Bridges of any replaced distributed plan are stale now — the
-            // host dropped that model during the swap (ADR 0004 ordering:
-            // model freed first, bridges closed after).
-            state.cluster.teardown_head_bridges();
+            install_solo_active(state, reference, local, planned.plan, planned.explanation);
             let _ = emit(tx, serde_json::json!({ "status": "ready", "model": model })).await;
         }
-        Ok(Err(message)) => emit_error(tx, message).await,
+        Ok(Err(message)) => {
+            // The host dropped any previous model before this load failed:
+            // nothing is loaded now (M5: the supervisor must not reload a
+            // stale source).
+            state.cluster.clear_loaded();
+            emit_error(tx, message).await;
+        }
         Err(_) => {
+            state.cluster.clear_loaded();
             emit_error(
                 tx,
                 "the engine host exited unexpectedly; restart with `onebrain up`".to_string(),
@@ -739,22 +881,66 @@ async fn solo_load(
     }
 }
 
-/// The distributed path (docs/distributed.md "Epoch lifecycle"): propose the
-/// plan, collect acks (15 s, typed error naming the node), open one `rpc`
-/// stream + accept-once loopback bridge per worker, then load through the
-/// engine host with the plan's tensor split.
-#[allow(clippy::too_many_arguments)]
-async fn distributed_load(
+/// SOLO reload without an NDJSON client — the M5 supervisor's retry and
+/// rejoin paths (docs/resilience.md steps 4–5). Progress is drained
+/// silently; the terminal outcome installs the same state as `solo_load`.
+pub(crate) async fn activate_solo_plan(
     state: &Arc<InternalState>,
-    reference: String,
-    local: LocalModel,
-    plan: Plan,
-    tensor_split: Vec<f32>,
-    explanation: String,
-    predicted_tpt_ms: Option<f64>,
-    own_id: String,
-    tx: &LineSender,
-) {
+    reference: &str,
+    local: &LocalModel,
+    planned: PlannedLoad,
+) -> Result<LoadedModel, String> {
+    let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<LoadProgress>();
+    let (resp_tx, resp_rx) = oneshot::channel();
+    if state
+        .host
+        .send(HostMsg::Load {
+            reference: reference.to_string(),
+            cache_root: state.cache_root.clone(),
+            ctx_len: state.ctx_len,
+            progress: progress_tx,
+            resp: resp_tx,
+        })
+        .is_err()
+    {
+        return Err(ApiError::ShuttingDown.to_string());
+    }
+    while progress_rx.recv().await.is_some() {}
+    match resp_rx.await {
+        Ok(Ok(model)) => {
+            install_solo_active(state, reference, local, planned.plan, planned.explanation);
+            Ok(model)
+        }
+        Ok(Err(message)) => {
+            state.cluster.clear_loaded();
+            Err(message)
+        }
+        Err(_) => {
+            state.cluster.clear_loaded();
+            Err("the engine host exited unexpectedly; restart with `onebrain up`".to_string())
+        }
+    }
+}
+
+/// The distributed activation (docs/distributed.md "Epoch lifecycle"):
+/// propose the plan, collect acks (15 s, typed error naming the node), open
+/// one `rpc` stream + loopback bridge per worker, then load through the
+/// engine host with the plan's tensor split. Shared by the NDJSON load flow
+/// and the M5 supervisor's retry/rejoin reloads; on success it installs the
+/// new epoch's bridges, active-plan view, and loaded-model source.
+pub(crate) async fn activate_distributed_plan(
+    state: &Arc<InternalState>,
+    reference: &str,
+    local: &LocalModel,
+    planned: PlannedLoad,
+) -> Result<LoadedModel, String> {
+    let PlannedLoad {
+        plan,
+        tensor_split,
+        explanation,
+        predicted_tpt_ms,
+        own_id,
+    } = planned;
     let epoch = plan.epoch;
     let peers = state.mesh.peers().await.unwrap_or_default();
     let label_of = |id: &str| {
@@ -777,22 +963,13 @@ async fn distributed_load(
     for (id, label) in &workers {
         let envelope = Envelope::new(Message::PlanProposal(plan.clone()));
         if let Err(err) = state.mesh.send_control(id, envelope).await {
-            emit_error(
-                tx,
-                format!("could not send the plan to node '{label}': {err}"),
-            )
-            .await;
-            return;
+            return Err(format!("could not send the plan to node '{label}': {err}"));
         }
     }
-    if let Err(message) = state
+    state
         .cluster
         .await_acks(epoch.0, &workers, Duration::from_secs(15))
-        .await
-    {
-        emit_error(tx, message).await;
-        return;
-    }
+        .await?;
 
     let mut endpoints = Vec::with_capacity(workers.len());
     let mut bridges = Vec::with_capacity(workers.len());
@@ -800,30 +977,33 @@ async fn distributed_load(
         // The bridge opens one fresh mesh rpc stream per accepted loopback
         // connection (the RPC client dials the endpoint repeatedly), so it
         // owns the mesh handle rather than a single pre-opened stream.
-        match crate::cluster::head_bridge(state.mesh.clone(), id.clone(), epoch).await {
+        match crate::cluster::head_bridge(
+            state.mesh.clone(),
+            state.cluster.clone(),
+            id.clone(),
+            epoch,
+        )
+        .await
+        {
             Ok((endpoint, task)) => {
                 endpoints.push(endpoint);
                 bridges.push(task);
             }
             Err(message) => {
                 abort_all(bridges);
-                emit_error(
-                    tx,
-                    format!("could not set up the rpc bridge for node '{label}': {message}"),
-                )
-                .await;
-                return;
+                return Err(format!(
+                    "could not set up the rpc bridge for node '{label}': {message}"
+                ));
             }
         }
     }
 
-    let _ = emit(tx, serde_json::json!({ "status": "loading" })).await;
     let (resp_tx, resp_rx) = oneshot::channel();
     if state
         .host
         .send(HostMsg::LoadDistributed {
             path: local.path.clone(),
-            reference,
+            reference: reference.to_string(),
             name: local.name.clone(),
             ctx_len: state.ctx_len,
             endpoints,
@@ -834,8 +1014,7 @@ async fn distributed_load(
         .is_err()
     {
         abort_all(bridges);
-        emit_error(tx, ApiError::ShuttingDown.to_string()).await;
-        return;
+        return Err(ApiError::ShuttingDown.to_string());
     }
     match resp_rx.await {
         Ok(Ok(model)) => {
@@ -849,19 +1028,24 @@ async fn distributed_load(
                 explanation: Some(explanation),
                 predicted_tpt_ms,
             }));
-            let _ = emit(tx, serde_json::json!({ "status": "ready", "model": model })).await;
+            state.cluster.note_loaded(LoadedSource {
+                reference: reference.to_string(),
+                name: local.name.clone(),
+                path: local.path.clone(),
+                size_bytes: local.size_bytes,
+            });
+            Ok(model)
         }
         Ok(Err(message)) => {
+            // Any previously loaded model was dropped during the swap.
             abort_all(bridges);
-            emit_error(tx, message).await;
+            state.cluster.clear_loaded();
+            Err(message)
         }
         Err(_) => {
             abort_all(bridges);
-            emit_error(
-                tx,
-                "the engine host exited unexpectedly; restart with `onebrain up`".to_string(),
-            )
-            .await;
+            state.cluster.clear_loaded();
+            Err("the engine host exited unexpectedly; restart with `onebrain up`".to_string())
         }
     }
 }
@@ -1039,7 +1223,7 @@ mod tests {
         tempfile::TempDir,
     ) {
         let dir = tempfile::tempdir().unwrap();
-        let (host, host_thread) = EngineHost::spawn();
+        let (host, host_thread) = EngineHost::spawn(None);
         let shutdown = Arc::new(Notify::new());
         let mesh = spawn_test_mesh(dir.path()).await;
         let state = Arc::new(InternalState {
@@ -1061,6 +1245,12 @@ mod tests {
             profile: Arc::new(StdMutex::new(None)),
             // Nested like a real <config_dir>: bench must create parents.
             profile_path: dir.path().join("config").join("profile.toml"),
+            // Deterministic in tests: a desktop-shaped probe never drains.
+            battery_probe: Arc::new(crate::power::mock::MockBattery {
+                level: None,
+                ac: Some(true),
+            }),
+            battery_threshold: 25,
         });
         let app = internal_router(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

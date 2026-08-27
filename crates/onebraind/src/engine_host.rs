@@ -5,11 +5,26 @@
 //! internal-api contract "Engine host"). The HTTP side talks to it through
 //! [`EngineHost`] (cheap clonable sender) and [`DaemonBackend`], the
 //! [`EngineBackend`] implementation the gateway routes into.
+//!
+//! # Generation supervision (M5, docs/resilience.md)
+//!
+//! Since M5 the gateway's jobs are not sent to this thread directly: they
+//! flow through the daemon's [`crate::supervisor`] task, which wraps each
+//! one in a [`SupervisedGenerate`] carrying an `outcome` channel. On an
+//! [`EngineError::Decode`] while the loaded model is DISTRIBUTED, the host
+//! sends nothing terminal on `job.tx`; it reports
+//! [`GenOutcome::Interrupted`] (prompt tokens, generated tokens, pieces
+//! already streamed) so the supervisor can tear the failed epoch down,
+//! re-plan, and retry transparently into the same client stream. Solo-model
+//! decode failures keep the pre-M5 behavior: a terminal
+//! [`TokenEvent::Error`] on `job.tx`.
 
 use std::collections::BTreeMap;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc as std_mpsc;
+use std::sync::Arc;
 use std::time::Duration;
 
 use onebrain_api::backend::{
@@ -18,12 +33,16 @@ use onebrain_api::backend::{
 };
 use onebrain_api::ApiError;
 use onebrain_engine::rpc::RemoteServer;
-use onebrain_engine::{FinishReason, Model, ModelParams, SamplerParams, Session, SessionParams};
+use onebrain_engine::{
+    EngineError, FinishReason, Model, ModelParams, SamplerParams, Session, SessionParams, Token,
+};
 use onebrain_models::registry::{ModelRef, Resolved};
 use onebrain_models::{cache, download};
 use onebrain_proto::plan::Epoch;
 use serde::Serialize;
 use tokio::sync::{mpsc, oneshot};
+
+use crate::supervisor::{SupervisorMsg, SupervisorTx};
 
 /// Summary of the currently loaded model, in the wire shape the internal
 /// status/load endpoints emit (`{"name","size_bytes","n_layer","n_ctx"}`).
@@ -44,7 +63,84 @@ pub enum LoadProgress {
     Loading,
 }
 
+/// One generation under daemon supervision (M5, docs/resilience.md
+/// "Failure lifecycle"): the job itself, an optional retry prefix, and the
+/// channel the host reports the attempt's outcome on.
+#[derive(Debug)]
+pub struct SupervisedGenerate {
+    pub job: GenerateJob,
+    /// `Some` on the supervisor's transparent retry: prefill this state's
+    /// prompt + already-generated tokens instead of tokenizing the prompt,
+    /// then continue sampling — already-sent pieces are never re-sent.
+    pub resume: Option<ResumeState>,
+    /// Where the host reports how the attempt ended. Best-effort: a gone
+    /// receiver (daemon shutting down) is ignored.
+    pub outcome: oneshot::Sender<GenOutcome>,
+}
+
+/// How one supervised generation attempt ended.
+#[derive(Debug)]
+pub enum GenOutcome {
+    /// The job's stream was terminated on `job.tx` (`Done` or `Error`) —
+    /// successful completions, validation failures, solo decode errors.
+    Finished,
+    /// A decode failure against a DISTRIBUTED model: `job.tx` received no
+    /// terminal event; the supervisor owns the retry-or-fail decision
+    /// (docs/resilience.md step 2 "the daemon does NOT surface it yet").
+    Interrupted(Box<InterruptedGen>),
+}
+
+/// Everything the supervisor needs to retry an interrupted generation into
+/// the same client stream: the job (with its live `tx`), the exact token
+/// prefix (prompt + generated so far), how many pieces the client already
+/// received, and the stop-scan state so cross-retry stop matching works.
+#[derive(Debug)]
+pub struct InterruptedGen {
+    pub job: GenerateJob,
+    /// The original prompt's tokens (fresh attempt: tokenized here; retry:
+    /// carried through unchanged).
+    pub prompt_tokens: Vec<Token>,
+    /// Every token generated so far, across attempts — the retry prefix is
+    /// `prompt_tokens + generated_tokens`.
+    pub generated_tokens: Vec<Token>,
+    /// Pieces already streamed to the client (never re-sent; carried so a
+    /// later attempt keeps the cumulative count).
+    pub pieces_sent: usize,
+    /// Stop-string scan state, carried so a stop match straddling the
+    /// failure point is still caught.
+    pub scan: StopScan,
+    /// The engine error that interrupted the attempt (user-facing string).
+    pub error: String,
+}
+
+impl InterruptedGen {
+    /// Split into the job to re-issue and the retry prefix for the next
+    /// attempt.
+    pub fn into_retry(self) -> (GenerateJob, ResumeState) {
+        (
+            self.job,
+            ResumeState {
+                prompt_tokens: self.prompt_tokens,
+                generated_tokens: self.generated_tokens,
+                pieces_sent: self.pieces_sent,
+                scan: self.scan,
+            },
+        )
+    }
+}
+
+/// Retry prefix for a supervised re-issue (fields mirror
+/// [`InterruptedGen`]).
+#[derive(Debug)]
+pub struct ResumeState {
+    pub prompt_tokens: Vec<Token>,
+    pub generated_tokens: Vec<Token>,
+    pub pieces_sent: usize,
+    pub scan: StopScan,
+}
+
 /// Messages into the engine-host thread.
+#[derive(Debug)]
 pub enum HostMsg {
     /// Load `reference` (registry id, `hf:…`, or local path), replacing any
     /// currently loaded model. Download progress flows through `progress`;
@@ -81,8 +177,11 @@ pub enum HostMsg {
         use_local_device: bool,
         resp: oneshot::Sender<Result<LoadedModel, String>>,
     },
-    /// Run one generation; all outcomes flow through `job.tx`.
-    Generate(GenerateJob),
+    /// Run one supervised generation attempt (M5): client-visible events
+    /// flow through `job.tx`, the attempt outcome through `outcome` —
+    /// except a distributed decode failure, which reaches ONLY `outcome`
+    /// (the supervisor decides what the client sees).
+    Generate(SupervisedGenerate),
     /// Ask what is loaded. Answered over a std channel so non-async callers
     /// (the sync [`EngineBackend::models`]) can wait with a timeout; the
     /// host replies with `try_send`, so a caller that gave up never blocks
@@ -110,23 +209,61 @@ pub enum HostMsg {
 #[derive(Clone)]
 pub struct EngineHost {
     tx: std_mpsc::Sender<HostMsg>,
+    /// Generation jobs accepted by the gateway and not yet fully handled by
+    /// the supervisor (queued + in flight). Feeds [`EngineHost::is_idle`],
+    /// which gates the M5 lazy re-plan and the no-job-in-flight death
+    /// teardown (docs/resilience.md).
+    jobs: Arc<AtomicUsize>,
 }
 
 impl EngineHost {
     /// Start the engine-host thread. Join the returned handle after sending
     /// [`HostMsg::Shutdown`] and before calling `onebrain_engine::shutdown`.
-    pub fn spawn() -> (EngineHost, std::thread::JoinHandle<()>) {
+    /// `decode_delay` is the test-only `[debug] decode_delay_ms` knob
+    /// (docs/resilience.md): when set the host sleeps that long after
+    /// emitting each token piece; `None` (all real deployments) adds no
+    /// delay anywhere.
+    pub fn spawn(decode_delay: Option<Duration>) -> (EngineHost, std::thread::JoinHandle<()>) {
         let (tx, rx) = std_mpsc::channel();
         let handle = std::thread::Builder::new()
             .name("engine-host".into())
-            .spawn(move || host_loop(rx))
+            .spawn(move || host_loop(rx, decode_delay))
             .expect("spawning the engine host thread failed; the system is out of resources");
-        (EngineHost { tx }, handle)
+        (
+            EngineHost {
+                tx,
+                jobs: Arc::new(AtomicUsize::new(0)),
+            },
+            handle,
+        )
     }
 
     /// Send a message; `Err` means the host thread is gone (shutdown).
     pub fn send(&self, msg: HostMsg) -> Result<(), ApiError> {
         self.tx.send(msg).map_err(|_| ApiError::ShuttingDown)
+    }
+
+    /// Send a message, handing it BACK when the host thread is gone so the
+    /// caller can still terminate the job's client stream itself.
+    pub fn send_or_return(&self, msg: HostMsg) -> Result<(), Box<HostMsg>> {
+        self.tx.send(msg).map_err(|e| Box::new(e.0))
+    }
+
+    /// A generation job entered the daemon (gateway accepted it). Paired
+    /// with [`EngineHost::job_finished`] by the supervisor.
+    pub fn job_started(&self) {
+        self.jobs.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// The supervisor fully finished a job (including any retry).
+    pub fn job_finished(&self) {
+        self.jobs.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// `true` when no generation job is queued or in flight (M5 idle probe:
+    /// gates the lazy rejoin re-plan and the idle death teardown).
+    pub fn is_idle(&self) -> bool {
+        self.jobs.load(Ordering::SeqCst) == 0
     }
 
     /// Blocking round-trip for the loaded-model summary. `None` after
@@ -174,7 +311,7 @@ enum Pending {
     Dist(DistLoadReq),
 }
 
-fn host_loop(rx: std_mpsc::Receiver<HostMsg>) {
+fn host_loop(rx: std_mpsc::Receiver<HostMsg>, decode_delay: Option<Duration>) {
     // Small runtime owned by this thread, used only to drive downloads.
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -195,7 +332,7 @@ fn host_loop(rx: std_mpsc::Receiver<HostMsg>) {
                     Ok(HostMsg::Models { resp }) => {
                         let _ = resp.try_send(None);
                     }
-                    Ok(HostMsg::Generate(job)) => {
+                    Ok(HostMsg::Generate(sup)) => {
                         let message = match serving_shard {
                             Some(epoch) => format!(
                                 "{} (this node is serving a pipeline shard for epoch {epoch}; \
@@ -204,7 +341,8 @@ fn host_loop(rx: std_mpsc::Receiver<HostMsg>) {
                             ),
                             None => ApiError::NoModel.to_string(),
                         };
-                        let _ = job.tx.blocking_send(TokenEvent::Error(message));
+                        let _ = sup.job.tx.blocking_send(TokenEvent::Error(message));
+                        let _ = sup.outcome.send(GenOutcome::Finished);
                     }
                     Ok(HostMsg::ServeShard { epoch }) => {
                         tracing::info!(epoch = epoch.0, "engine host entering shard-serving state");
@@ -254,8 +392,10 @@ fn host_loop(rx: std_mpsc::Receiver<HostMsg>) {
         };
 
         // Phase 2: obtain a loaded model (solo: resolve + download + load;
-        // distributed: register bridged RPC servers + split load).
-        let (model, info, reference, resp) = match req {
+        // distributed: register bridged RPC servers + split load). The
+        // `distributed` flag decides M5 decode-failure handling: only a
+        // distributed model's decode failure is supervisor-retryable.
+        let (model, info, reference, resp, distributed) = match req {
             Pending::Solo(req) => {
                 let LoadReq {
                     reference,
@@ -290,7 +430,7 @@ fn host_loop(rx: std_mpsc::Receiver<HostMsg>) {
                     n_layer: model.n_layer(),
                     n_ctx: ctx_len,
                 };
-                (model, info, reference, resp)
+                (model, info, reference, resp, false)
             }
             Pending::Dist(req) => {
                 let DistLoadReq {
@@ -339,7 +479,7 @@ fn host_loop(rx: std_mpsc::Receiver<HostMsg>) {
                     n_layer: model.n_layer(),
                     n_ctx: ctx_len,
                 };
-                (model, info, reference, resp)
+                (model, info, reference, resp, true)
             }
         };
         let mut session = match Session::new(
@@ -367,7 +507,14 @@ fn host_loop(rx: std_mpsc::Receiver<HostMsg>) {
                 Ok(HostMsg::Models { resp }) => {
                     let _ = resp.try_send(Some(info.clone()));
                 }
-                Ok(HostMsg::Generate(job)) => run_generation(&mut session, &info, &reference, job),
+                Ok(HostMsg::Generate(sup)) => run_generation(
+                    &mut session,
+                    &info,
+                    &reference,
+                    distributed,
+                    decode_delay,
+                    sup,
+                ),
                 Ok(HostMsg::Unload { resp }) => {
                     tracing::info!(model = %info.name, "unloading model");
                     // Drop BEFORE replying: the daemon sequences epoch
@@ -509,53 +656,111 @@ impl ProgressThrottle {
     }
 }
 
-/// One queued generation, executed to completion on the host thread.
+/// One queued generation attempt, executed to completion on the host
+/// thread. Fresh attempts tokenize the prompt; retries (`sup.resume`)
+/// prefill the carried prompt + generated tokens and continue sampling,
+/// streaming only NEW pieces (docs/resilience.md step 4). A decode failure
+/// against a distributed model reports [`GenOutcome::Interrupted`] instead
+/// of a terminal client event; everything else terminates `job.tx` exactly
+/// as before M5.
 fn run_generation(
     session: &mut Session<'_>,
     info: &LoadedModel,
     loaded_reference: &str,
-    job: GenerateJob,
+    distributed: bool,
+    decode_delay: Option<Duration>,
+    sup: SupervisedGenerate,
 ) {
+    let SupervisedGenerate {
+        job,
+        resume,
+        outcome,
+    } = sup;
+    // Terminate the stream with an error; the attempt is Finished.
+    let finish_error =
+        |job: &GenerateJob, outcome: oneshot::Sender<GenOutcome>, message: String| {
+            let _ = job.tx.blocking_send(TokenEvent::Error(message));
+            let _ = outcome.send(GenOutcome::Finished);
+        };
+
     // Accept the canonical loaded name and the reference the load was
     // requested with (`hf:…` refs cache under a sanitized key; clients may
     // use either spelling).
     if job.model != info.name && job.model != loaded_reference {
-        let _ = job.tx.blocking_send(TokenEvent::Error(
-            ApiError::ModelNotLoaded(job.model.clone()).to_string(),
-        ));
+        let message = ApiError::ModelNotLoaded(job.model.clone()).to_string();
+        finish_error(&job, outcome, message);
         return;
     }
 
-    let prompt_text = match render_prompt(session.model(), info, &job.prompt) {
-        Ok(text) => text,
-        Err(message) => {
-            let _ = job.tx.blocking_send(TokenEvent::Error(message));
-            return;
-        }
-    };
-    let prompt_tokens = match session.model().tokenize(&prompt_text, true) {
-        Ok(toks) => toks,
-        Err(e) => {
-            let _ = job.tx.blocking_send(TokenEvent::Error(e.to_string()));
-            return;
-        }
-    };
     let max_tokens = job.params.max_tokens as usize;
-    if prompt_tokens.len() + max_tokens > info.n_ctx as usize {
-        let message = ApiError::BadRequest(format!(
-            "the prompt is {} tokens and max_tokens is {}, which together exceed \
-             the context length of {}; shorten the prompt, lower max_tokens, or \
-             raise ctx_len in config.toml",
-            prompt_tokens.len(),
-            max_tokens,
-            info.n_ctx
-        ))
-        .to_string();
-        let _ = job.tx.blocking_send(TokenEvent::Error(message));
+    let (prompt_tokens, prior_generated, prior_pieces, mut scan) = match resume {
+        Some(state) => (
+            state.prompt_tokens,
+            state.generated_tokens,
+            state.pieces_sent,
+            state.scan,
+        ),
+        None => {
+            let prompt_text = match render_prompt(session.model(), info, &job.prompt) {
+                Ok(text) => text,
+                Err(message) => {
+                    finish_error(&job, outcome, message);
+                    return;
+                }
+            };
+            let prompt_tokens = match session.model().tokenize(&prompt_text, true) {
+                Ok(toks) => toks,
+                Err(e) => {
+                    finish_error(&job, outcome, e.to_string());
+                    return;
+                }
+            };
+            if prompt_tokens.len() + max_tokens > info.n_ctx as usize {
+                let message = ApiError::BadRequest(format!(
+                    "the prompt is {} tokens and max_tokens is {}, which together exceed \
+                     the context length of {}; shorten the prompt, lower max_tokens, or \
+                     raise ctx_len in config.toml",
+                    prompt_tokens.len(),
+                    max_tokens,
+                    info.n_ctx
+                ))
+                .to_string();
+                finish_error(&job, outcome, message);
+                return;
+            }
+            (
+                prompt_tokens,
+                Vec::new(),
+                0,
+                StopScan::new(job.params.stop.clone()),
+            )
+        }
+    };
+    // Budget left for this attempt. The fresh path checked prompt +
+    // max_tokens against n_ctx, and prefix + remaining equals exactly that
+    // sum, so no re-check is needed on resume.
+    let remaining = max_tokens.saturating_sub(prior_generated.len());
+    if remaining == 0 {
+        // Interrupted on the very last token's decode: every piece already
+        // reached the client — finish as Length without touching the engine.
+        let _ = job.tx.blocking_send(TokenEvent::Done(DoneStats {
+            prompt_tokens: prompt_tokens.len() as u32,
+            completion_tokens: prior_generated.len() as u32,
+            finish: FinishKind::Length,
+        }));
+        let _ = outcome.send(GenOutcome::Finished);
         return;
     }
+    let prefix: Vec<Token> = prompt_tokens
+        .iter()
+        .chain(prior_generated.iter())
+        .copied()
+        .collect();
 
     session.reset();
+    // On a retry the sampler (and its seed chain) restarts — exact for
+    // greedy/temp<=0; documented-acceptable for sampled runs
+    // (docs/resilience.md step 4).
     session.set_sampler(&SamplerParams {
         temperature: job.params.temperature,
         top_p: job.params.top_p,
@@ -563,9 +768,13 @@ fn run_generation(
         seed: job.params.seed.unwrap_or(0xFFFF_FFFF),
     });
 
-    let mut scan = StopScan::new(job.params.stop.clone());
     let mut stop_matched = false;
-    let result = session.generate(&prompt_tokens, max_tokens, |_tok, piece| {
+    let mut attempt_tokens: Vec<Token> = Vec::new();
+    let mut pieces_sent = prior_pieces;
+    let result = session.generate(&prefix, remaining, |tok, piece| {
+        // Record BEFORE the send/decode: a token whose piece reached the
+        // client must be part of any retry prefix.
+        attempt_tokens.push(tok);
         if !scan.admit(piece) {
             // The piece completes a stop-string match: hold it back and end
             // the generation (contract: finish Stop without sending it).
@@ -573,14 +782,42 @@ fn run_generation(
             return ControlFlow::Break(());
         }
         match job.tx.blocking_send(TokenEvent::Token(piece.to_string())) {
-            Ok(()) => ControlFlow::Continue(()),
+            Ok(()) => {
+                pieces_sent += 1;
+                if let Some(delay) = decode_delay {
+                    // Test-only `[debug] decode_delay_ms`: a deterministic
+                    // kill window for the chaos sim.
+                    std::thread::sleep(delay);
+                }
+                ControlFlow::Continue(())
+            }
             Err(_) => ControlFlow::Break(()), // client went away
         }
     });
     match result {
-        Err(e) => {
-            let _ = job.tx.blocking_send(TokenEvent::Error(e.to_string()));
+        Err(e @ EngineError::Decode { .. }) if distributed => {
+            // M5 failure lifecycle step 2: nothing terminal on job.tx — the
+            // supervisor owns retry-or-fail. The torn model stays loaded
+            // until the supervisor unloads it (patched frees tolerate dead
+            // bridges, patches/0002).
+            tracing::warn!(
+                error = %e,
+                generated = prior_generated.len() + attempt_tokens.len(),
+                pieces_sent,
+                "distributed decode failed; reporting the interruption to the supervisor"
+            );
+            let mut generated_tokens = prior_generated;
+            generated_tokens.extend(attempt_tokens);
+            let _ = outcome.send(GenOutcome::Interrupted(Box::new(InterruptedGen {
+                job,
+                prompt_tokens,
+                generated_tokens,
+                pieces_sent,
+                scan,
+                error: e.to_string(),
+            })));
         }
+        Err(e) => finish_error(&job, outcome, e.to_string()),
         Ok(stats) => {
             let finish = match stats.finished {
                 FinishReason::Stop => FinishKind::Stop,
@@ -588,11 +825,14 @@ fn run_generation(
                 FinishReason::Aborted if stop_matched => FinishKind::Stop,
                 FinishReason::Aborted => FinishKind::Abort,
             };
+            // Client-visible stats span ALL attempts: the original prompt
+            // length and the cumulative completion count.
             let _ = job.tx.blocking_send(TokenEvent::Done(DoneStats {
-                prompt_tokens: stats.prompt_tokens as u32,
-                completion_tokens: stats.generated_tokens as u32,
+                prompt_tokens: prompt_tokens.len() as u32,
+                completion_tokens: (prior_generated.len() + stats.generated_tokens) as u32,
                 finish,
             }));
+            let _ = outcome.send(GenOutcome::Finished);
         }
     }
 }
@@ -683,15 +923,23 @@ impl StopScan {
 }
 
 /// The daemon's [`EngineBackend`]: routes gateway requests into the
-/// engine-host thread and the model cache.
+/// daemon's supervisor task (which drives the engine-host thread — M5) and
+/// the model cache.
 pub struct DaemonBackend {
     host: EngineHost,
     cache_root: PathBuf,
+    /// Generation jobs go here; the supervisor owns their whole lifecycle
+    /// (attempt, transparent retry, terminal event — docs/resilience.md).
+    supervisor: SupervisorTx,
 }
 
 impl DaemonBackend {
-    pub fn new(host: EngineHost, cache_root: PathBuf) -> DaemonBackend {
-        DaemonBackend { host, cache_root }
+    pub fn new(host: EngineHost, cache_root: PathBuf, supervisor: SupervisorTx) -> DaemonBackend {
+        DaemonBackend {
+            host,
+            cache_root,
+            supervisor,
+        }
     }
 }
 
@@ -735,7 +983,15 @@ impl EngineBackend for DaemonBackend {
     }
 
     fn generate(&self, job: GenerateJob) -> Result<(), ApiError> {
-        self.host.send(HostMsg::Generate(job))
+        // Count the job BEFORE it is visible to the supervisor so the M5
+        // idle probe never reads idle while a job is en route; the
+        // supervisor decrements when the job's lifecycle fully ends.
+        self.host.job_started();
+        if self.supervisor.send(SupervisorMsg::Generate(job)).is_err() {
+            self.host.job_finished();
+            return Err(ApiError::ShuttingDown);
+        }
+        Ok(())
     }
 
     fn pull(&self, model: String, tx: mpsc::Sender<PullEvent>) -> Result<(), ApiError> {
@@ -791,6 +1047,156 @@ impl EngineBackend for DaemonBackend {
 mod tests {
     use super::*;
 
+    /// Load the OB_SMOKE_MODEL solo into a fresh host (by its local path)
+    /// and hand back everything a supervised-generation test needs. `None`
+    /// when the env var is unset (the test should skip).
+    fn spawn_with_smoke_model(
+        decode_delay: Option<Duration>,
+    ) -> Option<(EngineHost, std::thread::JoinHandle<()>, String)> {
+        let Ok(smoke) = std::env::var("OB_SMOKE_MODEL") else {
+            eprintln!("OB_SMOKE_MODEL not set; skipping supervised generation test");
+            return None;
+        };
+        let (host, handle) = EngineHost::spawn(decode_delay);
+        let (ptx, _prx) = mpsc::unbounded_channel();
+        let (rtx, rrx) = oneshot::channel();
+        host.send(HostMsg::Load {
+            reference: smoke.clone(),
+            cache_root: std::env::temp_dir(),
+            ctx_len: 512,
+            progress: ptx,
+            resp: rtx,
+        })
+        .unwrap();
+        rrx.blocking_recv()
+            .expect("host answers")
+            .expect("smoke model loads");
+        Some((host, handle, smoke))
+    }
+
+    fn greedy_job(model: String, max_tokens: u32, tx: mpsc::Sender<TokenEvent>) -> GenerateJob {
+        GenerateJob {
+            model,
+            prompt: PromptInput::Raw("Once upon a time".into()),
+            params: onebrain_api::backend::GenParams {
+                max_tokens,
+                temperature: 0.0,
+                ..Default::default()
+            },
+            tx,
+        }
+    }
+
+    #[test]
+    fn supervised_generation_streams_and_reports_finished() {
+        let Some((host, handle, smoke)) = spawn_with_smoke_model(None) else {
+            return;
+        };
+        let (tx, mut rx) = mpsc::channel(64);
+        let (otx, orx) = oneshot::channel();
+        host.send(HostMsg::Generate(SupervisedGenerate {
+            job: greedy_job(smoke, 4, tx),
+            resume: None,
+            outcome: otx,
+        }))
+        .unwrap();
+        let mut tokens = 0;
+        let done = loop {
+            match rx.blocking_recv().expect("stream must terminate") {
+                TokenEvent::Token(_) => tokens += 1,
+                TokenEvent::Done(stats) => break stats,
+                TokenEvent::Error(e) => panic!("unexpected error: {e}"),
+            }
+        };
+        assert!(tokens > 0, "at least one piece must stream");
+        assert_eq!(done.completion_tokens as usize, tokens);
+        assert!(matches!(
+            orx.blocking_recv().expect("outcome must arrive"),
+            GenOutcome::Finished
+        ));
+        host.send(HostMsg::Shutdown).unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn supervised_resume_with_spent_budget_finishes_as_length() {
+        // The retry edge case: interrupted on the very last token's decode —
+        // every piece already reached the client, so the resumed attempt
+        // must terminate as Length with the CUMULATIVE stats and without
+        // re-sending anything.
+        let Some((host, handle, smoke)) = spawn_with_smoke_model(None) else {
+            return;
+        };
+        let (tx, mut rx) = mpsc::channel(8);
+        let (otx, orx) = oneshot::channel();
+        host.send(HostMsg::Generate(SupervisedGenerate {
+            job: greedy_job(smoke, 2, tx),
+            resume: Some(ResumeState {
+                prompt_tokens: vec![1, 2, 3],
+                generated_tokens: vec![4, 5],
+                pieces_sent: 2,
+                scan: StopScan::new(vec![]),
+            }),
+            outcome: otx,
+        }))
+        .unwrap();
+        match rx.blocking_recv().expect("stream must terminate") {
+            TokenEvent::Done(stats) => {
+                assert_eq!(stats.prompt_tokens, 3, "original prompt length");
+                assert_eq!(stats.completion_tokens, 2, "cumulative completion");
+                assert_eq!(stats.finish, FinishKind::Length);
+            }
+            other => panic!("expected an immediate Done, got {other:?}"),
+        }
+        assert!(matches!(
+            orx.blocking_recv().expect("outcome must arrive"),
+            GenOutcome::Finished
+        ));
+        host.send(HostMsg::Shutdown).unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn decode_delay_slows_streaming_by_the_configured_amount() {
+        // [debug] decode_delay_ms: 3 pieces at a 50 ms per-piece sleep must
+        // take at least ~2 sleeps of wall time (conservative lower bound —
+        // the knob exists to give the chaos sim a kill window).
+        let Some((host, handle, smoke)) = spawn_with_smoke_model(Some(Duration::from_millis(50)))
+        else {
+            return;
+        };
+        let (tx, mut rx) = mpsc::channel(64);
+        let (otx, orx) = oneshot::channel();
+        let started = std::time::Instant::now();
+        host.send(HostMsg::Generate(SupervisedGenerate {
+            job: greedy_job(smoke, 3, tx),
+            resume: None,
+            outcome: otx,
+        }))
+        .unwrap();
+        let mut tokens = 0;
+        loop {
+            match rx.blocking_recv().expect("stream must terminate") {
+                TokenEvent::Token(_) => tokens += 1,
+                TokenEvent::Done(_) => break,
+                TokenEvent::Error(e) => panic!("unexpected error: {e}"),
+            }
+        }
+        assert!(matches!(
+            orx.blocking_recv().expect("outcome must arrive"),
+            GenOutcome::Finished
+        ));
+        if tokens >= 3 {
+            assert!(
+                started.elapsed() >= Duration::from_millis(100),
+                "3 pieces at 50 ms each must take at least ~100 ms, took {:?}",
+                started.elapsed()
+            );
+        }
+        host.send(HostMsg::Shutdown).unwrap();
+        handle.join().unwrap();
+    }
+
     #[test]
     fn stop_scan_holds_back_the_completing_piece() {
         // Contract example: pieces "he" · "llo w" · "orld" with stop "lo w"
@@ -843,13 +1249,18 @@ mod tests {
 
     #[test]
     fn generate_before_load_reports_no_model() {
-        let (host, handle) = EngineHost::spawn();
+        let (host, handle) = EngineHost::spawn(None);
         let (tx, mut rx) = mpsc::channel(8);
-        host.send(HostMsg::Generate(GenerateJob {
-            model: "anything".into(),
-            prompt: PromptInput::Raw("hi".into()),
-            params: Default::default(),
-            tx,
+        let (otx, orx) = oneshot::channel();
+        host.send(HostMsg::Generate(SupervisedGenerate {
+            job: GenerateJob {
+                model: "anything".into(),
+                prompt: PromptInput::Raw("hi".into()),
+                params: Default::default(),
+                tx,
+            },
+            resume: None,
+            outcome: otx,
         }))
         .unwrap();
         let event = rx.blocking_recv().expect("host must terminate the stream");
@@ -863,14 +1274,35 @@ mod tests {
             }
             other => panic!("expected Error, got {other:?}"),
         }
+        // The attempt outcome is Finished: the stream was terminated here,
+        // nothing for the supervisor to retry.
+        match orx.blocking_recv().expect("host must report an outcome") {
+            GenOutcome::Finished => {}
+            other => panic!("expected Finished, got {other:?}"),
+        }
         host.send(HostMsg::Shutdown).unwrap();
         handle.join().unwrap();
     }
 
     #[test]
     fn models_before_load_is_none() {
-        let (host, handle) = EngineHost::spawn();
+        let (host, handle) = EngineHost::spawn(None);
         assert_eq!(host.loaded_model(Duration::from_secs(5)), None);
+        host.send(HostMsg::Shutdown).unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn idle_probe_tracks_the_job_counter() {
+        let (host, handle) = EngineHost::spawn(None);
+        assert!(host.is_idle(), "a fresh host has no jobs");
+        host.job_started();
+        assert!(!host.is_idle(), "a queued job must clear the idle probe");
+        host.job_started();
+        host.job_finished();
+        assert!(!host.is_idle(), "one of two jobs finishing is not idle");
+        host.job_finished();
+        assert!(host.is_idle(), "all jobs finished; idle again");
         host.send(HostMsg::Shutdown).unwrap();
         handle.join().unwrap();
     }
@@ -878,7 +1310,7 @@ mod tests {
     #[test]
     fn load_with_unknown_reference_fails_with_remedy() {
         let dir = tempfile::tempdir().unwrap();
-        let (host, handle) = EngineHost::spawn();
+        let (host, handle) = EngineHost::spawn(None);
         let (ptx, _prx) = mpsc::unbounded_channel();
         let (rtx, rrx) = oneshot::channel();
         host.send(HostMsg::Load {

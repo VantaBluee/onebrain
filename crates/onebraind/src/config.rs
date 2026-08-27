@@ -49,6 +49,11 @@ pub struct DebugSection {
     /// hardware differences. It never changes how fast the engine actually
     /// runs, only how the scheduler weighs this node.
     pub decode_tps_override: Option<f64>,
+    /// TEST-ONLY (docs/resilience.md "Sim / DoD hooks"): when set, the
+    /// engine host sleeps this many milliseconds after emitting each token
+    /// piece, giving the chaos sim a deterministic window to kill a worker
+    /// mid-stream. Never consulted in real paths when unset (the default).
+    pub decode_delay_ms: Option<u64>,
 }
 
 /// The `[mesh]` table: switches passed to `onebrain-mesh::MeshConfig`.
@@ -198,6 +203,7 @@ mod tests {
         let c = Config::default();
         assert_eq!(c.debug.usable_memory_override_bytes, None);
         assert_eq!(c.debug.decode_tps_override, None);
+        assert_eq!(c.debug.decode_delay_ms, None);
         // A config file without a [debug] table parses to the same default.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
@@ -237,6 +243,30 @@ mod tests {
             debug: DebugSection {
                 usable_memory_override_bytes: Some(256 * 1024 * 1024),
                 decode_tps_override: None,
+                decode_delay_ms: None,
+            },
+            ..Default::default()
+        };
+        c.save(&path).unwrap();
+        assert_eq!(Config::load(&path).unwrap(), c);
+    }
+
+    #[test]
+    fn decode_delay_ms_parses_and_roundtrips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        // Parse from a hand-written chaos-sim config.
+        std::fs::write(&path, "[debug]\ndecode_delay_ms = 40\n").unwrap();
+        let c = Config::load(&path).unwrap();
+        assert_eq!(c.debug.decode_delay_ms, Some(40));
+        // The other debug knobs stay unset.
+        assert_eq!(c.debug.usable_memory_override_bytes, None);
+        assert_eq!(c.debug.decode_tps_override, None);
+        // Full save/load roundtrip.
+        let c = Config {
+            debug: DebugSection {
+                decode_delay_ms: Some(25),
+                ..Default::default()
             },
             ..Default::default()
         };
@@ -259,6 +289,7 @@ mod tests {
             debug: DebugSection {
                 usable_memory_override_bytes: Some(1 << 30),
                 decode_tps_override: Some(80.25),
+                decode_delay_ms: None,
             },
             ..Default::default()
         };

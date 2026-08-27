@@ -18,7 +18,12 @@ use crate::engine_host::{DaemonBackend, EngineHost, HostMsg};
 use crate::lock::{self, DaemonLock, RunInfo};
 use crate::paths::AppPaths;
 use crate::server::{internal_router, InternalState};
+use crate::supervisor::{self, SupervisorMsg, SupervisorTx};
 use crate::{token, DaemonError};
+
+/// Grace given to in-flight serve traffic after the polite `Draining`
+/// notice on `onebrain stop` (docs/resilience.md "Worker-side drain").
+const DRAIN_GRACE: Duration = Duration::from_secs(3);
 
 /// Run the daemon until shutdown (internal endpoint or Ctrl-C/SIGTERM-
 /// equivalent console signal). Blocks the calling thread for the daemon's
@@ -67,7 +72,17 @@ pub fn run_blocking() -> Result<(), DaemonError> {
         }
     };
 
-    let (host, host_thread) = EngineHost::spawn();
+    // Test-only `[debug] decode_delay_ms` (docs/resilience.md): a
+    // per-piece sleep that gives the chaos sim a deterministic kill window;
+    // None (every real deployment) adds no delay anywhere.
+    let decode_delay = config.debug.decode_delay_ms.map(Duration::from_millis);
+    if decode_delay.is_some() {
+        tracing::warn!(
+            delay_ms = config.debug.decode_delay_ms,
+            "[debug] decode_delay_ms is set; token streaming is artificially slowed (test-only)"
+        );
+    }
+    let (host, host_thread) = EngineHost::spawn(decode_delay);
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -108,6 +123,12 @@ pub fn run_blocking() -> Result<(), DaemonError> {
     let debug_override = config.debug.usable_memory_override_bytes;
     let decode_override = config.debug.decode_tps_override;
     let status_profile = profile.clone();
+    // Battery policy inputs (docs/resilience.md "Power realities"): one
+    // probe shared by the NodeStatus provider and the internal API.
+    let battery_probe: Arc<dyn crate::power::BatteryProbe + Send + Sync> =
+        Arc::from(crate::power::platform_battery_probe());
+    let battery_threshold = config.battery_drain_threshold;
+    let status_battery_probe = battery_probe.clone();
     let bind_addrs = match &config.mesh.bind_addr {
         Some(addr) => vec![addr.parse().map_err(|e| DaemonError::ConfigParse {
             path: paths.config_file().display().to_string(),
@@ -131,6 +152,14 @@ pub fn run_blocking() -> Result<(), DaemonError> {
                 prefill_tps: stored.map(|p| p.prefill_tps),
                 decode_tps: decode_override.or(stored.map(|p| p.decode_tps)),
                 disk_mbps: stored.map(|p| p.disk_mbps),
+                // Battery policy (docs/resilience.md): probed per status
+                // send, so a threshold crossing propagates on the next
+                // session establishment or bench push.
+                draining: crate::power::battery_status(
+                    status_battery_probe.as_ref(),
+                    battery_threshold,
+                )
+                .draining,
             }
         })),
         ..MeshConfig::default()
@@ -142,18 +171,27 @@ pub fn run_blocking() -> Result<(), DaemonError> {
         mesh_config,
     )) {
         Ok(mesh) => {
-            // Cluster task: consumes plan traffic and rpc streams from the
-            // mesh (worker path) and records acks (head path).
+            // Supervisor queue (M5): the gateway backend and the cluster
+            // task send into it; the supervisor task itself is spawned by
+            // `serve` once the internal state exists (messages queue in the
+            // channel until then).
+            let (sup_tx, sup_rx) = supervisor::channel();
+            // Cluster task: consumes plan traffic, rpc streams, and — M5 —
+            // peer events from the mesh (worker path + death/drain/rejoin
+            // detection) and records acks (head path).
             let cluster = ClusterState::new();
             let cluster_task = runtime.block_on(async {
                 let ctrl_rx = mesh.incoming_control().await?;
                 let rpc_rx = mesh.incoming_rpc().await?;
+                let events_rx = mesh.peer_events().await?;
                 Ok::<_, onebrain_mesh::MeshError>(cluster::spawn_cluster_task(
                     mesh.clone(),
                     host.clone(),
                     cluster.clone(),
                     ctrl_rx,
                     rpc_rx,
+                    events_rx,
+                    sup_tx.clone(),
                 ))
             });
             let cluster_task = match cluster_task {
@@ -174,7 +212,39 @@ pub fn run_blocking() -> Result<(), DaemonError> {
                 debug_override,
                 profile.clone(),
                 profile_path.clone(),
+                sup_tx,
+                sup_rx,
             ));
+            // M5 worker-side drain (docs/resilience.md): with an active
+            // shard epoch, tell the head we are draining politely and give
+            // in-flight serve traffic a short grace window — the mesh and
+            // the serve bridges are still up here.
+            if let Some((epoch, head)) = cluster.worker_shard() {
+                runtime.block_on(async {
+                    let notice = onebrain_proto::message::Envelope::new(
+                        onebrain_proto::message::Message::Draining {
+                            epoch,
+                            reason: "onebrain stop".to_string(),
+                        },
+                    );
+                    match mesh.send_control(&head.0, notice).await {
+                        Ok(()) => {
+                            tracing::info!(
+                                epoch = epoch.0,
+                                "sent polite drain notice to the head; granting {DRAIN_GRACE:?} \
+                                 for in-flight serve traffic"
+                            );
+                            tokio::time::sleep(DRAIN_GRACE).await;
+                        }
+                        Err(err) => tracing::warn!(
+                            epoch = epoch.0,
+                            error = %err,
+                            "could not send the drain notice (head unreachable); \
+                             continuing teardown"
+                        ),
+                    }
+                });
+            }
             // Teardown ordering (ADR 0004): free any loaded model FIRST —
             // a distributed head model sends remote frees over its rpc
             // bridges, and GGML aborts on a torn stream — then close the
@@ -239,6 +309,8 @@ async fn serve(
     usable_memory_override: Option<u64>,
     profile: crate::server::SharedProfile,
     profile_path: std::path::PathBuf,
+    supervisor_tx: SupervisorTx,
+    supervisor_rx: tokio::sync::mpsc::UnboundedReceiver<SupervisorMsg>,
 ) -> Result<(), DaemonError> {
     let product_version: &'static str = env!("CARGO_PKG_VERSION");
     let shutdown = Arc::new(Notify::new());
@@ -255,7 +327,11 @@ async fn serve(
     })?;
 
     let api_state = ApiState {
-        backend: Arc::new(DaemonBackend::new(host.clone(), cache_root.to_path_buf())),
+        backend: Arc::new(DaemonBackend::new(
+            host.clone(),
+            cache_root.to_path_buf(),
+            supervisor_tx,
+        )),
         auth: Arc::new(AuthConfig {
             token: token.clone(),
             localhost_exempt: config.localhost_auth_exempt,
@@ -282,7 +358,43 @@ async fn serve(
         decode_tps_override: config.debug.decode_tps_override,
         profile,
         profile_path,
+        // The platform probe is stateless (reads on every call); a second
+        // instance here keeps `serve` self-contained.
+        battery_probe: Arc::from(crate::power::platform_battery_probe()),
+        battery_threshold: config.battery_drain_threshold,
     });
+    // M5 supervisor: owns every generation job's lifecycle (transparent
+    // retry) plus the death-teardown and lazy rejoin re-plan follow-ups
+    // from the cluster task. Ends when its senders drop at teardown; the
+    // runtime shutdown reaps it regardless.
+    let _supervisor_task = supervisor::spawn(internal_state.clone(), supervisor_rx);
+    // M5 sleep inhibitor (docs/resilience.md): held while this node has
+    // work sleep would break — a loaded model with a request in flight or
+    // a distributed epoch, or (worker role) an adopted shard other nodes
+    // depend on. hold/release are idempotent, so edge-free polling is fine.
+    {
+        let watch = internal_state.clone();
+        tokio::spawn(async move {
+            let mut inhibitor = crate::power::platform_sleep_inhibitor();
+            let mut tick = tokio::time::interval(Duration::from_secs(2));
+            loop {
+                tick.tick().await;
+                let epoch_active = watch.cluster.active().is_some();
+                let serving_shard = watch.cluster.worker_shard().is_some();
+                let model_loaded = watch.cluster.loaded_source().is_some() || serving_shard;
+                let in_flight = !watch.host.is_idle();
+                if crate::power::should_hold_sleep(
+                    model_loaded,
+                    in_flight || serving_shard,
+                    epoch_active,
+                ) {
+                    inhibitor.hold("model active");
+                } else {
+                    inhibitor.release();
+                }
+            }
+        });
+    }
     let app = onebrain_api::router(api_state).merge(internal_router(internal_state));
 
     // daemon.json only after the listener is bound (contract): its port is

@@ -11,8 +11,10 @@ pub mod config;
 pub mod engine_host;
 pub mod lock;
 pub mod paths;
+pub mod power;
 pub mod runtime;
 pub mod server;
+pub mod supervisor;
 pub mod token;
 
 /// A node's role in the current cluster session. Roles are per-session, not

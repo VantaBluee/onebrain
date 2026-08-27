@@ -23,24 +23,27 @@
 //! aborts on a torn stream), and the bridges close afterwards. On the worker
 //! the serve threads end when their streams close, and are joined here.
 
-use std::collections::HashMap;
-use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use onebrain_engine::rpc::{BridgeStream, RpcSession};
 use onebrain_engine::DeviceKind;
-use onebrain_mesh::{ControlMessage, IncomingRpcStream, MeshHandle, RecvStream, SendStream};
+use onebrain_mesh::{
+    ControlMessage, IncomingRpcStream, MeshHandle, PeerEvent, PeerState, RecvStream, SendStream,
+};
 use onebrain_models::gguf::{GgufError, GgufHeader};
 use onebrain_proto::message::{DeviceBrief, Envelope, Message, StreamKind};
-use onebrain_proto::plan::{Epoch, NodeId, Plan};
+use onebrain_proto::plan::{Epoch, NodeId, Plan, Strategy};
 use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, Notify};
 use tokio::task::JoinHandle;
 
 use crate::engine_host::{EngineHost, HostMsg};
+use crate::supervisor::{SupervisorMsg, SupervisorTx};
 
 /// Fixed OS reserve subtracted from measured free memory when computing a
 /// node's schedulable budget (docs/distributed.md "Placement": usable memory
@@ -150,14 +153,47 @@ pub struct AckResult {
     pub detail: Option<String>,
 }
 
+/// Where the currently loaded model came from — enough for the M5
+/// supervisor and the lazy rejoin re-plan to re-plan and reload it without
+/// any client input (docs/resilience.md steps 3–5). Recorded by the load
+/// paths on `ready`; cleared when the model is unloaded or a reload fails.
+#[derive(Debug, Clone)]
+pub struct LoadedSource {
+    /// The reference the load was requested with (registry id, `hf:…`, or
+    /// a local path) — what a solo reload resolves.
+    pub reference: String,
+    /// Canonical display name of the loaded model.
+    pub name: String,
+    /// Local GGUF path (the head holds the full file — ADR 0004); what
+    /// planning reads the header from and a distributed reload pushes.
+    pub path: PathBuf,
+    pub size_bytes: u64,
+}
+
 /// Shared cluster-session state: the epoch counter, the active plan (for
-/// status), received plan acks, and the head's bridge tasks.
+/// status), received plan acks, the head's bridge tasks, and — since M5 —
+/// the failure-lifecycle bookkeeping (failed epochs with their lost peers,
+/// the loaded model's source, the rejoin re-plan request flag, and the
+/// worker's adopted shard identity for the polite drain).
 pub struct ClusterState {
     epoch_counter: AtomicU64,
     active: StdMutex<Option<ActivePlanView>>,
     acks: StdMutex<HashMap<(String, u64), AckResult>>,
     ack_notify: Notify,
     head_bridges: StdMutex<Vec<JoinHandle<()>>>,
+    /// Epochs marked failed → the peer ids lost to each (bridge stream
+    /// errors, Down/Draining transitions). Consulted by the supervisor to
+    /// exclude lost nodes from the retry re-plan and to name the lost node
+    /// in the typed error. Never pruned: epochs are few per daemon life.
+    failed: StdMutex<HashMap<u64, HashSet<String>>>,
+    /// Source of the currently loaded model (head side), if any.
+    loaded_source: StdMutex<Option<LoadedSource>>,
+    /// Set when a peer rejoined and a lazy re-plan should run once the
+    /// engine host is idle; consumed by the supervisor (M5 step 5).
+    rejoin_requested: AtomicBool,
+    /// Worker side: the adopted shard's epoch and its head, for the polite
+    /// `Draining` notice on `onebrain stop` (docs/resilience.md).
+    worker_shard: StdMutex<Option<(Epoch, NodeId)>>,
 }
 
 impl ClusterState {
@@ -168,6 +204,10 @@ impl ClusterState {
             acks: StdMutex::new(HashMap::new()),
             ack_notify: Notify::new(),
             head_bridges: StdMutex::new(Vec::new()),
+            failed: StdMutex::new(HashMap::new()),
+            loaded_source: StdMutex::new(None),
+            rejoin_requested: AtomicBool::new(false),
+            worker_shard: StdMutex::new(None),
         })
     }
 
@@ -260,6 +300,91 @@ impl ClusterState {
     pub fn teardown_head_bridges(&self) {
         self.replace_head_bridges(Vec::new());
     }
+
+    /// Mark `epoch` failed, recording the lost peer when known. Returns
+    /// `true` when this call added new information (first mark, or a peer
+    /// not yet recorded) — callers use it to log each loss exactly once.
+    pub fn mark_epoch_failed(&self, epoch: u64, lost_peer: Option<&str>) -> bool {
+        let mut failed = self.failed.lock().expect("cluster state poisoned");
+        match failed.entry(epoch) {
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(lost_peer.map(String::from).into_iter().collect());
+                true
+            }
+            std::collections::hash_map::Entry::Occupied(mut slot) => match lost_peer {
+                Some(peer) => slot.get_mut().insert(peer.to_string()),
+                None => false,
+            },
+        }
+    }
+
+    /// Whether `epoch` has been marked failed.
+    pub fn is_epoch_failed(&self, epoch: u64) -> bool {
+        self.failed
+            .lock()
+            .expect("cluster state poisoned")
+            .contains_key(&epoch)
+    }
+
+    /// The peer ids recorded as lost for `epoch` (empty when the epoch is
+    /// not marked failed, or failed without an identified peer).
+    pub fn epoch_lost_peers(&self, epoch: u64) -> HashSet<String> {
+        self.failed
+            .lock()
+            .expect("cluster state poisoned")
+            .get(&epoch)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Record where the currently loaded model came from (set on `ready`).
+    pub fn note_loaded(&self, source: LoadedSource) {
+        *self.loaded_source.lock().expect("cluster state poisoned") = Some(source);
+    }
+
+    /// The loaded model's source, if a load has succeeded and not been
+    /// undone since.
+    pub fn loaded_source(&self) -> Option<LoadedSource> {
+        self.loaded_source
+            .lock()
+            .expect("cluster state poisoned")
+            .clone()
+    }
+
+    /// Forget the loaded model's source (unload, or terminal load failure).
+    pub fn clear_loaded(&self) {
+        *self.loaded_source.lock().expect("cluster state poisoned") = None;
+    }
+
+    /// Request a lazy re-plan (a peer rejoined — M5 step 5). The
+    /// supervisor consumes the flag when the engine host is idle.
+    pub fn request_rejoin_replan(&self) {
+        self.rejoin_requested.store(true, Ordering::SeqCst);
+    }
+
+    /// Consume the rejoin re-plan request. Returns whether one was pending.
+    pub fn take_rejoin_request(&self) -> bool {
+        self.rejoin_requested.swap(false, Ordering::SeqCst)
+    }
+
+    /// Re-arm a rejoin request that could not run yet (host busy).
+    pub fn defer_rejoin_request(&self) {
+        self.rejoin_requested.store(true, Ordering::SeqCst);
+    }
+
+    /// Worker side: remember the adopted shard's epoch and head (for the
+    /// polite `Draining` notice at `onebrain stop`).
+    pub fn set_worker_shard(&self, shard: Option<(Epoch, NodeId)>) {
+        *self.worker_shard.lock().expect("cluster state poisoned") = shard;
+    }
+
+    /// The adopted shard's epoch and head, if this node is serving one.
+    pub fn worker_shard(&self) -> Option<(Epoch, NodeId)> {
+        self.worker_shard
+            .lock()
+            .expect("cluster state poisoned")
+            .clone()
+    }
 }
 
 /// What the worker decided about a received `PlanProposal`.
@@ -308,16 +433,25 @@ struct AdoptedPlan {
     serves: Vec<WorkerServe>,
 }
 
-/// Spawn the cluster task. It exits when the mesh service stops (both
-/// channels close), tearing down any worker serve sessions first.
+/// Spawn the cluster task. It exits when the mesh service stops (all
+/// channels close), tearing down any worker serve sessions first. Since M5
+/// it also consumes the mesh's peer-event stream: death/drain transitions
+/// for nodes of the active head epoch mark that epoch failed, and rejoin
+/// transitions request the lazy re-plan — the heavier follow-up work runs
+/// on the supervisor task (`supervisor` channel), which serializes it with
+/// in-flight generation jobs (docs/resilience.md).
 pub fn spawn_cluster_task(
     mesh: MeshHandle,
     host: EngineHost,
     state: Arc<ClusterState>,
     ctrl_rx: mpsc::Receiver<ControlMessage>,
     rpc_rx: mpsc::Receiver<IncomingRpcStream>,
+    events_rx: mpsc::Receiver<PeerEvent>,
+    supervisor: SupervisorTx,
 ) -> JoinHandle<()> {
-    tokio::spawn(cluster_task(mesh, host, state, ctrl_rx, rpc_rx))
+    tokio::spawn(cluster_task(
+        mesh, host, state, ctrl_rx, rpc_rx, events_rx, supervisor,
+    ))
 }
 
 async fn cluster_task(
@@ -326,11 +460,14 @@ async fn cluster_task(
     state: Arc<ClusterState>,
     mut ctrl_rx: mpsc::Receiver<ControlMessage>,
     mut rpc_rx: mpsc::Receiver<IncomingRpcStream>,
+    mut events_rx: mpsc::Receiver<PeerEvent>,
+    supervisor: SupervisorTx,
 ) {
     let mut adopted: Option<AdoptedPlan> = None;
     let mut ctrl_open = true;
     let mut rpc_open = true;
-    while ctrl_open || rpc_open {
+    let mut events_open = true;
+    while ctrl_open || rpc_open || events_open {
         tokio::select! {
             msg = ctrl_rx.recv(), if ctrl_open => match msg {
                 Some(msg) => handle_control(&mesh, &host, &state, &mut adopted, msg).await,
@@ -340,12 +477,77 @@ async fn cluster_task(
                 Some(stream) => handle_rpc_stream(&mut adopted, stream),
                 None => rpc_open = false,
             },
+            event = events_rx.recv(), if events_open => match event {
+                Some(event) => handle_peer_event(&state, &supervisor, event),
+                None => events_open = false,
+            },
         }
     }
     if let Some(plan) = adopted.take() {
         teardown_adopted(plan).await;
     }
     tracing::debug!("cluster task stopped");
+}
+
+/// M5 death/drain/rejoin detection (docs/resilience.md "Failure
+/// lifecycle" steps 1 and 5). Pure state-and-nudge: the epoch is marked
+/// failed here (so the supervisor's retry path sees the loss even when it
+/// learns of the failure through a decode error first), and the supervisor
+/// is nudged to run the teardown / lazy re-plan when the engine host is
+/// idle — with a job in flight the supervisor's own retry path owns the
+/// failed epoch's teardown.
+fn handle_peer_event(state: &Arc<ClusterState>, supervisor: &SupervisorTx, event: PeerEvent) {
+    match event.state {
+        PeerState::Down | PeerState::Draining => {
+            let Some(active) = state.active() else { return };
+            if active.role != "head" || active.plan.strategy == Strategy::Solo {
+                return;
+            }
+            let in_plan = active
+                .plan
+                .assignments
+                .iter()
+                .any(|a| a.node.0 == event.peer.0);
+            if !in_plan {
+                return;
+            }
+            let epoch = active.plan.epoch.0;
+            let newly = state.mark_epoch_failed(epoch, Some(&event.peer.0));
+            if newly {
+                if event.state == PeerState::Draining {
+                    tracing::info!(
+                        peer = %event.name,
+                        epoch,
+                        "node of the active epoch is draining politely; epoch marked failed"
+                    );
+                } else {
+                    tracing::warn!(
+                        peer = %event.name,
+                        epoch,
+                        "node of the active epoch is down; epoch marked failed"
+                    );
+                }
+            }
+            // The supervisor tears the epoch down when no job is in flight;
+            // an in-flight job reaches it as an Interrupted outcome instead.
+            let _ = supervisor.send(SupervisorMsg::EpochFailed { epoch });
+        }
+        PeerState::Connected => {
+            // Lazy rejoin re-plan (step 5): only meaningful while this node
+            // is the head of a loaded model; the supervisor re-checks state
+            // and idleness before acting, so a stale request is harmless.
+            let is_head = state.active().is_some_and(|a| a.role == "head");
+            if is_head && state.loaded_source().is_some() {
+                tracing::info!(
+                    peer = %event.name,
+                    "peer rejoined while a model is loaded; scheduling a lazy re-plan"
+                );
+                state.request_rejoin_replan();
+                let _ = supervisor.send(SupervisorMsg::PeerRejoined);
+            }
+        }
+        _ => {}
+    }
 }
 
 async fn handle_control(
@@ -370,6 +572,17 @@ async fn handle_control(
         }
         Message::NodeStatus { .. } => {
             // Cached by the mesh into the peer view; nothing to do here.
+        }
+        Message::Draining { epoch, reason } => {
+            // The mesh already surfaced this as a `Draining` peer event
+            // (which drives the failure lifecycle); the envelope is logged
+            // as the polite notice it is (docs/resilience.md).
+            tracing::info!(
+                peer = %sender.0,
+                epoch = epoch.0,
+                %reason,
+                "peer announced a polite drain"
+            );
         }
         other => {
             tracing::debug!(peer = %sender.0, "ignoring unexpected control message: {other:?}");
@@ -433,6 +646,8 @@ async fn handle_proposal(
                 explanation: None,
                 predicted_tpt_ms: None,
             }));
+            // Remembered for the polite drain at `onebrain stop` (M5).
+            state.set_worker_shard(Some((epoch, sender.clone())));
             *adopted = Some(AdoptedPlan {
                 epoch,
                 head: sender.clone(),
@@ -543,8 +758,12 @@ fn wrap_bridge(bridge: BridgeStream) -> std::io::Result<(BridgeReadHalf, BridgeW
 
 /// Relay bytes 1:1 between a mesh `rpc` stream and a local socket, both
 /// directions concurrently. EOF (or error) on one side half-closes the
-/// other, so the relay winds down as soon as either peer closes.
-async fn pump_streams<R, W>(recv: RecvStream, send: SendStream, sock_read: R, sock_write: W)
+/// other, so the relay winds down as soon as either peer closes. Returns
+/// `true` when either direction ended with an ERROR (a torn stream — dead
+/// peer), as opposed to a clean EOF (the RPC client closing a probe
+/// connection, a model free): the M5 head bridges use this to mark the
+/// epoch failed the moment its transport dies.
+async fn pump_streams<R, W>(recv: RecvStream, send: SendStream, sock_read: R, sock_write: W) -> bool
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
@@ -552,20 +771,31 @@ where
     let to_socket = async move {
         let mut recv = recv;
         let mut sock_write = sock_write;
-        if let Err(err) = tokio::io::copy(&mut recv, &mut sock_write).await {
-            tracing::debug!(error = %err, "rpc bridge mesh->socket ended with error");
-        }
+        let errored = match tokio::io::copy(&mut recv, &mut sock_write).await {
+            Ok(_) => false,
+            Err(err) => {
+                tracing::debug!(error = %err, "rpc bridge mesh->socket ended with error");
+                true
+            }
+        };
         let _ = sock_write.shutdown().await;
+        errored
     };
     let to_mesh = async move {
         let mut sock_read = sock_read;
         let mut send = send;
-        if let Err(err) = tokio::io::copy(&mut sock_read, &mut send).await {
-            tracing::debug!(error = %err, "rpc bridge socket->mesh ended with error");
-        }
+        let errored = match tokio::io::copy(&mut sock_read, &mut send).await {
+            Ok(_) => false,
+            Err(err) => {
+                tracing::debug!(error = %err, "rpc bridge socket->mesh ended with error");
+                true
+            }
+        };
         let _ = send.finish();
+        errored
     };
-    tokio::join!(to_socket, to_mesh);
+    let (a, b) = tokio::join!(to_socket, to_mesh);
+    a || b
 }
 
 /// [`pump_streams`] on its own task (worker-side bridges own their lifetime
@@ -580,7 +810,11 @@ where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    tokio::spawn(pump_streams(recv, send, sock_read, sock_write))
+    tokio::spawn(async move {
+        // Worker side: stream errors need no marking — the serve session
+        // ends with its socket either way.
+        let _ = pump_streams(recv, send, sock_read, sock_write).await;
+    })
 }
 
 /// Head side of one rpc tunnel: bind a loopback listener on an ephemeral
@@ -598,6 +832,7 @@ where
 /// distributed session is active and asserts they are gone after teardown.
 pub async fn head_bridge(
     mesh: MeshHandle,
+    state: Arc<ClusterState>,
     peer: String,
     epoch: Epoch,
 ) -> Result<(String, JoinHandle<()>), String> {
@@ -639,7 +874,25 @@ pub async fn head_bridge(
                 }
             };
             let (read_half, write_half) = sock.into_split();
-            pumps.spawn(pump_streams(recv, send, read_half, write_half));
+            let state = state.clone();
+            let peer = peer.clone();
+            pumps.spawn(async move {
+                // A stream ERROR (vs a clean EOF) means this worker's
+                // transport died under the epoch: record the loss so the
+                // supervisor's retry names the right node and excludes it
+                // from the re-plan (M5 failure lifecycle). Teardown never
+                // reaches this branch — pump aborts cancel the copy at an
+                // await point instead of erroring it.
+                if pump_streams(recv, send, read_half, write_half).await
+                    && state.mark_epoch_failed(epoch.0, Some(&peer))
+                {
+                    tracing::warn!(
+                        peer = %peer,
+                        epoch = epoch.0,
+                        "rpc bridge stream tore; epoch marked failed"
+                    );
+                }
+            });
         }
     });
     Ok((format!("127.0.0.1:{port}"), task))
@@ -740,6 +993,180 @@ mod tests {
         let cpu = devices.iter().find(|d| d.kind == "cpu").unwrap();
         assert!(measured <= cpu.free_bytes.saturating_sub(0));
         assert!(measured < cpu.total_bytes, "must never budget total RAM");
+    }
+
+    #[test]
+    fn mark_epoch_failed_reports_new_information_once() {
+        let state = ClusterState::new();
+        assert!(!state.is_epoch_failed(7));
+        assert!(state.mark_epoch_failed(7, Some("w1")), "first mark is new");
+        assert!(state.is_epoch_failed(7));
+        assert!(
+            !state.mark_epoch_failed(7, Some("w1")),
+            "the same peer again adds nothing"
+        );
+        assert!(
+            state.mark_epoch_failed(7, Some("w2")),
+            "a second lost peer is new information"
+        );
+        assert!(
+            !state.mark_epoch_failed(7, None),
+            "a peerless re-mark of a failed epoch adds nothing"
+        );
+        let lost = state.epoch_lost_peers(7);
+        assert!(lost.contains("w1") && lost.contains("w2"));
+        assert!(state.epoch_lost_peers(8).is_empty(), "unmarked epoch");
+        // A peerless first mark still fails the epoch.
+        assert!(state.mark_epoch_failed(9, None));
+        assert!(state.is_epoch_failed(9) && state.epoch_lost_peers(9).is_empty());
+    }
+
+    #[test]
+    fn loaded_source_roundtrips_and_clears() {
+        let state = ClusterState::new();
+        assert!(state.loaded_source().is_none());
+        state.note_loaded(LoadedSource {
+            reference: "tinystories-260k".into(),
+            name: "tinystories-260k".into(),
+            path: PathBuf::from("C:/models/t.gguf"),
+            size_bytes: 42,
+        });
+        let source = state.loaded_source().expect("recorded");
+        assert_eq!(source.reference, "tinystories-260k");
+        assert_eq!(source.size_bytes, 42);
+        state.clear_loaded();
+        assert!(state.loaded_source().is_none());
+    }
+
+    #[test]
+    fn rejoin_request_latches_and_is_consumed_once() {
+        let state = ClusterState::new();
+        assert!(!state.take_rejoin_request(), "nothing requested yet");
+        state.request_rejoin_replan();
+        state.request_rejoin_replan(); // idempotent latch, not a counter
+        assert!(state.take_rejoin_request());
+        assert!(!state.take_rejoin_request(), "consumed");
+        state.defer_rejoin_request(); // busy host re-arms it
+        assert!(state.take_rejoin_request());
+    }
+
+    #[test]
+    fn worker_shard_roundtrips() {
+        let state = ClusterState::new();
+        assert!(state.worker_shard().is_none());
+        state.set_worker_shard(Some((Epoch(3), NodeId("head-id".into()))));
+        let (epoch, head) = state.worker_shard().expect("recorded");
+        assert_eq!(epoch, Epoch(3));
+        assert_eq!(head.0, "head-id");
+        state.set_worker_shard(None);
+        assert!(state.worker_shard().is_none());
+    }
+
+    /// Build a head-side active plan over the given worker ids for the
+    /// peer-event tests.
+    fn head_plan(epoch: u64, workers: &[&str]) -> ActivePlanView {
+        let mut assignments: Vec<onebrain_proto::plan::Assignment> = workers
+            .iter()
+            .enumerate()
+            .map(|(i, id)| onebrain_proto::plan::Assignment {
+                node: NodeId(id.to_string()),
+                layers: onebrain_proto::plan::LayerRange {
+                    start: i as u32,
+                    end: i as u32 + 1,
+                },
+                stage: i as u32,
+            })
+            .collect();
+        assignments.push(onebrain_proto::plan::Assignment {
+            node: NodeId("own-id".into()),
+            layers: onebrain_proto::plan::LayerRange {
+                start: workers.len() as u32,
+                end: workers.len() as u32 + 1,
+            },
+            stage: workers.len() as u32,
+        });
+        ActivePlanView {
+            role: "head",
+            plan: Plan {
+                epoch: Epoch(epoch),
+                model: "m".into(),
+                strategy: Strategy::PipelineParallel,
+                assignments,
+                ctx_len: 4096,
+            },
+            explanation: None,
+            predicted_tpt_ms: None,
+        }
+    }
+
+    fn event(peer: &str, state: PeerState) -> PeerEvent {
+        PeerEvent {
+            peer: NodeId(peer.to_string()),
+            name: peer.to_string(),
+            state,
+        }
+    }
+
+    #[tokio::test]
+    async fn peer_death_in_the_active_epoch_marks_it_failed_and_nudges_the_supervisor() {
+        let state = ClusterState::new();
+        state.set_active(Some(head_plan(5, &["w1", "w2"])));
+        let (sup_tx, mut sup_rx) = crate::supervisor::channel();
+
+        handle_peer_event(&state, &sup_tx, event("w1", PeerState::Down));
+        assert!(state.is_epoch_failed(5));
+        assert!(state.epoch_lost_peers(5).contains("w1"));
+        match sup_rx.try_recv().expect("supervisor must be nudged") {
+            crate::supervisor::SupervisorMsg::EpochFailed { epoch } => assert_eq!(epoch, 5),
+            other => panic!("expected EpochFailed, got {other:?}"),
+        }
+
+        // A polite drain is handled exactly like a death for planning.
+        handle_peer_event(&state, &sup_tx, event("w2", PeerState::Draining));
+        assert!(state.epoch_lost_peers(5).contains("w2"));
+        assert!(matches!(
+            sup_rx.try_recv(),
+            Ok(crate::supervisor::SupervisorMsg::EpochFailed { epoch: 5 })
+        ));
+    }
+
+    #[tokio::test]
+    async fn death_of_a_non_participant_does_not_fail_the_epoch() {
+        let state = ClusterState::new();
+        state.set_active(Some(head_plan(5, &["w1"])));
+        let (sup_tx, mut sup_rx) = crate::supervisor::channel();
+        handle_peer_event(&state, &sup_tx, event("bystander", PeerState::Down));
+        assert!(!state.is_epoch_failed(5));
+        assert!(sup_rx.try_recv().is_err(), "no nudge for bystanders");
+        // Suspect alone (without Down) is not a failure either — spec §5
+        // treats it as "suspect", and docs/resilience.md keys on Down.
+        handle_peer_event(&state, &sup_tx, event("w1", PeerState::Suspect));
+        assert!(!state.is_epoch_failed(5));
+        assert!(sup_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn rejoin_with_a_loaded_model_requests_the_lazy_replan() {
+        let state = ClusterState::new();
+        let (sup_tx, mut sup_rx) = crate::supervisor::channel();
+        // Without a loaded model: no request.
+        state.set_active(Some(head_plan(5, &["w1"])));
+        handle_peer_event(&state, &sup_tx, event("w2", PeerState::Connected));
+        assert!(!state.take_rejoin_request());
+        assert!(sup_rx.try_recv().is_err());
+        // With one: latched + nudged.
+        state.note_loaded(LoadedSource {
+            reference: "m".into(),
+            name: "m".into(),
+            path: PathBuf::from("m.gguf"),
+            size_bytes: 1,
+        });
+        handle_peer_event(&state, &sup_tx, event("w2", PeerState::Connected));
+        assert!(state.take_rejoin_request());
+        assert!(matches!(
+            sup_rx.try_recv(),
+            Ok(crate::supervisor::SupervisorMsg::PeerRejoined)
+        ));
     }
 
     #[test]
