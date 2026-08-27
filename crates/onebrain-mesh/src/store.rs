@@ -19,6 +19,7 @@
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -55,12 +56,20 @@ struct StoreFile {
 #[derive(Debug, Clone)]
 pub struct PeerStore {
     path: PathBuf,
+    /// Serializes every load-modify-save cycle across clones. The service
+    /// task and per-session runners write concurrently (pairing persists,
+    /// address refreshes, unpair); without this, two interleaved writers
+    /// can save from stale snapshots and silently drop a just-added peer.
+    write_lock: Arc<Mutex<()>>,
 }
 
 impl PeerStore {
     /// A store backed by the given `peers.toml` path (need not exist yet).
     pub fn new(path: PathBuf) -> Self {
-        PeerStore { path }
+        PeerStore {
+            path,
+            write_lock: Arc::new(Mutex::new(())),
+        }
     }
 
     /// Read all peers. A missing file is an empty store.
@@ -91,6 +100,7 @@ impl PeerStore {
     /// Add a peer under a deduplicated name and persist. Returns the final
     /// name. Re-adding an already-paired id keeps its existing name.
     pub fn add(&self, endpoint_id: &str, wanted_name: &str) -> Result<String, MeshError> {
+        let _guard = self.write_lock.lock().expect("peer store lock poisoned");
         let mut peers = self.load()?;
         if let Some(existing) = peers.get(endpoint_id) {
             return Ok(existing.name.clone());
@@ -139,6 +149,7 @@ impl PeerStore {
         direct_addrs: Vec<SocketAddr>,
         relay_url: Option<String>,
     ) -> Result<bool, MeshError> {
+        let _guard = self.write_lock.lock().expect("peer store lock poisoned");
         let mut peers = self.load()?;
         let Some(record) = peers.get_mut(endpoint_id) else {
             return Ok(false);
@@ -164,6 +175,7 @@ impl PeerStore {
     /// Remove a peer by name and persist. Returns the removed endpoint id.
     /// An unknown name errors with the list of known names.
     pub fn remove_by_name(&self, name: &str) -> Result<String, MeshError> {
+        let _guard = self.write_lock.lock().expect("peer store lock poisoned");
         let mut peers = self.load()?;
         let id = peers
             .iter()
@@ -208,13 +220,12 @@ impl PeerStore {
             path: self.path.clone(),
             source,
         })?;
-        // Windows cannot rename over an existing file; remove first.
-        if self.path.exists() {
-            std::fs::remove_file(&self.path).map_err(|source| MeshError::StoreWrite {
-                path: self.path.clone(),
-                source,
-            })?;
-        }
+        // Rename over the destination in one step: Rust's `rename` maps to
+        // `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` on Windows, so this
+        // replaces an existing `peers.toml` atomically. Removing the file
+        // first would open a window in which a concurrent `load` sees
+        // NotFound and reports an empty store — a paired daemon flickering
+        // to "no peers" mid-query.
         std::fs::rename(&tmp, &self.path).map_err(|source| MeshError::StoreWrite {
             path: self.path.clone(),
             source,
@@ -357,6 +368,38 @@ mod tests {
         let peers = s.load().unwrap();
         assert_eq!(peers["aaaa"].direct_addrs, vec![addr]);
         assert_eq!(peers["aaaa"].name, "gaming-pc");
+    }
+
+    #[test]
+    fn concurrent_loads_never_see_a_paired_peer_vanish() {
+        // Regression: `save` used to remove `peers.toml` before renaming the
+        // temp file into place (believing Windows could not rename over an
+        // existing file). A `load` racing into that gap saw NotFound and
+        // reported an EMPTY store — pair-sim caught the joiner listing zero
+        // peers moments after pairing. Writers now rename atomically, so a
+        // reader must always observe the paired peer.
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(&dir);
+        s.add("aaaa", "laptop").unwrap();
+
+        let writer = {
+            let s = s.clone();
+            std::thread::spawn(move || {
+                for port in 1..=300u16 {
+                    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+                    s.update_addrs("aaaa", vec![addr], None).unwrap();
+                }
+            })
+        };
+        while !writer.is_finished() {
+            let peers = s.load().unwrap();
+            assert!(
+                peers.contains_key("aaaa"),
+                "load observed the paired peer missing mid-save"
+            );
+        }
+        writer.join().unwrap();
+        assert!(s.load().unwrap().contains_key("aaaa"));
     }
 
     #[test]
