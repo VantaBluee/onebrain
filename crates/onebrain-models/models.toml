@@ -1,14 +1,29 @@
 # OneBrain curated model registry (embedded into the binary via include_str!).
 #
 # Schema per entry — the table key is the model id:
-#   display_name    human-readable name shown by `onebrain ls` / the dashboard
-#   url             direct GGUF download (HTTPS)
-#   file_name       the on-disk file name inside <data_dir>/models/<id>/
-#   license         upstream model license (recorded, not enforced)
-#   min_memory_mb   minimum usable memory to load at the recommended context
-#   ctx_recommended recommended context length
+#   display_name        human-readable name shown by `onebrain ls` / the dashboard
+#   url                 direct GGUF download (HTTPS); for split models the
+#                       FIRST part (`-00001-of-000NN.gguf`) — the downloader
+#                       derives the sibling part URLs from it
+#   file_name           the on-disk file name inside <data_dir>/models/<id>/
+#   license             upstream model license (recorded, not enforced)
+#   min_memory_mb       minimum usable memory on ONE node to load solo at the
+#                       recommended context
 #
-# Every URL below was verified to answer HTTP 200 on 2026-08-26.
+# Optional fields (absent = the stated default; docs/logistics.md
+# "Registry v1"):
+#   recommended_ctx     recommended context length in tokens (default 8192)
+#   parts               split-GGUF part count (default 1 = single file)
+#   moe_total_params    MoE only: total parameter count (absent = dense)
+#   moe_active_params   MoE only: parameters active per token (absent = dense)
+#   min_pooled_memory_mb  minimum POOLED memory across the cluster to load at
+#                       the recommended context. Filled conservatively as
+#                       file_size_mb * 1.2 + 2048 MB ctx headroom, rounded up
+#                       to a whole GiB (file GB read as GiB, which slightly
+#                       over-provisions — deliberate).
+#
+# Every URL below was verified to answer HTTP 200 without a license gate on
+# 2026-08-27.
 
 ["qwen3-0.6b"]
 display_name = "Qwen3 0.6B (Q8_0)"
@@ -16,7 +31,7 @@ url = "https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.
 file_name = "Qwen3-0.6B-Q8_0.gguf"
 license = "Apache-2.0"
 min_memory_mb = 2048
-ctx_recommended = 8192
+recommended_ctx = 8192
 
 ["qwen3-1.7b"]
 display_name = "Qwen3 1.7B (Q8_0)"
@@ -24,15 +39,106 @@ url = "https://huggingface.co/Qwen/Qwen3-1.7B-GGUF/resolve/main/Qwen3-1.7B-Q8_0.
 file_name = "Qwen3-1.7B-Q8_0.gguf"
 license = "Apache-2.0"
 min_memory_mb = 4096
-ctx_recommended = 8192
+recommended_ctx = 8192
 
+# 2.50 GB file; formula gives 5120 MB pooled, raised to the 6144 MB solo
+# floor this entry already declared (pooled below solo would be nonsense).
 ["qwen3-4b"]
 display_name = "Qwen3 4B (Q4_K_M)"
 url = "https://huggingface.co/Qwen/Qwen3-4B-GGUF/resolve/main/Qwen3-4B-Q4_K_M.gguf"
 file_name = "Qwen3-4B-Q4_K_M.gguf"
 license = "Apache-2.0"
 min_memory_mb = 6144
-ctx_recommended = 8192
+recommended_ctx = 8192
+min_pooled_memory_mb = 6144
+
+# 19.76 GB file: 20235 * 1.2 + 2048 = 26330 MB -> 26 GiB.
+["qwen3-32b"]
+display_name = "Qwen3 32B (Q4_K_M)"
+url = "https://huggingface.co/Qwen/Qwen3-32B-GGUF/resolve/main/Qwen3-32B-Q4_K_M.gguf"
+file_name = "Qwen3-32B-Q4_K_M.gguf"
+license = "Apache-2.0"
+min_memory_mb = 26624
+recommended_ctx = 8192
+min_pooled_memory_mb = 26624
+
+# MoE: 30.5B total / 3.3B active per token (Qwen3-30B-A3B model card).
+# 18.56 GB file: 19006 * 1.2 + 2048 = 24856 MB -> 25 GiB.
+["qwen3-30b-a3b"]
+display_name = "Qwen3 30B-A3B MoE (Q4_K_M)"
+url = "https://huggingface.co/Qwen/Qwen3-30B-A3B-GGUF/resolve/main/Qwen3-30B-A3B-Q4_K_M.gguf"
+file_name = "Qwen3-30B-A3B-Q4_K_M.gguf"
+license = "Apache-2.0"
+min_memory_mb = 25600
+recommended_ctx = 8192
+moe_total_params = 30_500_000_000
+moe_active_params = 3_300_000_000
+min_pooled_memory_mb = 25600
+
+# MoE: 106B total / 12B active (GLM-4.5-Air model card). Split GGUF — the
+# url names part 1 of 2; the downloader derives the second part's URL.
+# 73.50 GB across both parts: 75264 * 1.2 + 2048 = 92365 MB -> 91 GiB.
+["glm-4.5-air"]
+display_name = "GLM-4.5-Air MoE (Q4_K_M, 2 parts)"
+url = "https://huggingface.co/bartowski/zai-org_GLM-4.5-Air-GGUF/resolve/main/zai-org_GLM-4.5-Air-Q4_K_M/zai-org_GLM-4.5-Air-Q4_K_M-00001-of-00002.gguf"
+file_name = "zai-org_GLM-4.5-Air-Q4_K_M-00001-of-00002.gguf"
+license = "MIT"
+min_memory_mb = 93184
+recommended_ctx = 8192
+parts = 2
+moe_total_params = 106_000_000_000
+moe_active_params = 12_000_000_000
+min_pooled_memory_mb = 93184
+
+# MoE: 117B total / 5.1B active (gpt-oss model card); native MXFP4 weights.
+# A reasoning model whose analysis channel runs long, so it gets 16384 ctx
+# rather than the 8192 default.
+# 63.39 GB file: 64912 * 1.2 + 2048 = 79943 MB -> 79 GiB.
+["gpt-oss-120b"]
+display_name = "gpt-oss 120B MoE (MXFP4)"
+url = "https://huggingface.co/ggml-org/gpt-oss-120b-GGUF/resolve/main/gpt-oss-120b-MXFP4.gguf"
+file_name = "gpt-oss-120b-MXFP4.gguf"
+license = "Apache-2.0"
+min_memory_mb = 80896
+recommended_ctx = 16384
+moe_total_params = 117_000_000_000
+moe_active_params = 5_100_000_000
+min_pooled_memory_mb = 80896
+
+# R1 distills think out loud before answering, so their recommended context
+# is doubled to 16384 to leave room for the reasoning trace.
+# 4.68 GB file: 4793 * 1.2 + 2048 = 7800 MB -> 8 GiB.
+["deepseek-r1-distill-qwen-7b"]
+display_name = "DeepSeek R1 Distill Qwen 7B (Q4_K_M)"
+url = "https://huggingface.co/bartowski/DeepSeek-R1-Distill-Qwen-7B-GGUF/resolve/main/DeepSeek-R1-Distill-Qwen-7B-Q4_K_M.gguf"
+file_name = "DeepSeek-R1-Distill-Qwen-7B-Q4_K_M.gguf"
+license = "MIT"
+min_memory_mb = 8192
+recommended_ctx = 16384
+min_pooled_memory_mb = 8192
+
+# 8.99 GB file: 9206 * 1.2 + 2048 = 13096 MB -> 13 GiB.
+["deepseek-r1-distill-qwen-14b"]
+display_name = "DeepSeek R1 Distill Qwen 14B (Q4_K_M)"
+url = "https://huggingface.co/bartowski/DeepSeek-R1-Distill-Qwen-14B-GGUF/resolve/main/DeepSeek-R1-Distill-Qwen-14B-Q4_K_M.gguf"
+file_name = "DeepSeek-R1-Distill-Qwen-14B-Q4_K_M.gguf"
+license = "MIT"
+min_memory_mb = 13312
+recommended_ctx = 16384
+min_pooled_memory_mb = 13312
+
+# License is the Llama 3.3 Community License (HF tag "llama3.3"), recorded
+# not enforced; this bartowski mirror serves the file without a license
+# gate, per the logistics contract's condition for including Llama at all.
+# 42.52 GB file: 43541 * 1.2 + 2048 = 54298 MB -> 54 GiB.
+["llama-3.3-70b-instruct"]
+display_name = "Llama 3.3 70B Instruct (Q4_K_M)"
+url = "https://huggingface.co/bartowski/Llama-3.3-70B-Instruct-GGUF/resolve/main/Llama-3.3-70B-Instruct-Q4_K_M.gguf"
+file_name = "Llama-3.3-70B-Instruct-Q4_K_M.gguf"
+license = "llama3.3 (Llama 3.3 Community License; ungated mirror)"
+min_memory_mb = 55296
+recommended_ctx = 8192
+min_pooled_memory_mb = 55296
 
 ["tinystories-260k"]
 display_name = "TinyStories 260K (test model)"
@@ -40,4 +146,4 @@ url = "https://huggingface.co/ggml-org/models/resolve/main/tinyllamas/stories260
 file_name = "stories260K.gguf"
 license = "MIT (llama2.c weights; trained on the public TinyStories dataset) — test model, not for real use"
 min_memory_mb = 64
-ctx_recommended = 512
+recommended_ctx = 512

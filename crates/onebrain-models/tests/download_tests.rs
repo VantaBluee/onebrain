@@ -226,6 +226,34 @@ async fn server_ignoring_range_restarts_from_zero() {
 }
 
 #[tokio::test]
+async fn download_preserves_cache_state_fields_in_manifest() {
+    let data = Arc::new(random_blob(64 * 1024));
+    let url = start_server(data.clone(), true).await;
+    let dir = tempfile::tempdir().unwrap();
+    let spec = spec_for(url);
+
+    // A user pinned the entry before (or while) the download ran — the
+    // completion manifest write must merge, not clobber.
+    std::fs::create_dir_all(dir.path()).unwrap();
+    std::fs::write(
+        dir.path().join("manifest.json"),
+        br#"{ "pinned": true, "last_used_unix": 42 }"#,
+    )
+    .unwrap();
+
+    download(&spec, dir.path(), |_, _| {}).await.unwrap();
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.path().join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(json["pinned"], true, "pin state lost: {json}");
+    assert_eq!(json["last_used_unix"], 42, "LRU state lost: {json}");
+    // And the integrity fields landed as usual.
+    let manifest = read_manifest(dir.path()).unwrap();
+    assert_eq!(manifest.size_bytes, 64 * 1024);
+    assert_eq!(manifest.blake3, hex_hash(&data));
+}
+
+#[tokio::test]
 async fn corrupted_file_fails_verify() {
     let dir = tempfile::tempdir().unwrap();
     let payload = random_blob(64 * 1024);

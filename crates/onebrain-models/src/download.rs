@@ -96,6 +96,41 @@ pub fn manifest_path(dir: &Path) -> PathBuf {
     dir.join(MANIFEST_FILE)
 }
 
+/// The shared HTTPS client (also used by the range fetcher in `ranges`).
+pub(crate) fn http_client() -> Result<reqwest::Client, DownloadError> {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(15))
+        .read_timeout(Duration::from_secs(60))
+        .build()
+        .map_err(DownloadError::Client)
+}
+
+/// Exponential backoff before retry number `attempt` (1-based).
+pub(crate) fn backoff_delay(attempt: u32) -> Duration {
+    Duration::from_millis(250u64 << attempt)
+}
+
+/// `Authorization` header value for `url` from `$HF_TOKEN`, or `None`.
+pub(crate) fn hf_bearer_for(url: &str) -> Option<String> {
+    bearer_for(url, std::env::var("HF_TOKEN").ok().as_deref())
+}
+
+/// The token unlocks license-gated Hugging Face repos, so it is sent to
+/// huggingface.co (and subdomains) only — sending it to any other registry
+/// mirror would leak the credential to a third party. reqwest strips the
+/// `Authorization` header on cross-host redirects, so the CDN hosts that
+/// `resolve/` redirects to never see it either.
+fn bearer_for(url: &str, token: Option<&str>) -> Option<String> {
+    let token = token?.trim();
+    if token.is_empty() {
+        return None;
+    }
+    let parsed = reqwest::Url::parse(url).ok()?;
+    let host = parsed.host_str()?.to_ascii_lowercase();
+    (host == "huggingface.co" || host.ends_with(".huggingface.co"))
+        .then(|| format!("Bearer {token}"))
+}
+
 /// Read and parse `<dir>/manifest.json`.
 pub fn read_manifest(dir: &Path) -> Result<Manifest, DownloadError> {
     let path = manifest_path(dir);
@@ -161,17 +196,13 @@ pub async fn download(
         }
     }
 
-    let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(15))
-        .read_timeout(Duration::from_secs(60))
-        .build()
-        .map_err(DownloadError::Client)?;
+    let client = http_client()?;
 
     let mut last_error = String::from("no attempt made");
     let attempts = MAX_RETRIES + 1;
     for attempt in 0..attempts {
         if attempt > 0 {
-            let backoff = Duration::from_millis(250u64 << attempt);
+            let backoff = backoff_delay(attempt);
             tracing::warn!(
                 url = %spec.url,
                 attempt,
@@ -232,6 +263,9 @@ async fn run_attempt(
     let mut request = client.get(&spec.url);
     if existing > 0 {
         request = request.header(reqwest::header::RANGE, format!("bytes={existing}-"));
+    }
+    if let Some(auth) = hf_bearer_for(&spec.url) {
+        request = request.header(reqwest::header::AUTHORIZATION, auth);
     }
     let response = match request.send().await {
         Ok(r) => r,
@@ -319,7 +353,7 @@ async fn run_attempt(
 }
 
 /// Parse the total from a `Content-Range: bytes <a>-<b>/<total>` header.
-fn content_range_total(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+pub(crate) fn content_range_total(headers: &reqwest::header::HeaderMap) -> Option<u64> {
     headers
         .get(reqwest::header::CONTENT_RANGE)?
         .to_str()
@@ -352,8 +386,66 @@ pub async fn hash_file(path: &Path) -> Result<(u64, String), DownloadError> {
 
 async fn write_manifest(dir: &Path, manifest: &Manifest) -> Result<(), DownloadError> {
     let path = manifest_path(dir);
-    let json = serde_json::to_vec_pretty(manifest).expect("manifest serialization is infallible");
+    // The entry manifest also carries cache state (`pinned`,
+    // `last_used_unix` — see `cache`) that a completed download must not
+    // wipe: merge our fields into whatever object is already on disk
+    // instead of overwriting the file wholesale.
+    let mut map = match tokio::fs::read(&path).await {
+        Ok(bytes) => serde_json::from_slice::<serde_json::Value>(&bytes)
+            .ok()
+            .and_then(|v| match v {
+                serde_json::Value::Object(m) => Some(m),
+                _ => None,
+            })
+            .unwrap_or_default(),
+        Err(_) => serde_json::Map::new(),
+    };
+    let fields = serde_json::to_value(manifest).expect("manifest serialization is infallible");
+    if let serde_json::Value::Object(fields) = fields {
+        for (k, v) in fields {
+            map.insert(k, v);
+        }
+    }
+    let json = serde_json::to_vec_pretty(&serde_json::Value::Object(map))
+        .expect("manifest serialization is infallible");
     tokio::fs::write(&path, json)
         .await
         .map_err(|e| DownloadError::Io { path, source: e })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bearer_goes_to_huggingface_hosts_only() {
+        let token = Some("hf_secret");
+        for url in [
+            "https://huggingface.co/Qwen/Qwen3-4B-GGUF/resolve/main/m.gguf",
+            "https://cdn.huggingface.co/some/file.gguf",
+        ] {
+            assert_eq!(
+                bearer_for(url, token).as_deref(),
+                Some("Bearer hf_secret"),
+                "token must be sent to {url}"
+            );
+        }
+        for url in [
+            "https://example.com/model.gguf",
+            "https://evilhuggingface.co/model.gguf",
+            "https://huggingface.co.evil.example/model.gguf",
+            "http://127.0.0.1:9999/model.gguf",
+            "not a url",
+        ] {
+            assert_eq!(bearer_for(url, token), None, "token must NOT go to {url}");
+        }
+    }
+
+    #[test]
+    fn missing_or_empty_token_sends_nothing() {
+        let url = "https://huggingface.co/org/repo/resolve/main/m.gguf";
+        assert_eq!(bearer_for(url, None), None);
+        assert_eq!(bearer_for(url, Some("")), None);
+        assert_eq!(bearer_for(url, Some("   ")), None);
+    }
 }

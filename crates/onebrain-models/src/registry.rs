@@ -18,6 +18,10 @@ use serde::Deserialize;
 const EMBEDDED_REGISTRY: &str = include_str!("../models.toml");
 
 /// One curated registry entry (see `models.toml` for field semantics).
+///
+/// The M6 fields are optional in the TOML (docs/logistics.md "Registry v1")
+/// so pre-M6 entries — and third-party forks of the file — keep parsing:
+/// absent means "dense single-file model, default context".
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RegistryEntry {
@@ -25,8 +29,37 @@ pub struct RegistryEntry {
     pub url: String,
     pub file_name: String,
     pub license: String,
+    /// Minimum usable memory on ONE node to load solo at `recommended_ctx`.
     pub min_memory_mb: u64,
-    pub ctx_recommended: u32,
+    /// Recommended context length in tokens (default 8192 when absent).
+    #[serde(default = "default_recommended_ctx")]
+    pub recommended_ctx: u32,
+    /// Split-GGUF part count; 1 (the default) = a single-file model. For
+    /// split entries `url`/`file_name` name the first part and the
+    /// downloader derives the siblings (`crate::split`).
+    #[serde(default = "default_parts")]
+    pub parts: u32,
+    /// MoE total parameter count; `None` = dense model.
+    #[serde(default)]
+    pub moe_total_params: Option<u64>,
+    /// MoE parameters active per token; `None` = dense model.
+    #[serde(default)]
+    pub moe_active_params: Option<u64>,
+    /// Minimum POOLED memory across the whole cluster to load at
+    /// `recommended_ctx`; `None` for small models where solo == pooled is
+    /// the only sensible reading.
+    #[serde(default)]
+    pub min_pooled_memory_mb: Option<u64>,
+}
+
+/// Spec §6 default: 8192 tokens serves chat well without ballooning the
+/// KV cache; entries that need more (reasoning models) say so explicitly.
+fn default_recommended_ctx() -> u32 {
+    8192
+}
+
+fn default_parts() -> u32 {
+    1
 }
 
 /// The embedded registry, parsed on first access.
@@ -155,7 +188,7 @@ impl ModelRef {
                 }))
             }
             ModelRef::Hf { org, repo, file } => {
-                let url = format!("https://huggingface.co/{org}/{repo}/resolve/main/{file}");
+                let url = format!("{}/{org}/{repo}/resolve/main/{file}", hf_base_url());
                 // `file` may carry subdirectories (hf:org/repo/dir/f.gguf);
                 // only the last component becomes the on-disk name.
                 let file_name = file.rsplit('/').next().unwrap_or(file).to_string();
@@ -173,6 +206,20 @@ impl ModelRef {
             ModelRef::Local(path) => Ok(Resolved::Local(path.clone())),
         }
     }
+}
+
+/// Base URL `hf:` references resolve against. TEST-ONLY seam: the cluster
+/// sim's zero-WAN proof (docs/logistics.md "DoD hooks") points
+/// `OB_HF_BASE_URL` at a byte-counting local server standing in for
+/// huggingface.co; real installs never set it. `$HF_TOKEN` stays safe
+/// either way — `download::hf_bearer_for` sends it to huggingface.co
+/// hosts only, regardless of what the resolved URL's host is.
+fn hf_base_url() -> String {
+    std::env::var("OB_HF_BASE_URL")
+        .ok()
+        .map(|v| v.trim().trim_end_matches('/').to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "https://huggingface.co".to_string())
 }
 
 /// Make a string safe as a single directory name: ASCII alphanumerics,
@@ -196,15 +243,142 @@ mod tests {
     #[test]
     fn embedded_registry_parses_with_required_entries() {
         let reg = registry();
-        assert!(reg.len() >= 4, "expected at least 4 registry entries");
-        for id in ["qwen3-0.6b", "qwen3-1.7b", "qwen3-4b", "tinystories-260k"] {
-            let entry = reg.get(id).unwrap_or_else(|| panic!("missing {id}"));
-            assert!(entry.url.starts_with("https://"));
-            assert!(entry.file_name.ends_with(".gguf"));
-            assert!(entry.min_memory_mb > 0);
-            assert!(entry.ctx_recommended > 0);
+        assert!(
+            reg.len() >= 11,
+            "expected the full v1 registry, got {}",
+            reg.len()
+        );
+        for id in [
+            "qwen3-0.6b",
+            "qwen3-1.7b",
+            "qwen3-4b",
+            "qwen3-32b",
+            "qwen3-30b-a3b",
+            "glm-4.5-air",
+            "gpt-oss-120b",
+            "deepseek-r1-distill-qwen-7b",
+            "deepseek-r1-distill-qwen-14b",
+            "llama-3.3-70b-instruct",
+            "tinystories-260k",
+        ] {
+            assert!(reg.contains_key(id), "missing curated entry {id}");
         }
         assert_eq!(reg["qwen3-0.6b"].license, "Apache-2.0");
+    }
+
+    /// Registry v1 structural invariants (docs/logistics.md): every entry —
+    /// present and future — must satisfy these, so the test iterates the
+    /// whole map instead of naming ids.
+    #[test]
+    fn every_entry_is_structurally_sound() {
+        for (id, entry) in registry() {
+            // Ids double as cache directory names, so they must be single
+            // filesystem-safe path components (and BTreeMap keys are unique
+            // by construction — TOML rejects duplicate tables at parse).
+            assert!(!id.is_empty());
+            assert_eq!(
+                sanitize_component(id),
+                *id,
+                "id {id:?} is not filesystem-safe"
+            );
+            assert!(entry.url.starts_with("https://"), "{id}: non-https url");
+            assert!(
+                entry.url.ends_with(&entry.file_name),
+                "{id}: url must end in file_name so the downloader's naming holds"
+            );
+            assert!(
+                entry.file_name.to_ascii_lowercase().ends_with(".gguf"),
+                "{id}: file_name must be a .gguf"
+            );
+            assert!(!entry.display_name.is_empty(), "{id}: empty display_name");
+            assert!(!entry.license.is_empty(), "{id}: license must be recorded");
+            assert!(entry.min_memory_mb > 0, "{id}: min_memory_mb");
+            assert!(entry.recommended_ctx > 0, "{id}: recommended_ctx");
+            assert!(entry.parts >= 1, "{id}: parts");
+            // MoE fields come as a pair, active strictly below total.
+            match (entry.moe_total_params, entry.moe_active_params) {
+                (None, None) => {}
+                (Some(total), Some(active)) => {
+                    assert!(active < total, "{id}: active params must be < total");
+                }
+                _ => panic!("{id}: moe_total_params and moe_active_params must both be set"),
+            }
+            // Pooled memory can never be below the solo floor.
+            if let Some(pooled) = entry.min_pooled_memory_mb {
+                assert!(
+                    pooled >= entry.min_memory_mb,
+                    "{id}: min_pooled_memory_mb below min_memory_mb"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn split_entry_declares_parts_matching_its_file_name() {
+        let reg = registry();
+        let glm = &reg["glm-4.5-air"];
+        assert!(glm.parts > 1, "glm-4.5-air must be a split entry");
+        // The file name itself must parse as part 1 of `parts`, otherwise
+        // the downloader cannot derive the sibling part URLs.
+        let split = crate::split::parse_split_name(&glm.file_name)
+            .expect("glm-4.5-air file_name must follow the -%05d-of-%05d.gguf convention");
+        assert_eq!(split.index, 1, "registry entries must name the FIRST part");
+        assert_eq!(split.count, glm.parts);
+        // Every single-file entry must NOT look like a split part.
+        for (id, entry) in reg {
+            if entry.parts == 1 {
+                assert!(
+                    crate::split::parse_split_name(&entry.file_name).is_none(),
+                    "{id}: single-file entry has a split-style file_name"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn moe_entries_carry_both_param_counts() {
+        let reg = registry();
+        for id in ["qwen3-30b-a3b", "glm-4.5-air", "gpt-oss-120b"] {
+            let entry = &reg[id];
+            assert!(entry.moe_total_params.is_some(), "{id}: moe_total_params");
+            assert!(entry.moe_active_params.is_some(), "{id}: moe_active_params");
+        }
+        // And the curated big entries all state a pooled-memory floor.
+        for id in [
+            "qwen3-32b",
+            "qwen3-30b-a3b",
+            "glm-4.5-air",
+            "gpt-oss-120b",
+            "deepseek-r1-distill-qwen-7b",
+            "deepseek-r1-distill-qwen-14b",
+            "llama-3.3-70b-instruct",
+        ] {
+            assert!(
+                reg[id].min_pooled_memory_mb.is_some(),
+                "{id}: min_pooled_memory_mb"
+            );
+        }
+    }
+
+    #[test]
+    fn entry_without_optional_fields_parses_with_defaults() {
+        // Backward compatibility: a pre-M6 entry (no optional fields at
+        // all) must keep parsing — absent means dense/single-file/8192.
+        let toml = r#"
+            ["old-style"]
+            display_name = "Old Style"
+            url = "https://example.invalid/old.gguf"
+            file_name = "old.gguf"
+            license = "MIT"
+            min_memory_mb = 1024
+        "#;
+        let reg: BTreeMap<String, RegistryEntry> = toml::from_str(toml).unwrap();
+        let entry = &reg["old-style"];
+        assert_eq!(entry.recommended_ctx, 8192);
+        assert_eq!(entry.parts, 1);
+        assert_eq!(entry.moe_total_params, None);
+        assert_eq!(entry.moe_active_params, None);
+        assert_eq!(entry.min_pooled_memory_mb, None);
     }
 
     #[test]
