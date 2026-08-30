@@ -211,8 +211,54 @@ fmt, clippy, tests, CPU smoke inference with a tiny GGUF on all three OSes;
       gate's clippy pass had run; both fixed, full workspace sweep clean
 - Note: workspace rust-version 1.80 → 1.91 (iroh-blobs 0.103 floor)
 
+## M7 — Performance (implementation landed; CI gate in progress)
+
+- [x] Contract: docs/perf.md (audit-grounded: RPC backend had no
+      async/event caps, so upstream pipeline-parallel never engaged
+      over RPC — that finding shaped the whole milestone)
+- [x] Patch 0003 (additive): RPC client async pipelining — per-socket
+      pending-ack ledger with implicit batched acks (server is serial
+      in-order per connection: NO wire change), event iface, caps flip;
+      llama.cpp's pipeline_parallel gate now passes and engagement is
+      observable (filtered log line + process counter);
+      ggml_backend_rpc_pipeline_enable is the M3-baseline switch
+- [x] Engine: ob_session_params (n_ubatch/n_seq_max/kv_unified/
+      flash_attn/type_k/v), explicit batch + memory-seq API,
+      decode_step primitive, GenerationStats timing; batched-vs-alone
+      greedy proven byte-identical (no divergence fallback needed)
+- [x] Daemon micro-batching: multi-sequence step loop, unified-KV
+      admission control + 429 remedy, held-piece backpressure handling
+      (2 confirm-before-send window bugs gate-caught + fixed), status
+      honesty (no model:null while busy), concurrent supervisor with
+      retry ledger (M5 semantics intact per job)
+- [x] KV prefix reuse: best-LCP retained slots, suffix-only prefill,
+      byte-identical to cold (sim-proven: warm request prefilled
+      exactly the suffix); resets on swap/teardown/retry
+- [x] Speculative decoding: draft solo on head, K=8 + one-batch verify,
+      greedy byte-equivalence proven solo AND distributed; tears
+      mid-verify retry and continue speculating
+- [x] Scheduler v2-lite: candidate search (tilt family × exact orders),
+      bandwidth transfer term, MoE-aware dims, pipeline copy-buffer
+      reserve; plan_v1 frozen (M4 contract); daemon still calls v1 —
+      switch is the next follow-up
+- [x] bench --cluster: peer microbenches over the mesh (proto v5) +
+      timed end-to-end vs constructed M3 baseline vs solo, markdown
+- [x] Timing instrumentation: DoneStats ms fields, real Ollama
+      duration fields (ns), stable per-generation perf log line
+- [x] Full local gate green: fmt, clippy -Dwarnings, 431 workspace
+      tests, e2e, pair-sim, sim 55 steps; sweep clean (no listeners,
+      proto v5 hard-reject, patch tree byte-verified, confirm-before-
+      send audit)
+- [ ] CI green incl. the netem perf DoD (overlap ≤ 0.75× sequential,
+      decode ≥ 0.9×) — rides the M7 push
+- [ ] Follow-up queued: switch daemon plan_load to plan_v2 (+ xtask
+      mirror + predicted_tpt_ms updates), own gate + commit
+- Deferred by contract: int8 activation compression (docs/perf.md §9
+  records why); per-seq sampler chains for interleaved non-greedy
+  (documented divergence class, engine follow-up)
+
 ## Upcoming
-- M7 performance · M8 product polish. Details in the spec.
+- M8 product polish. Details in the spec.
 
 ## Dev environment notes (this machine: Windows 11)
 

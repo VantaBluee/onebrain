@@ -10,6 +10,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 M0 (skeleton & CI) complete locally; M1 (excellent single-node) implemented,
 cross-OS CI proof in flight.
 
+### Added — M7
+
+- Distributed prefill overlaps: an additive vendor patch teaches the
+  GGML RPC client async submission (pending-ack ledger; the server's
+  serial in-order processing is the correctness argument, so the wire
+  format is untouched), which finally lets llama.cpp's pipeline-parallel
+  scheduler engage over RPC — chunks of a long prompt now compute on one
+  node while another node's chunk is in flight (sim DoD: ≥25% faster
+  than the sequential path on the 1 Gbit profile, asserted in CI's
+  netem leg).
+- Requests no longer queue single-file: up to `max_concurrent_requests`
+  generations share one unified KV cache with per-step token batching,
+  admission control, and an honest 429 (with remedy) when the queue is
+  full. A stalled client only stalls itself. Status queries answer
+  instantly during generation.
+- A repeated prompt prefix skips its own prefill: completed requests
+  retain their KV, and a new request decodes only the divergent suffix
+  (byte-identical output, greedy-proven), which makes chat-style
+  system-prompt reuse nearly free.
+- `--speculative`: a small draft model on the head proposes K tokens and
+  the (possibly sharded) target verifies them in one batch — greedy
+  output is byte-identical to non-speculative (sim-proven solo and
+  distributed), and node loss mid-verify recovers and keeps
+  speculating.
+- Scheduler v2-lite searches candidate splits (memory/compute tilts,
+  slow-node underweighting) with a bandwidth-aware transfer term and
+  MoE-aware model dims; `--explain` reports the candidates and why the
+  winner won.
+- `onebrain bench --cluster`: every paired machine's microbench over
+  the mesh plus timed end-to-end runs — as configured, vs the
+  pre-overlap baseline, vs solo — in one reproducible markdown table.
+- Real timing everywhere: the Ollama dialect now returns genuine
+  `*_duration` fields, and every generation logs prefill/decode/TTFT.
+
 ### Added — M6
 
 - Weights now move at range granularity: the model cache stores
