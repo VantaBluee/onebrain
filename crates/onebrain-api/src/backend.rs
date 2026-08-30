@@ -48,12 +48,59 @@ impl Default for GenParams {
 }
 
 /// Terminal statistics for a finished generation.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+///
+/// The M7 timing/speculative fields (docs/perf.md §1) are wall-clock
+/// measurements the daemon copies from the engine's `GenerationStats`; `0`
+/// uniformly means "not measured" (the pre-instrumentation engine path, or
+/// a backend that cannot time itself). The Ollama dialect scales the
+/// millisecond fields to the nanosecond `*_duration` fields real Ollama
+/// emits; OpenAI `usage` stays counts-only per the OpenAI schema.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct DoneStats {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     /// "stop" | "length" | "abort" — pre-mapped to dialect wording upstream.
     pub finish: FinishKind,
+    /// Wall-clock MILLISECONDS spent prefilling the prompt. `0` = not
+    /// measured.
+    #[serde(default)]
+    pub prefill_ms: u64,
+    /// Wall-clock MILLISECONDS spent in the decode loop. `0` = not
+    /// measured.
+    #[serde(default)]
+    pub decode_ms: u64,
+    /// MILLISECONDS from generation start to the first emitted piece (time
+    /// to first token). `0` = not measured.
+    #[serde(default)]
+    pub ttft_ms: u64,
+    /// Tokens proposed by the speculative draft model (COUNT; `0` until the
+    /// M7 `--speculative` engine work lands, and always `0` without a
+    /// draft — docs/perf.md §5).
+    #[serde(default)]
+    pub drafted: u32,
+    /// Draft tokens the target model accepted (COUNT; `<= drafted`).
+    #[serde(default)]
+    pub accepted: u32,
+}
+
+impl Default for DoneStats {
+    /// All-zero counts and timing with `finish: Stop`. Exists so
+    /// construction sites can spell only what they measured
+    /// (`..DoneStats::default()`) as the struct grows across milestones;
+    /// `finish` MUST always be overwritten — `Stop` here is a spelling
+    /// convenience, not a semantic default.
+    fn default() -> Self {
+        DoneStats {
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            finish: FinishKind::Stop,
+            prefill_ms: 0,
+            decode_ms: 0,
+            ttft_ms: 0,
+            drafted: 0,
+            accepted: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -122,6 +169,29 @@ pub trait EngineBackend: Send + Sync + 'static {
 pub mod testing {
     use super::*;
 
+    /// Deterministic wall-clock figures the fake reports in every
+    /// [`DoneStats`] (milliseconds), so dialect conformance tests can assert
+    /// the exact nanosecond scaling of Ollama's `*_duration` fields.
+    pub const FAKE_PREFILL_MS: u64 = 12;
+    /// See [`FAKE_PREFILL_MS`].
+    pub const FAKE_DECODE_MS: u64 = 34;
+    /// See [`FAKE_PREFILL_MS`].
+    pub const FAKE_TTFT_MS: u64 = 5;
+
+    /// The stats shape every fake generation terminates with: real token
+    /// counts, the deterministic fake timing, zero speculative counters.
+    fn fake_stats(completion_tokens: u32, finish: FinishKind) -> DoneStats {
+        DoneStats {
+            prompt_tokens: 3,
+            completion_tokens,
+            finish,
+            prefill_ms: FAKE_PREFILL_MS,
+            decode_ms: FAKE_DECODE_MS,
+            ttft_ms: FAKE_TTFT_MS,
+            ..DoneStats::default()
+        }
+    }
+
     /// Streams each whitespace-separated word of `script` as one token,
     /// honoring `max_tokens` and stop strings, for any requested model name
     /// contained in `models`.
@@ -185,11 +255,7 @@ pub mod testing {
                     if sent >= job.params.max_tokens {
                         let _ = job
                             .tx
-                            .send(TokenEvent::Done(DoneStats {
-                                prompt_tokens: 3,
-                                completion_tokens: sent,
-                                finish: FinishKind::Length,
-                            }))
+                            .send(TokenEvent::Done(fake_stats(sent, FinishKind::Length)))
                             .await;
                         return;
                     }
@@ -202,11 +268,7 @@ pub mod testing {
                     if job.params.stop.iter().any(|s| accumulated.contains(s)) {
                         let _ = job
                             .tx
-                            .send(TokenEvent::Done(DoneStats {
-                                prompt_tokens: 3,
-                                completion_tokens: sent,
-                                finish: FinishKind::Stop,
-                            }))
+                            .send(TokenEvent::Done(fake_stats(sent, FinishKind::Stop)))
                             .await;
                         return;
                     }
@@ -217,11 +279,7 @@ pub mod testing {
                 }
                 let _ = job
                     .tx
-                    .send(TokenEvent::Done(DoneStats {
-                        prompt_tokens: 3,
-                        completion_tokens: sent,
-                        finish: FinishKind::Stop,
-                    }))
+                    .send(TokenEvent::Done(fake_stats(sent, FinishKind::Stop)))
                     .await;
             });
             Ok(())

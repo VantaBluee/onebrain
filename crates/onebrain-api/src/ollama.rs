@@ -283,9 +283,31 @@ fn done_json(kind: &Kind, model: &str, content: &str, stats: &DoneStats) -> Valu
         .expect("done_json builds a JSON object");
     obj.insert("done".to_string(), json!(true));
     obj.insert("done_reason".to_string(), json!(done_reason(stats.finish)));
+    // Duration fields (M7, docs/perf.md §1) in NANOSECONDS with real
+    // Ollama's exact field names, derived from the engine's millisecond
+    // wall-clocks in `DoneStats`. Zeros mean "not measured" — honest, and
+    // what unmodified Ollama clients already tolerate. `total_duration` is
+    // prefill + decode (queueing/tokenization are not attributed);
+    // `load_duration` is present for field-shape parity but OneBrain does
+    // not attribute model-load time to a single request, so it is 0.
+    let prompt_eval_ns = ms_to_ns(stats.prefill_ms);
+    let eval_ns = ms_to_ns(stats.decode_ms);
+    obj.insert(
+        "total_duration".to_string(),
+        json!(prompt_eval_ns.saturating_add(eval_ns)),
+    );
+    obj.insert("load_duration".to_string(), json!(0u64));
     obj.insert("prompt_eval_count".to_string(), json!(stats.prompt_tokens));
+    obj.insert("prompt_eval_duration".to_string(), json!(prompt_eval_ns));
     obj.insert("eval_count".to_string(), json!(stats.completion_tokens));
+    obj.insert("eval_duration".to_string(), json!(eval_ns));
     value
+}
+
+/// Milliseconds → nanoseconds for the Ollama duration fields. Saturating:
+/// a garbage duration must cap out, never wrap into a plausible lie.
+fn ms_to_ns(ms: u64) -> u64 {
+    ms.saturating_mul(1_000_000)
 }
 
 fn done_reason(finish: FinishKind) -> &'static str {
@@ -435,6 +457,58 @@ mod tests {
         assert_eq!(civil_from_days(31), (1970, 2, 1));
         // 2000-02-29 (leap year), day 11_016 from the epoch.
         assert_eq!(civil_from_days(11_016), (2000, 2, 29));
+    }
+
+    #[test]
+    fn done_json_scales_ms_to_ollama_nanosecond_durations() {
+        // Real Ollama reports *_duration in nanoseconds; our DoneStats carry
+        // milliseconds (docs/perf.md §1), so the terminal object must scale
+        // by exactly 1e6 and sum prefill+decode into total_duration.
+        let stats = DoneStats {
+            prompt_tokens: 7,
+            completion_tokens: 9,
+            finish: FinishKind::Stop,
+            prefill_ms: 12,
+            decode_ms: 34,
+            ttft_ms: 5,
+            ..DoneStats::default()
+        };
+        let value = done_json(&Kind::Generate, "m", "", &stats);
+        assert_eq!(value["prompt_eval_duration"], 12_000_000u64);
+        assert_eq!(value["eval_duration"], 34_000_000u64);
+        assert_eq!(value["total_duration"], 46_000_000u64);
+        assert_eq!(value["load_duration"], 0u64);
+        assert_eq!(value["prompt_eval_count"], 7);
+        assert_eq!(value["eval_count"], 9);
+    }
+
+    #[test]
+    fn done_json_unmeasured_stats_emit_zero_durations() {
+        // A backend that measured nothing (all-zero timing) still emits the
+        // full Ollama field set, honestly zeroed — clients must never see a
+        // missing field or a fabricated duration.
+        let stats = DoneStats {
+            prompt_tokens: 3,
+            completion_tokens: 5,
+            finish: FinishKind::Stop,
+            ..DoneStats::default()
+        };
+        let value = done_json(&Kind::Chat, "m", "", &stats);
+        for field in [
+            "total_duration",
+            "load_duration",
+            "prompt_eval_duration",
+            "eval_duration",
+        ] {
+            assert_eq!(value[field], 0u64, "{field} must be present and zero");
+        }
+    }
+
+    #[test]
+    fn ms_to_ns_saturates_instead_of_wrapping() {
+        assert_eq!(ms_to_ns(0), 0);
+        assert_eq!(ms_to_ns(1), 1_000_000);
+        assert_eq!(ms_to_ns(u64::MAX), u64::MAX, "must cap, not wrap");
     }
 
     #[test]

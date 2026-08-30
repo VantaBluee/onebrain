@@ -28,6 +28,18 @@ pub enum ApiError {
     NoModel,
     #[error("the engine is busy shutting down")]
     ShuttingDown,
+    /// Admission control (docs/perf.md §6): the concurrent set AND the wait
+    /// queue are full. Maps to HTTP 429 with a remedy — never an unbounded
+    /// queue.
+    #[error(
+        "this node is at capacity: {max_concurrent} generations are running and \
+         {queue_depth} more are queued; retry shortly, or raise [perf] \
+         max_concurrent_requests / queue_depth in config.toml"
+    )]
+    Overloaded {
+        max_concurrent: u32,
+        queue_depth: u32,
+    },
     #[error("request validation failed: {0}")]
     BadRequest(String),
     #[error("this endpoint is not implemented yet: {0}")]

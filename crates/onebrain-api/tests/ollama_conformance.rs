@@ -5,11 +5,37 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use onebrain_api::auth::AuthConfig;
-use onebrain_api::backend::testing::FakeBackend;
+use onebrain_api::backend::testing::{FakeBackend, FAKE_DECODE_MS, FAKE_PREFILL_MS};
 use onebrain_api::{router, ApiState};
 use serde_json::{json, Value};
 
 const SCRIPT: &str = "the quick brown fox jumps";
+/// Milliseconds → nanoseconds: the scale factor the dialect must apply to
+/// the engine's DoneStats wall-clocks (real Ollama reports nanoseconds).
+const NS_PER_MS: u64 = 1_000_000;
+
+/// Assert the terminal object carries real Ollama's duration field set
+/// (M7, docs/perf.md §1): exact nanosecond scaling of the fake backend's
+/// millisecond stats, total = prefill + decode, and a present-but-zero
+/// `load_duration` (OneBrain does not attribute load time to a request).
+fn assert_duration_fields(last: &Value) {
+    assert_eq!(
+        last["prompt_eval_duration"],
+        FAKE_PREFILL_MS * NS_PER_MS,
+        "prompt_eval_duration must be prefill_ms in ns: {last}"
+    );
+    assert_eq!(
+        last["eval_duration"],
+        FAKE_DECODE_MS * NS_PER_MS,
+        "eval_duration must be decode_ms in ns: {last}"
+    );
+    assert_eq!(
+        last["total_duration"],
+        (FAKE_PREFILL_MS + FAKE_DECODE_MS) * NS_PER_MS,
+        "total_duration must be prefill+decode in ns: {last}"
+    );
+    assert_eq!(last["load_duration"], 0, "load_duration present, 0: {last}");
+}
 
 /// Bind a fresh server on an ephemeral loopback port; return its base URL.
 async fn spawn_server() -> String {
@@ -84,6 +110,7 @@ async fn generate_streams_ndjson_by_default() {
     assert_eq!(last["response"], "");
     assert_eq!(last["prompt_eval_count"], 3);
     assert_eq!(last["eval_count"], 5);
+    assert_duration_fields(last);
 }
 
 #[tokio::test]
@@ -103,6 +130,7 @@ async fn generate_honors_stream_false() {
     assert_eq!(body["done_reason"], "stop");
     assert_eq!(body["prompt_eval_count"], 3);
     assert_eq!(body["eval_count"], 5);
+    assert_duration_fields(&body);
 }
 
 #[tokio::test]
@@ -135,6 +163,7 @@ async fn chat_streams_message_pieces() {
     assert_eq!(last["done_reason"], "stop");
     assert_eq!(last["message"]["content"], "");
     assert_eq!(last["eval_count"], 5);
+    assert_duration_fields(last);
 }
 
 #[tokio::test]
@@ -156,6 +185,7 @@ async fn chat_honors_stream_false() {
     assert_eq!(body["message"]["content"], SCRIPT);
     assert_eq!(body["done"], true);
     assert_eq!(body["eval_count"], 5);
+    assert_duration_fields(&body);
 }
 
 #[tokio::test]
@@ -278,6 +308,7 @@ async fn num_predict_limits_generation_with_length_reason() {
     assert_eq!(last["done"], true);
     assert_eq!(last["done_reason"], "length");
     assert_eq!(last["eval_count"], 2);
+    assert_duration_fields(last);
 }
 
 #[tokio::test]

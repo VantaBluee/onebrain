@@ -19,6 +19,8 @@ impl ApiError {
             ApiError::ModelNotLoaded(_) | ApiError::NoModel => StatusCode::NOT_FOUND,
             ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
             ApiError::ShuttingDown => StatusCode::SERVICE_UNAVAILABLE,
+            // Admission control (docs/perf.md §6): the typed 429-equivalent.
+            ApiError::Overloaded { .. } => StatusCode::TOO_MANY_REQUESTS,
             ApiError::NotImplemented(_) => StatusCode::NOT_IMPLEMENTED,
             ApiError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -34,6 +36,8 @@ impl IntoResponse for ApiError {
                 "type": match self {
                     ApiError::BadRequest(_) => "invalid_request_error",
                     ApiError::ModelNotLoaded(_) | ApiError::NoModel => "not_found_error",
+                    // OpenAI's own wording for 429-class rejections.
+                    ApiError::Overloaded { .. } => "rate_limit_error",
                     _ => "api_error",
                 }
             },
