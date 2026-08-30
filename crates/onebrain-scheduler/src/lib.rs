@@ -10,8 +10,12 @@
 //! - [`v1`] — [`plan_v1`]: KV budgeting at the requested context,
 //!   memory-and-compute layer shares, boundary-on-fastest-link stage
 //!   ordering, and the ≥5% third-node rule.
-//!
-//! The prima.cpp-style cost-model search is M7.
+//! - [`v2`] — [`plan_v2`]: the M7 v2-lite cost-model search
+//!   (docs/perf.md §7 + §8): layer-share tilt family × stage orders with a
+//!   link-bandwidth prefill transfer term, the pipeline-parallel copy
+//!   reserve, and MoE active-expert compute scaling. [`plan_v1`] is kept
+//!   byte-for-byte (its M4 contract is frozen); the daemon opts into v2 by
+//!   calling [`plan_v2`] with the same [`PlanRequest`].
 //!
 //! # The M3 compatibility path ([`plan`] / [`PlanInput`])
 //!
@@ -35,6 +39,7 @@
 pub mod dims;
 pub mod profile;
 pub mod v1;
+pub mod v2;
 
 pub use dims::{model_dims, ModelDims};
 pub use profile::{
@@ -43,7 +48,10 @@ pub use profile::{
 };
 pub use v1::{
     node_budget, node_layer_capacity, plan_v1, LinkRtt, NodeCaps, PlanRequest, ADDED_NODE_TPT_GAIN,
-    DEFAULT_LINK_RTT_MS, EXACT_ORDER_MAX_NODES, OVERHEAD_RESERVE_BYTES,
+    DEFAULT_LINK_RTT_MS, DEFAULT_N_UBATCH, EXACT_ORDER_MAX_NODES, OVERHEAD_RESERVE_BYTES,
+};
+pub use v2::{
+    boundary_transfer_ms, effective_n_ubatch, node_budget_v2, node_layer_capacity_v2, plan_v2,
 };
 
 use serde::{Deserialize, Serialize};

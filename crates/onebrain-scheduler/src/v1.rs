@@ -79,6 +79,11 @@ pub const ADDED_NODE_TPT_GAIN: f64 = 0.05;
 /// participating nodes; beyond it a greedy nearest-neighbor chain is built.
 pub const EXACT_ORDER_MAX_NODES: usize = 8;
 
+/// Default effective microbatch size when [`PlanRequest::n_ubatch`] is 0 —
+/// mirrors the engine's `n_ubatch` default and the `[perf] n_ubatch` config
+/// knob default (docs/perf.md §3).
+pub const DEFAULT_N_UBATCH: u32 = 512;
+
 /// One node as the v1 planner sees it: identity, budgetable memory, and the
 /// optional compute microbench result (None ⇒ memory-only weighting).
 #[derive(Debug, Clone, PartialEq)]
@@ -103,6 +108,12 @@ pub struct LinkRtt {
     pub a: NodeId,
     pub b: NodeId,
     pub rtt_ms: f64,
+    /// Measured link bandwidth in megabits/second (M7, docs/perf.md §7),
+    /// fed from `PeerStatus` once the daemon measures it. `None` (or a
+    /// nonsense non-positive value) = unmeasured: the link is costed
+    /// RTT-only, exactly today's behavior — so the daemon can wire this
+    /// field whenever its probe lands without changing plans until then.
+    pub bandwidth_mbps: Option<f64>,
 }
 
 /// Everything [`plan_v1`] needs to place one model load.
@@ -123,6 +134,13 @@ pub struct PlanRequest {
     /// Measured per-link RTTs. Missing pairs default to
     /// [`DEFAULT_LINK_RTT_MS`].
     pub links: Vec<LinkRtt>,
+    /// Effective microbatch size for this load (the `[perf] n_ubatch` knob;
+    /// docs/perf.md §3). 0 is treated as [`DEFAULT_N_UBATCH`]. With
+    /// [`ModelDims::n_embd`] it sizes the per-ubatch pipeline boundary
+    /// activation copy (`4·n_embd·n_ubatch` bytes) that drives `plan_v2`'s
+    /// transfer term and per-node pipeline reserve; `plan_v1` records but
+    /// never reads it.
+    pub n_ubatch: u32,
 }
 
 /// M3 compatibility: an M3-shaped [`PlanInput`] carries only a total byte
@@ -146,6 +164,7 @@ impl From<&PlanInput> for PlanRequest {
             ctx_len: input.ctx_len,
             forced_nodes: input.forced_nodes,
             links: Vec::new(),
+            n_ubatch: DEFAULT_N_UBATCH,
         }
     }
 }
@@ -166,25 +185,79 @@ pub fn node_layer_capacity(usable_memory_bytes: u64, dims: &ModelDims, ctx_len: 
 
 /// Mean weight + KV cost of one layer at `ctx_len`, as f64, never below 1.0
 /// (division guard for degenerate synthetic models).
-fn per_layer_cost(dims: &ModelDims, ctx_len: u32) -> f64 {
+pub(crate) fn per_layer_cost(dims: &ModelDims, ctx_len: u32) -> f64 {
     ((dims.mean_weight_bytes_per_layer() + dims.kv_bytes_per_layer(ctx_len)) as f64).max(1.0)
 }
 
-/// One candidate node with its derived planning numbers.
-struct Cand<'a> {
-    caps: &'a NodeCaps,
-    is_head: bool,
-    budget: u64,
+/// One candidate node with its derived planning numbers. Shared with the v2
+/// planner, which builds it with its own (pipeline-reserve) budget rule.
+pub(crate) struct Cand<'a> {
+    pub(crate) caps: &'a NodeCaps,
+    pub(crate) is_head: bool,
+    pub(crate) budget: u64,
     /// Fractional layer capacity (budget / per-layer cost).
-    cap_f: f64,
+    pub(crate) cap_f: f64,
     /// Whole-layer capacity (floor of `cap_f`).
-    cap_layers: u64,
+    pub(crate) cap_layers: u64,
+    /// The node's own profiled decode throughput (> 0), or `None` when
+    /// unprofiled. v2's tilt family and slowest-node underweighting key off
+    /// this raw value.
+    pub(crate) decode: Option<f64>,
     /// Compute tilt factor: `0.5 + 0.5 × decode/max_decode`, or 1.0 when
     /// unprofiled (module docs).
-    factor: f64,
+    pub(crate) factor: f64,
     /// decode_tps used in the tpt prediction: own, or the slowest profiled
     /// node's (conservative), or `None` when no node is profiled.
-    tpt_decode: Option<f64>,
+    pub(crate) tpt_decode: Option<f64>,
+}
+
+/// Build the candidate table for `all_caps` (workers in stable order, head
+/// last) under a caller-supplied budget rule — [`node_budget`] for v1,
+/// the pipeline-reserve budget for v2. Everything else (compute factors,
+/// conservative unprofiled costing) is common to both planners.
+pub(crate) fn build_cands<'a>(
+    all_caps: &[&'a NodeCaps],
+    cost: f64,
+    budget_of: &dyn Fn(u64) -> u64,
+) -> Vec<Cand<'a>> {
+    let profiled: Vec<f64> = all_caps
+        .iter()
+        .filter_map(|c| c.compute.map(|p| p.decode_tps))
+        .filter(|d| *d > 0.0)
+        .collect();
+    let max_decode = profiled.iter().copied().fold(f64::NAN, f64::max);
+    let min_decode = profiled.iter().copied().fold(f64::NAN, f64::min);
+
+    all_caps
+        .iter()
+        .enumerate()
+        .map(|(i, caps)| {
+            let budget = budget_of(caps.usable_memory_bytes);
+            let cap_f = budget as f64 / cost;
+            let decode = caps.compute.map(|p| p.decode_tps).filter(|d| *d > 0.0);
+            let factor = match decode {
+                Some(d) if max_decode.is_finite() => 0.5 + 0.5 * d / max_decode,
+                // Unprofiled: neutral factor — no tilt for or against. With
+                // no profiles anywhere this is memory-only weighting (M3).
+                _ => 1.0,
+            };
+            let tpt_decode = decode.or(if min_decode.is_finite() {
+                Some(min_decode)
+            } else {
+                None
+            });
+            Cand {
+                caps,
+                is_head: i == all_caps.len() - 1,
+                budget,
+                cap_f,
+                cap_layers: (cap_f.floor().max(0.0) as u64).min(u64::from(u32::MAX)),
+                decode,
+                factor,
+                tpt_decode,
+            }
+        })
+        .collect()
 }
 
 /// A fully evaluated candidate participant set.
@@ -241,7 +314,7 @@ pub fn plan_v1(input: &PlanRequest) -> Result<PlannedPlacement, ScheduleError> {
     distributed_v1(input, forced, head_budget, required, kv_layer, solo_fits)
 }
 
-fn solo_placement(
+pub(crate) fn solo_placement(
     input: &PlanRequest,
     head_budget: u64,
     required: u64,
@@ -295,7 +368,7 @@ fn solo_placement(
 }
 
 /// Undirected RTT lookup with the documented default for unprobed pairs.
-fn link_rtt(links: &[LinkRtt], a: &NodeId, b: &NodeId) -> f64 {
+pub(crate) fn link_rtt(links: &[LinkRtt], a: &NodeId, b: &NodeId) -> f64 {
     links
         .iter()
         .find(|l| (&l.a == a && &l.b == b) || (&l.a == b && &l.b == a))
@@ -303,13 +376,29 @@ fn link_rtt(links: &[LinkRtt], a: &NodeId, b: &NodeId) -> f64 {
         .unwrap_or(DEFAULT_LINK_RTT_MS)
 }
 
-/// Largest-remainder apportionment of `n_layers` over the candidates,
-/// proportional to `cap_f × factor`, clamped to each node's whole-layer
-/// capacity. `None` when the set cannot hold the model at all.
-fn apportion(cands: &[&Cand], n_layers: u32) -> Option<Vec<u32>> {
-    let scores: Vec<f64> = cands.iter().map(|c| c.cap_f * c.factor).collect();
+/// Undirected bandwidth lookup (megabits/sec). `None` = unmeasured link
+/// (or a nonsense non-positive figure): the transfer term stays zero and
+/// the boundary is costed RTT-only, today's behavior.
+pub(crate) fn link_bandwidth(links: &[LinkRtt], a: &NodeId, b: &NodeId) -> Option<f64> {
+    links
+        .iter()
+        .find(|l| (&l.a == a && &l.b == b) || (&l.a == b && &l.b == a))
+        .and_then(|l| l.bandwidth_mbps)
+        .filter(|bw| *bw > 0.0)
+}
+
+/// Largest-remainder apportionment of `n_layers` proportional to `scores`,
+/// clamped to each node's whole-layer capacity `caps`. Returns the counts
+/// and the fractional quotas (v2's underweight variant re-uses the quotas
+/// for its recipient rule); `None` when the set cannot hold the model at
+/// all.
+pub(crate) fn apportion(
+    scores: &[f64],
+    caps: &[u64],
+    n_layers: u32,
+) -> Option<(Vec<u32>, Vec<f64>)> {
     let total_score: f64 = scores.iter().sum();
-    let total_cap: u64 = cands.iter().map(|c| c.cap_layers).sum();
+    let total_cap: u64 = caps.iter().sum();
     if total_score <= 0.0 || total_cap < n_layers as u64 {
         return None;
     }
@@ -319,16 +408,16 @@ fn apportion(cands: &[&Cand], n_layers: u32) -> Option<Vec<u32>> {
         .collect();
     let mut counts: Vec<u32> = quotas
         .iter()
-        .zip(cands)
-        .map(|(q, c)| (q.floor() as u64).min(c.cap_layers) as u32)
+        .zip(caps)
+        .map(|(q, c)| (q.floor() as u64).min(*c) as u32)
         .collect();
     let mut leftover = n_layers - counts.iter().sum::<u32>();
     // Hand out the rest one layer at a time to the node with the largest
     // unmet quota that still has capacity; ties break on score, then index.
     while leftover > 0 {
         let mut best: Option<usize> = None;
-        for i in 0..cands.len() {
-            if (counts[i] as u64) >= cands[i].cap_layers {
+        for i in 0..scores.len() {
+            if (counts[i] as u64) >= caps[i] {
                 continue;
             }
             let better = match best {
@@ -347,14 +436,26 @@ fn apportion(cands: &[&Cand], n_layers: u32) -> Option<Vec<u32>> {
         counts[i] += 1;
         leftover -= 1;
     }
-    Some(counts)
+    Some((counts, quotas))
+}
+
+/// v1's apportionment: proportional to the memory-and-compute score
+/// `cap_f × factor` (module docs).
+fn apportion_v1(cands: &[&Cand], n_layers: u32) -> Option<Vec<u32>> {
+    let scores: Vec<f64> = cands.iter().map(|c| c.cap_f * c.factor).collect();
+    let caps: Vec<u64> = cands.iter().map(|c| c.cap_layers).collect();
+    apportion(&scores, &caps, n_layers).map(|(counts, _)| counts)
 }
 
 /// Choose the stage order: nodes holding layers, head pinned to the last
 /// stage (sampling locality), arranged to minimize the summed RTT across
 /// consecutive stages. Exact permutation search up to
 /// [`EXACT_ORDER_MAX_NODES`] participants, greedy nearest-neighbor beyond.
-fn order_stages(cands: &[&Cand], counts: &[u32], links: &[LinkRtt]) -> (Vec<usize>, Vec<f64>) {
+pub(crate) fn order_stages(
+    cands: &[&Cand],
+    counts: &[u32],
+    links: &[LinkRtt],
+) -> (Vec<usize>, Vec<f64>) {
     let active: Vec<usize> = (0..cands.len()).filter(|&i| counts[i] > 0).collect();
     if active.len() <= 1 {
         return (active, Vec::new());
@@ -428,7 +529,7 @@ fn order_stages(cands: &[&Cand], counts: &[u32], links: &[LinkRtt]) -> (Vec<usiz
 }
 
 /// All permutations of `items`, in lexicographic order over the input.
-fn permutations(items: &[usize]) -> Vec<Vec<usize>> {
+pub(crate) fn permutations(items: &[usize]) -> Vec<Vec<usize>> {
     if items.is_empty() {
         return vec![Vec::new()];
     }
@@ -447,7 +548,7 @@ fn permutations(items: &[usize]) -> Vec<Vec<usize>> {
 /// Apportion + order + predict for one candidate participant set.
 /// `None` when the set cannot hold the model.
 fn evaluate(cands: &[&Cand], n_layers: u32, links: &[LinkRtt]) -> Option<Evaluated> {
-    let counts = apportion(cands, n_layers)?;
+    let counts = apportion_v1(cands, n_layers)?;
     let (order, boundary_rtts) = order_stages(cands, &counts, links);
     let compute_ms = order
         .iter()
@@ -465,66 +566,34 @@ fn evaluate(cands: &[&Cand], n_layers: u32, links: &[LinkRtt]) -> Option<Evaluat
     })
 }
 
-fn distributed_v1(
-    input: &PlanRequest,
+/// The selected worker indices plus the head, in stable (candidate) order.
+pub(crate) fn participants<'c, 'a>(cands: &'c [Cand<'a>], selected: &[usize]) -> Vec<&'c Cand<'a>> {
+    let mut set: Vec<usize> = selected.to_vec();
+    set.sort_unstable();
+    set.push(cands.len() - 1);
+    set.iter().map(|&i| &cands[i]).collect()
+}
+
+/// Participant selection, shared by the v1 and v2 planners (M7 contract:
+/// "existing inclusion rules unchanged"). Workers are ranked non-draining
+/// first (docs/resilience.md), then by memory-and-compute score; forced
+/// counts take the best-ranked, automatic mode admits a worker only when
+/// the plan does not fit without it or `eval_tpt` improves by
+/// [`ADDED_NODE_TPT_GAIN`]. `eval_tpt` returns the predicted
+/// time-per-token of a participant set, or `None` when the set cannot hold
+/// the model — v1 passes its single evaluation, v2 the best of its
+/// candidate family. Returns the selected worker indices and the
+/// explanation notes.
+pub(crate) fn select_workers(
+    cands: &[Cand],
     forced: Option<u32>,
-    head_budget: u64,
-    required: u64,
-    kv_layer: u64,
-    solo_fits: bool,
-) -> Result<PlannedPlacement, ScheduleError> {
-    let dims = &input.dims;
-    let n_layers = dims.n_layers;
-    let cost = per_layer_cost(dims, input.ctx_len);
-
-    // Compute factors over every candidate (head + workers).
-    let all_caps: Vec<&NodeCaps> = input
-        .workers
-        .iter()
-        .chain(std::iter::once(&input.head))
-        .collect();
-    let profiled: Vec<f64> = all_caps
-        .iter()
-        .filter_map(|c| c.compute.map(|p| p.decode_tps))
-        .filter(|d| *d > 0.0)
-        .collect();
-    let max_decode = profiled.iter().copied().fold(f64::NAN, f64::max);
-    let min_decode = profiled.iter().copied().fold(f64::NAN, f64::min);
-
-    // Candidates: workers in their stable order, head last.
-    let cands: Vec<Cand> = all_caps
-        .iter()
-        .enumerate()
-        .map(|(i, caps)| {
-            let budget = node_budget(caps.usable_memory_bytes);
-            let cap_f = budget as f64 / cost;
-            let decode = caps.compute.map(|p| p.decode_tps).filter(|d| *d > 0.0);
-            let factor = match decode {
-                Some(d) if max_decode.is_finite() => 0.5 + 0.5 * d / max_decode,
-                // Unprofiled: neutral factor — no tilt for or against. With
-                // no profiles anywhere this is memory-only weighting (M3).
-                _ => 1.0,
-            };
-            let tpt_decode = decode.or(if min_decode.is_finite() {
-                Some(min_decode)
-            } else {
-                None
-            });
-            Cand {
-                caps,
-                is_head: i == all_caps.len() - 1,
-                budget,
-                cap_f,
-                cap_layers: (cap_f.floor().max(0.0) as u64).min(u64::from(u32::MAX)),
-                factor,
-                tpt_decode,
-            }
-        })
-        .collect();
+    n_layers: u32,
+    ctx_len: u32,
+    cost: f64,
+    eval_tpt: &mut dyn FnMut(&[&Cand]) -> Option<f64>,
+) -> (Vec<usize>, Vec<String>) {
     let head_idx = cands.len() - 1;
-    let pooled_budget: u64 = cands.iter().map(|c| c.budget).sum();
 
-    // ---- Participant selection ------------------------------------------
     // Worker candidate order: non-draining before draining (a draining
     // battery joins only when nothing else works — docs/resilience.md), then
     // by memory-and-compute score, descending (ties: earlier stable order).
@@ -544,13 +613,6 @@ fn distributed_v1(
 
     let mut selection_notes: Vec<String> = Vec::new();
     let mut selected: Vec<usize> = Vec::new(); // worker candidate indices
-
-    let participants = |selected: &[usize]| -> Vec<&Cand> {
-        let mut set: Vec<usize> = selected.to_vec();
-        set.sort_unstable();
-        set.push(head_idx);
-        set.iter().map(|&i| &cands[i]).collect()
-    };
 
     match forced {
         Some(n) => {
@@ -585,13 +647,13 @@ fn distributed_v1(
                         "Node '{}': excluded — it cannot hold even one layer at ctx {} \
                          ({} MB budget vs ~{} MB per layer with KV)",
                         cand.caps.node.0,
-                        input.ctx_len,
+                        ctx_len,
                         mb_floor(cand.budget),
                         mb_ceil(cost as u64),
                     ));
                     continue;
                 }
-                let current = evaluate(&participants(&selected), n_layers, &input.links);
+                let current = eval_tpt(&participants(cands, &selected));
                 // A draining node never joins for speed; it joins only when
                 // the plan does not fit without it (docs/resilience.md).
                 if cand.caps.draining {
@@ -616,7 +678,10 @@ fn distributed_v1(
                 }
                 match current {
                     None => {
-                        let have: u64 = participants(&selected).iter().map(|c| c.cap_layers).sum();
+                        let have: u64 = participants(cands, &selected)
+                            .iter()
+                            .map(|c| c.cap_layers)
+                            .sum();
                         selection_notes.push(format!(
                             "Node '{}': included — needed for memory (capacity so far {} of \
                              {} layers)",
@@ -627,38 +692,33 @@ fn distributed_v1(
                     Some(cur) => {
                         let mut with_set = selected.clone();
                         with_set.push(wi);
-                        let Some(with) = evaluate(&participants(&with_set), n_layers, &input.links)
-                        else {
+                        let Some(with) = eval_tpt(&participants(cands, &with_set)) else {
                             continue;
                         };
-                        let gain = (cur.tpt - with.tpt) / cur.tpt.max(1e-9);
+                        let gain = (cur - with) / cur.max(1e-9);
                         if gain >= ADDED_NODE_TPT_GAIN {
                             selection_notes.push(format!(
                                 "Node '{}': included — predicted time-per-token improves \
-                                 {:.1}% ({:.1} -> {:.1}, ≥ {:.0}% threshold)",
+                                 {:.1}% ({cur:.1} -> {with:.1}, ≥ {:.0}% threshold)",
                                 cand.caps.node.0,
                                 gain * 100.0,
-                                cur.tpt,
-                                with.tpt,
                                 ADDED_NODE_TPT_GAIN * 100.0
                             ));
                             selected.push(wi);
                         } else if gain > 0.0 {
                             selection_notes.push(format!(
                                 "Node '{}': excluded — predicted time-per-token improves only \
-                                 {:.1}% ({:.1} -> {:.1}), below the {:.0}% threshold",
+                                 {:.1}% ({cur:.1} -> {with:.1}), below the {:.0}% threshold",
                                 cand.caps.node.0,
                                 gain * 100.0,
-                                cur.tpt,
-                                with.tpt,
                                 ADDED_NODE_TPT_GAIN * 100.0
                             ));
                         } else {
                             selection_notes.push(format!(
                                 "Node '{}': excluded — adding it would not improve predicted \
-                                 time-per-token ({:.1} -> {:.1}; every extra boundary costs \
-                                 one RTT per token)",
-                                cand.caps.node.0, cur.tpt, with.tpt
+                                 time-per-token ({cur:.1} -> {with:.1}; every extra boundary \
+                                 costs one RTT per token)",
+                                cand.caps.node.0
                             ));
                         }
                     }
@@ -667,7 +727,36 @@ fn distributed_v1(
         }
     }
 
-    let final_set = participants(&selected);
+    (selected, selection_notes)
+}
+
+fn distributed_v1(
+    input: &PlanRequest,
+    forced: Option<u32>,
+    head_budget: u64,
+    required: u64,
+    kv_layer: u64,
+    solo_fits: bool,
+) -> Result<PlannedPlacement, ScheduleError> {
+    let dims = &input.dims;
+    let n_layers = dims.n_layers;
+    let cost = per_layer_cost(dims, input.ctx_len);
+
+    // Candidates: workers in their stable order, head last, budgeted per
+    // the v1 rule (usable minus the fixed overhead reserve).
+    let all_caps: Vec<&NodeCaps> = input
+        .workers
+        .iter()
+        .chain(std::iter::once(&input.head))
+        .collect();
+    let cands = build_cands(&all_caps, cost, &node_budget);
+    let pooled_budget: u64 = cands.iter().map(|c| c.budget).sum();
+
+    let mut eval_tpt = |set: &[&Cand]| evaluate(set, n_layers, &input.links).map(|e| e.tpt);
+    let (selected, selection_notes) =
+        select_workers(&cands, forced, n_layers, input.ctx_len, cost, &mut eval_tpt);
+
+    let final_set = participants(&cands, &selected);
     let Some(eval) = evaluate(&final_set, n_layers, &input.links) else {
         return Err(ScheduleError::DoesNotFit {
             required_mb: mb_ceil(required),
@@ -843,13 +932,18 @@ mod tests {
     const GIB: u64 = 1 << 30;
 
     /// Uniform-weight dims: `n_layers` layers of `weight_mib` each, KV
-    /// growing at `kv_rate` bytes per layer per context token.
+    /// growing at `kv_rate` bytes per layer per context token. Dense, no
+    /// embedding width (v2's transfer term stays inert).
     fn dims(n_layers: u32, weight_mib: u64, kv_rate: u64) -> ModelDims {
         ModelDims {
             n_layers,
             kv_bytes_per_layer_per_ctx_token: kv_rate,
             weight_bytes_per_layer: vec![weight_mib * MIB; n_layers as usize],
             total_weight_bytes: weight_mib * MIB * n_layers as u64,
+            n_embd: 0,
+            n_expert: 0,
+            n_expert_used: 0,
+            expert_weight_bytes_per_layer: vec![0; n_layers as usize],
         }
     }
 
@@ -878,6 +972,7 @@ mod tests {
             a: NodeId(a.into()),
             b: NodeId(b.into()),
             rtt_ms,
+            bandwidth_mbps: None,
         }
     }
 
@@ -906,6 +1001,7 @@ mod tests {
             dims: d.clone(),
             ctx_len: 512,
             forced_nodes: None,
+            n_ubatch: DEFAULT_N_UBATCH,
             links: vec![],
         })
         .unwrap();
@@ -919,6 +1015,7 @@ mod tests {
             dims: d,
             ctx_len: 2048,
             forced_nodes: None,
+            n_ubatch: DEFAULT_N_UBATCH,
             links: vec![],
         })
         .unwrap();
@@ -937,6 +1034,7 @@ mod tests {
             dims: dims(32, 100, 4096),
             ctx_len: 4096,
             forced_nodes: None,
+            n_ubatch: DEFAULT_N_UBATCH,
             links: vec![],
         })
         .unwrap();
@@ -969,6 +1067,7 @@ mod tests {
             dims: dims(32, 100, 16384),
             ctx_len: 2048,
             forced_nodes: Some(3),
+            n_ubatch: DEFAULT_N_UBATCH,
             links: vec![
                 link("w1", "head", 0.2),
                 link("w2", "head", 5.0),
@@ -1008,6 +1107,7 @@ mod tests {
             dims: dims(32, 100, 16384),
             ctx_len: 2048,
             forced_nodes: None,
+            n_ubatch: DEFAULT_N_UBATCH,
             links: vec![
                 link("w1", "head", 45.0),
                 link("w2", "head", 45.0),
@@ -1047,6 +1147,7 @@ mod tests {
             dims: dims(32, 100, 16384),
             ctx_len: 2048,
             forced_nodes: None,
+            n_ubatch: DEFAULT_N_UBATCH,
             links: vec![],
         })
         .unwrap();
@@ -1075,6 +1176,7 @@ mod tests {
             dims: d.clone(),
             ctx_len: ctx,
             forced_nodes: None,
+            n_ubatch: DEFAULT_N_UBATCH,
             links: vec![],
         };
         let small = plan_v1(&req(2048)).unwrap();
@@ -1114,6 +1216,7 @@ mod tests {
             dims: dims(32, 100, 16384),
             ctx_len: 2048,
             forced_nodes: None,
+            n_ubatch: DEFAULT_N_UBATCH,
             links: vec![],
         })
         .unwrap();
@@ -1172,6 +1275,7 @@ mod tests {
             dims: dims(32, 100, 0),
             ctx_len: 2048,
             forced_nodes: None,
+            n_ubatch: DEFAULT_N_UBATCH,
             links: vec![],
         });
         match too_small.unwrap_err() {
@@ -1191,6 +1295,7 @@ mod tests {
             dims: dims(32, 100, 0),
             ctx_len: 2048,
             forced_nodes: Some(4),
+            n_ubatch: DEFAULT_N_UBATCH,
             links: vec![],
         });
         match not_enough.unwrap_err() {
@@ -1217,6 +1322,7 @@ mod tests {
             dims: dims(32, 100, 16384),
             ctx_len: 2048,
             forced_nodes: None,
+            n_ubatch: DEFAULT_N_UBATCH,
             links: vec![
                 link("w1", "head", 0.1),
                 link("w2", "head", 0.1),
@@ -1260,6 +1366,7 @@ mod tests {
             dims: dims(32, 100, 16384),
             ctx_len: 2048,
             forced_nodes: None,
+            n_ubatch: DEFAULT_N_UBATCH,
             links: vec![],
         })
         .unwrap();

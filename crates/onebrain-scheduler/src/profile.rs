@@ -91,7 +91,9 @@ pub fn measure_compute(model_path: &Path) -> Result<ComputeProfile, ProfileError
         &SessionParams {
             n_ctx: 256,
             n_batch: PREFILL_PROMPT_TOKENS as u32,
-            n_threads: 0,
+            // M7 widened SessionParams (docs/perf.md §2); the defaults
+            // reproduce the pre-widening session exactly.
+            ..SessionParams::default()
         },
     )?;
 

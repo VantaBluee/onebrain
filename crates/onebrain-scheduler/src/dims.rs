@@ -32,6 +32,22 @@
 //! first layer and every other non-block tensor (`output*`, `output_norm*`,
 //! rope tables, …) onto the last, matching the contract's "embedding/output
 //! counted on their host" (stage 0 embeds, the tail stage projects logits).
+//!
+//! # MoE awareness (M7, docs/perf.md §8)
+//!
+//! `{arch}.expert_count` / `{arch}.expert_used_count` are read when present
+//! (0 = dense). Routed-expert tensors (`blk.<i>.*_exps*` — the llama.cpp
+//! naming for stacked per-expert FFN weights) are tracked per layer so
+//! *compute* predictions can scale a layer's cost by the fraction of its
+//! weights a token actually touches
+//! ([`ModelDims::active_compute_fraction`]): dense math over-costs MoE
+//! compute because only `expert_used_count` of `expert_count` routed
+//! experts run per token. Shared experts (`*_shexp`) and the router
+//! (`ffn_gate_inp`) run for every token and stay in the dense share. Two
+//! things deliberately do NOT change: weight/memory math stays
+//! tensor-range-driven (every expert is resident), and the KV rate is
+//! untouched — the KV cache is attention-side (`n_head_kv × head_dim`) and
+//! independent of expert count.
 
 use onebrain_models::gguf::GgufHeader;
 
@@ -50,6 +66,24 @@ pub struct ModelDims {
     pub weight_bytes_per_layer: Vec<u64>,
     /// Sum of `weight_bytes_per_layer` — the whole tensor-data section.
     pub total_weight_bytes: u64,
+    /// Embedding width (`{arch}.embedding_length`); 0 = unknown (synthetic
+    /// [`ModelDims::uniform`] dims). Sizes the per-ubatch pipeline boundary
+    /// activation copy (`4·n_embd·n_ubatch` bytes) in scheduler v2's
+    /// transfer term and budget reserve; 0 disables both, reproducing the
+    /// pre-M7 math.
+    pub n_embd: u64,
+    /// MoE routed-expert count (`{arch}.expert_count`); 0 = dense.
+    pub n_expert: u32,
+    /// Routed experts active per token (`{arch}.expert_used_count`); 0 =
+    /// dense or undeclared — compute is then costed dense (conservative:
+    /// only ever over-estimates).
+    pub n_expert_used: u32,
+    /// Routed-expert weight bytes per layer (tensors named
+    /// `blk.<i>.*_exps*`); always `len == n_layers`, all zeros for dense
+    /// models. A subset of [`ModelDims::weight_bytes_per_layer`]; shared
+    /// experts (`*_shexp`) and the router stay in the dense share because
+    /// they run for every token (module docs).
+    pub expert_weight_bytes_per_layer: Vec<u64>,
 }
 
 impl ModelDims {
@@ -71,6 +105,58 @@ impl ModelDims {
             .div_ceil(self.n_layers.max(1) as u64)
     }
 
+    /// Whether active-expert compute scaling applies (docs/perf.md §8):
+    /// experts are declared AND fewer are active per token than resident.
+    /// `expert_used_count >= expert_count` (or either missing) means every
+    /// resident expert runs, i.e. dense compute.
+    fn moe_scaled(&self) -> bool {
+        self.n_expert > 0 && self.n_expert_used > 0 && self.n_expert_used < self.n_expert
+    }
+
+    /// Fraction of one layer's weight bytes a single token actually touches:
+    /// 1.0 for dense layers; for MoE layers the routed-expert bytes are
+    /// scaled by `expert_used_count / expert_count` while the dense share
+    /// (attention, norms, shared experts, router) counts in full. Compute
+    /// predictions use this; memory math never does (all experts are
+    /// resident).
+    pub fn active_compute_fraction(&self, layer: usize) -> f64 {
+        if !self.moe_scaled() {
+            return 1.0;
+        }
+        let total = self.weight_bytes_per_layer.get(layer).copied().unwrap_or(0);
+        let expert = self
+            .expert_weight_bytes_per_layer
+            .get(layer)
+            .copied()
+            .unwrap_or(0)
+            .min(total);
+        if total == 0 {
+            // A layer with no recorded bytes has nothing to scale; neutral
+            // (conservative) rather than dividing by zero.
+            return 1.0;
+        }
+        let used = self.n_expert_used as f64 / self.n_expert as f64;
+        ((total - expert) as f64 + expert as f64 * used) / total as f64
+    }
+
+    /// Compute-relative "layer units" of the contiguous range
+    /// `[start, end)`: the sum of each layer's
+    /// [`active_compute_fraction`](Self::active_compute_fraction). Exactly
+    /// `end - start` for dense models, less for MoE — scheduler v2's
+    /// predicted-cost term divides this (not the raw layer count) by a
+    /// node's `decode_tps` so MoE compute stops being over-costed.
+    pub fn active_compute_units(&self, start: u32, end: u32) -> f64 {
+        let span = end.saturating_sub(start);
+        if !self.moe_scaled() {
+            // Dense shortcut keeps the value bit-exact with the layer count
+            // (no float summation of 1.0s).
+            return span as f64;
+        }
+        (start..end)
+            .map(|l| self.active_compute_fraction(l as usize))
+            .sum()
+    }
+
     /// Synthetic dims for callers that only know a total byte size and a
     /// layer count (the M3-shaped [`crate::PlanInput`] compatibility path):
     /// weights spread uniformly, KV growth rate unknown and therefore zero —
@@ -90,6 +176,12 @@ impl ModelDims {
             kv_bytes_per_layer_per_ctx_token: 0,
             weight_bytes_per_layer: weights,
             total_weight_bytes,
+            // Unknown embedding width and no expert data: v2's transfer
+            // term and MoE scaling both degrade to today's dense math.
+            n_embd: 0,
+            n_expert: 0,
+            n_expert_used: 0,
+            expert_weight_bytes_per_layer: vec![0; n as usize],
         }
     }
 }
@@ -139,6 +231,29 @@ pub fn model_dims(header: &GgufHeader, file_size: u64) -> Result<ModelDims, Sche
     };
     let kv_bytes_per_layer_per_ctx_token = 2 * 2 * n_embd_kv; // K+V, f16
 
+    // MoE metadata (docs/perf.md §8). Optional: absent or zero means dense.
+    // The KV rate above is deliberately NOT touched — the cache is
+    // attention-side and independent of expert count (module docs).
+    let expert_u32 = |suffix: &str| -> Result<u32, ScheduleError> {
+        let key = format!("{arch}.{suffix}");
+        match meta_u64(header, &key).filter(|n| *n > 0) {
+            None => Ok(0),
+            Some(v) => u32::try_from(v).map_err(|_| ScheduleError::BadModel {
+                detail: format!("absurd {key} {v}"),
+            }),
+        }
+    };
+    let n_expert = expert_u32("expert_count")?;
+    let n_expert_used = expert_u32("expert_used_count")?;
+    if n_expert > 0 && n_expert_used > n_expert {
+        return Err(ScheduleError::BadModel {
+            detail: format!(
+                "the header declares {n_expert_used} active experts per token but only \
+                 {n_expert} experts"
+            ),
+        });
+    }
+
     let ranges = header
         .tensor_ranges(file_size)
         .map_err(|e| ScheduleError::BadModel {
@@ -146,6 +261,7 @@ pub fn model_dims(header: &GgufHeader, file_size: u64) -> Result<ModelDims, Sche
         })?;
 
     let mut weight_bytes_per_layer = vec![0u64; n_layers as usize];
+    let mut expert_weight_bytes_per_layer = vec![0u64; n_layers as usize];
     let mut total_weight_bytes = 0u64;
     for range in &ranges {
         let size = range.end - range.start;
@@ -166,6 +282,13 @@ pub fn model_dims(header: &GgufHeader, file_size: u64) -> Result<ModelDims, Sche
                     ),
                 });
             }
+            // Routed-expert stacks carry the `_exps` name part
+            // (`ffn_gate_exps`, `ffn_up_exps`, `ffn_down_exps`); shared
+            // experts are `_shexp` (no trailing `s`) and stay dense —
+            // they run for every token (module docs, MoE section).
+            if rest.contains("_exps") {
+                expert_weight_bytes_per_layer[idx] += size;
+            }
             idx
         } else if range.name.starts_with("token_embd") {
             0
@@ -180,6 +303,10 @@ pub fn model_dims(header: &GgufHeader, file_size: u64) -> Result<ModelDims, Sche
         kv_bytes_per_layer_per_ctx_token,
         weight_bytes_per_layer,
         total_weight_bytes,
+        n_embd,
+        n_expert,
+        n_expert_used,
+        expert_weight_bytes_per_layer,
     })
 }
 
@@ -364,5 +491,86 @@ mod tests {
         assert_eq!(dims.kv_bytes_per_layer_per_ctx_token, 0);
         assert_eq!(dims.weight_bytes_per_layer, vec![333, 333, 334]);
         assert_eq!(dims.total_weight_bytes, 1000);
+        // Synthetic dims declare no embedding width and no experts: v2's
+        // transfer term and MoE scaling both stay disabled.
+        assert_eq!(dims.n_embd, 0);
+        assert_eq!(dims.n_expert, 0);
+        assert_eq!(dims.n_expert_used, 0);
+        assert_eq!(dims.expert_weight_bytes_per_layer, vec![0, 0, 0]);
+        assert_eq!(dims.active_compute_units(0, 3), 3.0);
+    }
+
+    #[test]
+    fn n_embd_is_captured_from_the_header() {
+        let h = two_layer_header();
+        let dims = model_dims(&h, h.data_offset + 16384).unwrap();
+        assert_eq!(dims.n_embd, 4096);
+    }
+
+    #[test]
+    fn dense_models_report_no_experts_and_unit_fractions() {
+        let h = two_layer_header();
+        let dims = model_dims(&h, h.data_offset + 16384).unwrap();
+        assert_eq!(dims.n_expert, 0);
+        assert_eq!(dims.n_expert_used, 0);
+        assert_eq!(dims.expert_weight_bytes_per_layer, vec![0, 0]);
+        assert_eq!(dims.active_compute_fraction(0), 1.0);
+        assert_eq!(dims.active_compute_units(0, 2), 2.0);
+    }
+
+    /// A 1-layer MoE header: 4096 B of dense attention weights, 4096 B of
+    /// routed experts (`_exps`), 4096 B of shared expert (`_shexp`, dense),
+    /// 4096 B of router — 16384 B in the data section.
+    fn moe_header(expert_count: u32, expert_used: u32) -> GgufHeader {
+        Gguf::new()
+            .kv_str("general.architecture", "llama")
+            .kv_u32("llama.block_count", 1)
+            .kv_u32("llama.embedding_length", 4096)
+            .kv_u32("llama.expert_count", expert_count)
+            .kv_u32("llama.expert_used_count", expert_used)
+            .tensor("blk.0.attn_q.weight", 0)
+            .tensor("blk.0.ffn_gate_exps.weight", 4096)
+            .tensor("blk.0.ffn_down_shexp.weight", 8192)
+            .tensor("blk.0.ffn_gate_inp.weight", 12288)
+            .parse()
+    }
+
+    #[test]
+    fn moe_metadata_and_expert_tensor_bytes_parse() {
+        let h = moe_header(8, 2);
+        let dims = model_dims(&h, h.data_offset + 16384).unwrap();
+        assert_eq!(dims.n_expert, 8);
+        assert_eq!(dims.n_expert_used, 2);
+        // Only the routed `_exps` stack counts as expert bytes; the shared
+        // expert (`_shexp`) and the router stay in the dense share.
+        assert_eq!(dims.expert_weight_bytes_per_layer, vec![4096]);
+        assert_eq!(dims.weight_bytes_per_layer, vec![16384]);
+        // Active fraction: (16384 - 4096 + 4096 × 2/8) / 16384 = 0.8125.
+        assert_eq!(dims.active_compute_fraction(0), 0.8125);
+        assert_eq!(dims.active_compute_units(0, 1), 0.8125);
+        // KV math is expert-independent: same GQA-less rate as any dense
+        // header with these attention dims would produce.
+        assert_eq!(dims.kv_bytes_per_layer_per_ctx_token, 16384);
+    }
+
+    #[test]
+    fn moe_with_all_experts_active_costs_dense() {
+        // used == count means every resident expert runs: no scaling.
+        let h = moe_header(4, 4);
+        let dims = model_dims(&h, h.data_offset + 16384).unwrap();
+        assert_eq!(dims.active_compute_fraction(0), 1.0);
+        assert_eq!(dims.active_compute_units(0, 1), 1.0);
+    }
+
+    #[test]
+    fn moe_used_beyond_count_is_rejected() {
+        let h = moe_header(2, 4);
+        match model_dims(&h, h.data_offset + 16384).unwrap_err() {
+            ScheduleError::BadModel { detail } => {
+                assert!(detail.contains("4 active experts"), "{detail}");
+                assert!(detail.contains("2 experts"), "{detail}");
+            }
+            other => panic!("expected BadModel, got {other:?}"),
+        }
     }
 }
