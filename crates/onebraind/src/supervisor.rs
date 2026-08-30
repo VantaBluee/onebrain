@@ -1,6 +1,6 @@
 //! The M5 job supervisor (docs/resilience.md "Failure lifecycle (head)").
 //!
-//! One task per daemon owns the lifecycle of every generation job: the
+//! The supervisor task owns the lifecycle of every generation job: the
 //! gateway's [`crate::engine_host::DaemonBackend`] enqueues jobs here, the
 //! supervisor issues them to the engine host as supervised attempts, and on
 //! a distributed decode failure it — instead of surfacing an error —
@@ -15,14 +15,32 @@
 //!    a second failure (or an infeasible re-plan) surfaces the typed error
 //!    naming the lost node, and the model is marked unloaded.
 //!
+//! # M7 concurrency (docs/perf.md §6)
+//!
+//! Since M7 the engine host runs up to `[perf] max_concurrent_requests`
+//! generations at once, so jobs are no longer single-flighted here: each
+//! [`SupervisorMsg::Generate`] spawns its own lifecycle task. What stays
+//! SERIALIZED — via the [`RetryLedger`] mutex on
+//! [`crate::server::InternalState`] — is every piece of epoch surgery:
+//! interruption handling, the no-job teardown, and the rejoin re-plan run
+//! one at a time (contract rule: the retry path may serialize; correctness
+//! first). A distributed decode failure interrupts EVERY active sequence
+//! at once; the first interruption to take the mutex is the LEADER (full
+//! failure lifecycle: teardown → re-plan → reload) and records the failed
+//! epoch's outcome in the ledger, and the other interrupted jobs — the
+//! followers — consult that record instead of tearing down the epoch the
+//! leader just replaced: on a successful reload each re-issues its own
+//! resume prefix (re-prefilling THE AFFECTED SEQUENCES), on a failed one
+//! each surfaces the same typed error.
+//!
 //! The cluster task's peer-event consumer (crate::cluster) feeds two more
 //! message kinds: [`SupervisorMsg::EpochFailed`] (death/drain detection
-//! with no job in flight → teardown here, serialized with jobs) and
-//! [`SupervisorMsg::PeerRejoined`] (lazy re-plan once the engine host is
-//! idle — in-flight/queued work always finishes first, which this task
-//! guarantees structurally by re-checking after every job).
+//! with no job in flight → teardown here, serialized via the same mutex)
+//! and [`SupervisorMsg::PeerRejoined`] (lazy re-plan once the engine host
+//! is idle — in-flight/queued work always finishes first, which every job
+//! task guarantees by re-checking after it ends).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -33,7 +51,9 @@ use onebrain_proto::plan::{Assignment, Strategy};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
-use crate::engine_host::{GenOutcome, HostMsg, InterruptedGen, ResumeState, SupervisedGenerate};
+use crate::engine_host::{
+    DraftRequest, GenOutcome, HostMsg, InterruptedGen, ResumeState, SupervisedGenerate,
+};
 use crate::server::{
     activate_distributed_plan, activate_solo_plan, plan_load, InternalState, LocalModel,
     PlanLoadError,
@@ -71,8 +91,36 @@ pub fn channel() -> (SupervisorTx, mpsc::UnboundedReceiver<SupervisorMsg>) {
     mpsc::unbounded_channel()
 }
 
+/// What happened to a failed epoch, recorded by the interruption LEADER so
+/// the other sequences interrupted by the same decode failure resolve
+/// consistently without a second teardown (docs/perf.md §6 + the module
+/// docs).
+#[derive(Debug, Clone)]
+enum EpochOutcome {
+    /// Teardown + re-plan + reload succeeded: followers re-issue their
+    /// resume prefixes against the new epoch. `lost` is the blamed node's
+    /// label — followers with a spent retry budget need it for the typed
+    /// exhaustion error.
+    Reloaded { lost: String },
+    /// The epoch is gone and nothing was reloaded (infeasible re-plan,
+    /// reload failure, or a spent-budget leader): followers surface
+    /// `message` verbatim, budget or not.
+    Failed { message: String },
+}
+
+/// Serialization point + memory for epoch surgery. Held (as
+/// `tokio::sync::Mutex<RetryLedger>` on [`InternalState`]) across every
+/// interruption's failure lifecycle, the no-job teardown, and the rejoin
+/// re-plan — one at a time, correctness first.
+#[derive(Debug, Default)]
+pub struct RetryLedger {
+    outcomes: HashMap<u64, EpochOutcome>,
+}
+
 /// Spawn the supervisor task. It ends when every sender is gone (daemon
-/// teardown drops the backend and the cluster task).
+/// teardown drops the backend and the cluster task). Generation jobs run
+/// in their own tasks (M7: the engine host serves them concurrently);
+/// epoch-level messages run inline, serialized by the retry ledger.
 pub fn spawn(
     state: Arc<InternalState>,
     mut rx: mpsc::UnboundedReceiver<SupervisorMsg>,
@@ -81,11 +129,14 @@ pub fn spawn(
         while let Some(msg) = rx.recv().await {
             match msg {
                 SupervisorMsg::Generate(job) => {
-                    run_supervised(&state, job).await;
-                    // A rejoin that arrived mid-job waited for it (queued
-                    // work always finishes first); run it now if we are the
-                    // last job out.
-                    maybe_rejoin_replan(&state).await;
+                    let state = state.clone();
+                    tokio::spawn(async move {
+                        run_supervised(&state, job).await;
+                        // A rejoin that arrived mid-job waited for it
+                        // (queued work always finishes first); run it now
+                        // if we are the last job out.
+                        maybe_rejoin_replan(&state).await;
+                    });
                 }
                 SupervisorMsg::EpochFailed { epoch } => {
                     handle_epoch_failed(&state, epoch).await;
@@ -220,25 +271,27 @@ async fn fail_job(job: &GenerateJob, message: String) {
 }
 
 /// Drive one job to its terminal event, transparently retrying once on a
-/// distributed mid-generation failure.
+/// distributed mid-generation failure. Runs in its own task since M7; the
+/// interruption path serializes internally on the retry ledger.
 async fn run_supervised(state: &Arc<InternalState>, job: GenerateJob) {
     let mut retries_used: u32 = 0;
-    let mut attempt = send_attempt(state, job, None).await;
-    loop {
-        match attempt {
-            Attempt::Outcome(GenOutcome::Finished) => break,
+    let mut next: Option<(GenerateJob, Option<ResumeState>)> = Some((job, None));
+    while let Some((job, resume)) = next.take() {
+        // The epoch this attempt runs against, for leader/follower
+        // resolution when it gets interrupted (module docs).
+        let attempt_epoch = state.cluster.active().map(|a| a.plan.epoch.0);
+        match send_attempt(state, job, resume).await {
+            Attempt::Outcome(GenOutcome::Finished) => {}
             Attempt::HostGone(Some(job)) => {
                 fail_job(&job, ApiError::ShuttingDown.to_string()).await;
-                break;
             }
-            Attempt::HostGone(None) => break,
+            Attempt::HostGone(None) => {}
             Attempt::Outcome(GenOutcome::Interrupted(interrupted)) => {
-                match handle_interrupted(state, *interrupted, retries_used).await {
-                    None => break,
-                    Some(next) => {
-                        retries_used += 1;
-                        attempt = next;
-                    }
+                if let Some((job, resume)) =
+                    handle_interrupted(state, *interrupted, retries_used, attempt_epoch).await
+                {
+                    retries_used += 1;
+                    next = Some((job, Some(resume)));
                 }
             }
         }
@@ -246,15 +299,89 @@ async fn run_supervised(state: &Arc<InternalState>, job: GenerateJob) {
     state.host.job_finished();
 }
 
-/// The failure lifecycle for one interruption. Returns `Some(attempt)` when
-/// a retry was issued (the caller loops on its outcome), `None` when the
-/// job reached a terminal event here.
+/// The failure lifecycle for one interruption. Returns `Some((job,
+/// resume))` when the job should be re-issued (the caller loops), `None`
+/// when it reached a terminal event here.
+///
+/// Serialized on the retry ledger: the first interrupted job of a failed
+/// epoch (the LEADER — the epoch is still the active one when it takes the
+/// mutex) runs the full lifecycle and records the outcome; jobs
+/// interrupted by the same failure (FOLLOWERS — by the time they take the
+/// mutex the active epoch has changed or is gone) resolve from the record
+/// instead of tearing down whatever the leader just built.
 async fn handle_interrupted(
     state: &Arc<InternalState>,
     interrupted: InterruptedGen,
     retries_used: u32,
-) -> Option<Attempt> {
-    // State of the failed epoch, captured before teardown clears it.
+    attempt_epoch: Option<u64>,
+) -> Option<(GenerateJob, ResumeState)> {
+    let engine_error = interrupted.error.clone();
+    let (job, resume) = interrupted.into_retry();
+
+    let mut ledger = state.retry.lock().await;
+
+    // Follower path: this attempt's epoch is no longer the active one —
+    // another sequence's interruption already resolved it.
+    let still_active = match attempt_epoch {
+        Some(epoch) => state
+            .cluster
+            .active()
+            .is_some_and(|a| a.plan.epoch.0 == epoch),
+        // No epoch recorded at send time: cannot be matched against the
+        // ledger; fall through to the leader path (its "no active plan"
+        // handling covers this).
+        None => false,
+    };
+    if let Some(epoch) = attempt_epoch {
+        if !still_active {
+            let outcome = ledger.outcomes.get(&epoch).cloned();
+            drop(ledger);
+            return match outcome {
+                Some(EpochOutcome::Reloaded { lost }) => {
+                    if decide_interrupted(retries_used) == InterruptedAction::FailTyped {
+                        fail_job(&job, retry_exhausted_error(&lost)).await;
+                        None
+                    } else {
+                        tracing::info!(
+                            epoch,
+                            generated = resume.generated_tokens.len(),
+                            "re-issuing a sequence interrupted with the epoch another \
+                             job already recovered"
+                        );
+                        Some((job, resume))
+                    }
+                }
+                Some(EpochOutcome::Failed { message, .. }) => {
+                    fail_job(&job, message).await;
+                    None
+                }
+                None => {
+                    // The epoch changed hands without a recorded failure
+                    // (e.g. a rejoin swap raced the interruption). With a
+                    // model still loaded and budget left, re-issue against
+                    // it; otherwise surface the engine error.
+                    if decide_interrupted(retries_used) == InterruptedAction::RetryOnce
+                        && state.cluster.loaded_source().is_some()
+                    {
+                        Some((job, resume))
+                    } else {
+                        fail_job(
+                            &job,
+                            format!(
+                                "the distributed generation failed ({engine_error}); \
+                                 check the cluster with `onebrain status` and retry"
+                            ),
+                        )
+                        .await;
+                        None
+                    }
+                }
+            };
+        }
+    }
+
+    // Leader path: full failure lifecycle. State of the failed epoch,
+    // captured before teardown clears it.
     let failed = state.cluster.active();
     let failed_epoch = failed.as_ref().map(|a| a.plan.epoch.0);
     let source = state.cluster.loaded_source();
@@ -262,7 +389,7 @@ async fn handle_interrupted(
         state.cluster.mark_epoch_failed(epoch, None);
     }
     tracing::warn!(
-        error = %interrupted.error,
+        error = %engine_error,
         epoch = failed_epoch,
         retries_used,
         "distributed generation interrupted; epoch marked failed"
@@ -285,27 +412,46 @@ async fn handle_interrupted(
         .map(|a| lost_node_label(&a.plan.assignments, &own_id, &lost_ids, &peers))
         .unwrap_or_else(|| "unknown".to_string());
 
-    let engine_error = interrupted.error.clone();
-    let (job, resume) = interrupted.into_retry();
+    // Record the epoch's outcome + terminate or re-issue this job. The
+    // record closure keeps ledger writes next to the decision they encode.
+    let record = |ledger: &mut RetryLedger, outcome: EpochOutcome| {
+        if let Some(epoch) = failed_epoch {
+            ledger.outcomes.insert(epoch, outcome);
+        }
+    };
 
     if decide_interrupted(retries_used) == InterruptedAction::FailTyped {
         // The single transparent retry is spent (step 4: "a second failure
-        // surfaces the typed error").
+        // surfaces the typed error"). M5 posture preserved: no reload is
+        // attempted, the model is marked unloaded — followers of this
+        // epoch (fresh or spent) surface the same typed error.
         state.cluster.clear_loaded();
-        fail_job(&job, retry_exhausted_error(&lost)).await;
+        let message = retry_exhausted_error(&lost);
+        record(
+            &mut ledger,
+            EpochOutcome::Failed {
+                message: message.clone(),
+            },
+        );
+        drop(ledger);
+        fail_job(&job, message).await;
         return None;
     }
 
     let Some(source) = source else {
         state.cluster.clear_loaded();
-        fail_job(
-            &job,
-            format!(
-                "the distributed generation failed ({engine_error}) and the loaded model \
-                 could not be identified for a retry; reload it with `onebrain run`"
-            ),
-        )
-        .await;
+        let message = format!(
+            "the distributed generation failed ({engine_error}) and the loaded model \
+             could not be identified for a retry; reload it with `onebrain run`"
+        );
+        record(
+            &mut ledger,
+            EpochOutcome::Failed {
+                message: message.clone(),
+            },
+        );
+        drop(ledger);
+        fail_job(&job, message).await;
         return None;
     };
 
@@ -333,36 +479,70 @@ async fn handle_interrupted(
             // Nothing fits pooled: the contract's typed error, model
             // unloaded (step 3).
             state.cluster.clear_loaded();
-            fail_job(&job, lost_node_error(&lost, required_mb, available_mb)).await;
+            let message = lost_node_error(&lost, required_mb, available_mb);
+            record(
+                &mut ledger,
+                EpochOutcome::Failed {
+                    message: message.clone(),
+                },
+            );
+            drop(ledger);
+            fail_job(&job, message).await;
             return None;
         }
         Err(other) => {
             state.cluster.clear_loaded();
-            fail_job(&job, other.into_message()).await;
+            let message = other.into_message();
+            record(
+                &mut ledger,
+                EpochOutcome::Failed {
+                    message: message.clone(),
+                },
+            );
+            drop(ledger);
+            fail_job(&job, message).await;
             return None;
         }
     };
 
     // Reload on the new plan (step 4). A reload failure consumes the retry:
-    // the job surfaces the reload's own error.
+    // the job surfaces the reload's own error. The recorded draft rides
+    // along (docs/perf.md §5: "retry re-prefills and continues
+    // speculating").
     let new_epoch = planned.plan.epoch.0;
+    let draft = source
+        .draft_reference
+        .clone()
+        .map(|reference| DraftRequest {
+            reference,
+            cache_root: state.cache_root.clone(),
+        });
     let reload = if planned.plan.strategy == Strategy::Solo {
-        activate_solo_plan(state, &source.reference, &local, planned).await
+        activate_solo_plan(state, &source.reference, &local, planned, draft).await
     } else {
-        activate_distributed_plan(state, &source.reference, &local, planned).await
+        activate_distributed_plan(state, &source.reference, &local, planned, draft).await
     };
     if let Err(message) = reload {
         state.cluster.clear_loaded();
+        record(
+            &mut ledger,
+            EpochOutcome::Failed {
+                message: message.clone(),
+            },
+        );
+        drop(ledger);
         fail_job(&job, message).await;
         return None;
     }
+    record(&mut ledger, EpochOutcome::Reloaded { lost });
+    drop(ledger);
     tracing::info!(
         epoch = new_epoch,
         generated = resume.generated_tokens.len(),
         pieces_sent = resume.pieces_sent,
         "reloaded after mid-generation failure; retrying transparently with the carried prefix"
     );
-    Some(send_attempt(state, job, Some(resume)).await)
+    Some((job, resume))
 }
 
 /// Tear down the failed epoch's local half: unload the model (its frees
@@ -390,11 +570,12 @@ async fn teardown_failed_epoch(state: &Arc<InternalState>) {
 
 /// Death or polite drain detected with (possibly) no job in flight
 /// (docs/resilience.md step 1): when the failed epoch is still the active
-/// one and the host is idle, tear it down so the next load re-plans. With a
-/// job in flight this message queued behind it — by the time it runs, the
-/// retry path has already replaced or cleared the epoch and the check below
-/// fences it.
+/// one and the host is idle, tear it down so the next load re-plans. The
+/// retry ledger serializes this against any in-flight interruption's
+/// lifecycle; the stale-epoch and busy checks below fence the cases the
+/// retry path owns.
 async fn handle_epoch_failed(state: &Arc<InternalState>, epoch: u64) {
+    let _ledger = state.retry.lock().await;
     let Some(active) = state.cluster.active() else {
         return;
     };
@@ -424,11 +605,13 @@ async fn handle_epoch_failed(state: &Arc<InternalState>, epoch: u64) {
 /// new epoch through the normal proposal/ack/load flow. When the planner
 /// keeps the same assignments the active epoch stays (a pointless reload
 /// serves nobody). A busy host re-arms the request; it runs after the last
-/// queued job finishes.
+/// queued job finishes. Serialized on the retry ledger so a swap can never
+/// interleave with an interruption's teardown/reload.
 async fn maybe_rejoin_replan(state: &Arc<InternalState>) {
     if !state.cluster.take_rejoin_request() {
         return;
     }
+    let _ledger = state.retry.lock().await;
     let Some(source) = state.cluster.loaded_source() else {
         return; // nothing loaded (anymore); moot
     };
@@ -480,10 +663,17 @@ async fn maybe_rejoin_replan(state: &Arc<InternalState>) {
         strategy = ?planned.plan.strategy,
         "rejoin re-plan changes the placement; swapping epochs"
     );
+    let draft = source
+        .draft_reference
+        .clone()
+        .map(|reference| DraftRequest {
+            reference,
+            cache_root: state.cache_root.clone(),
+        });
     let result = if planned.plan.strategy == Strategy::Solo {
-        activate_solo_plan(state, &source.reference, &local, planned).await
+        activate_solo_plan(state, &source.reference, &local, planned, draft).await
     } else {
-        activate_distributed_plan(state, &source.reference, &local, planned).await
+        activate_distributed_plan(state, &source.reference, &local, planned, draft).await
     };
     match result {
         Ok(model) => {

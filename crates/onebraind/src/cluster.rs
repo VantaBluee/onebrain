@@ -25,7 +25,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -70,6 +70,13 @@ pub struct WorkerLogistics {
 
 /// How long a worker serve thread gets to finish after its bridge closes.
 const SERVE_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Debounce before a stream-less epoch retires its `worker_shard` record:
+/// the vendored RPC client dials the bridge as SEVERAL sequential
+/// connections (probe, per-device queries, then the long-lived one — see
+/// [`head_bridge`]), so a momentary zero between dials must not read as
+/// teardown. Real teardown leaves the count at zero well past this.
+const WORKER_SHARD_RETIRE_GRACE: Duration = Duration::from_secs(2);
 
 /// This node's `NodeStatus` payload: `(usable_memory_bytes, devices)`.
 /// Usable memory is the CPU device's measured free bytes minus
@@ -187,6 +194,10 @@ pub struct LoadedSource {
     /// header from the first part; a distributed reload pushes them all.
     pub paths: Vec<PathBuf>,
     pub size_bytes: u64,
+    /// Speculative draft-model reference loaded with the target
+    /// (docs/perf.md §5), when one was; the M5 retry reload re-issues it so
+    /// a recovered generation "continues speculating".
+    pub draft_reference: Option<String>,
 }
 
 impl LoadedSource {
@@ -412,6 +423,23 @@ impl ClusterState {
             .expect("cluster state poisoned")
             .clone()
     }
+
+    /// Worker side: drop the shard record IF it still names `epoch`. Called
+    /// when the last live serve stream of that epoch ends naturally — the
+    /// head closing its streams is the worker's ONLY teardown signal (there
+    /// is no teardown message; docs/resilience.md tears epochs down by
+    /// closing streams). Without this the record outlives the epoch
+    /// forever after the head re-plans or goes solo, which wrongly holds
+    /// the sleep inhibitor and permanently declines peer bench requests
+    /// (docs/perf.md §10) until the worker restarts. The epoch guard keeps
+    /// a newer adoption's record intact when an old epoch's stream end
+    /// races it.
+    pub fn clear_worker_shard_for(&self, epoch: Epoch) {
+        let mut shard = self.worker_shard.lock().expect("cluster state poisoned");
+        if shard.as_ref().is_some_and(|(e, _)| *e == epoch) {
+            *shard = None;
+        }
+    }
 }
 
 /// What the worker decided about a received `PlanProposal`.
@@ -458,6 +486,12 @@ struct AdoptedPlan {
     epoch: Epoch,
     head: NodeId,
     serves: Vec<WorkerServe>,
+    /// Live mesh serve streams of this epoch: incremented per accepted
+    /// stream, decremented as each pump ends NATURALLY (aborted pumps —
+    /// plan replacement, shutdown — skip the hook). At 0 the head has
+    /// closed every stream, and the debounced check in
+    /// [`handle_rpc_stream`] retires the stale `worker_shard` record.
+    live_streams: Arc<AtomicUsize>,
     /// The M6 logistics task for this epoch (range fetch + rpc-cache
     /// pre-seed). Aborted at teardown; an aborted fetch leaves resumable
     /// `.part` files that the next adoption picks up.
@@ -511,7 +545,7 @@ async fn cluster_task(
                 None => ctrl_open = false,
             },
             stream = rpc_rx.recv(), if rpc_open => match stream {
-                Some(stream) => handle_rpc_stream(&mut adopted, &logistics, stream),
+                Some(stream) => handle_rpc_stream(&state, &mut adopted, &logistics, stream),
                 None => rpc_open = false,
             },
             event = events_rx.recv(), if events_open => match event {
@@ -701,6 +735,7 @@ async fn handle_proposal(
                 epoch,
                 head: sender.clone(),
                 serves: Vec::new(),
+                live_streams: Arc::new(AtomicUsize::new(0)),
                 prepare: Some(prepare),
             });
             let ack = Envelope::new(Message::PlanAck {
@@ -805,6 +840,7 @@ async fn worker_prepare(mesh: MeshHandle, logistics: WorkerLogistics, plan: Plan
 /// session — or refuse it with close code 4 (`bad-epoch`) when it is not for
 /// the active epoch from that epoch's head (the M3 fencing rule).
 fn handle_rpc_stream(
+    state: &Arc<ClusterState>,
     adopted: &mut Option<AdoptedPlan>,
     logistics: &WorkerLogistics,
     stream: IncomingRpcStream,
@@ -857,7 +893,33 @@ fn handle_rpc_stream(
         epoch = stream.epoch.0,
         "rpc serve session bridged to mesh stream"
     );
-    let pump = spawn_pump(stream.recv, stream.send, read_half, write_half);
+    // Every accepted stream re-asserts the shard record: the debounced
+    // retire below could have cleared it between the RPC client's
+    // sequential dials, and re-adoption keeps it truthful either way.
+    state.set_worker_shard(Some((active.epoch, active.head.clone())));
+    let live = Arc::clone(&active.live_streams);
+    live.fetch_add(1, Ordering::SeqCst);
+    let state = Arc::clone(state);
+    let epoch = active.epoch;
+    let pump = spawn_pump(stream.recv, stream.send, read_half, write_half, move || {
+        if live.fetch_sub(1, Ordering::SeqCst) != 1 {
+            return;
+        }
+        // The last live stream of the epoch ended NATURALLY: the head tore
+        // the epoch down (re-plan, solo load, shutdown) — its only
+        // teardown signal — or this was a gap between the RPC client's
+        // dials. Debounce past the dial gap, then retire the record if the
+        // epoch is still stream-less; `clear_worker_shard_for`'s epoch
+        // guard protects a newer adoption, and aborted pumps (plan
+        // replacement) never reach this hook at all.
+        let live = Arc::clone(&live);
+        tokio::spawn(async move {
+            tokio::time::sleep(WORKER_SHARD_RETIRE_GRACE).await;
+            if live.load(Ordering::SeqCst) == 0 {
+                state.clear_worker_shard_for(epoch);
+            }
+        });
+    });
     active.serves.push(WorkerServe { session, pump });
 }
 
@@ -956,6 +1018,7 @@ fn spawn_pump<R, W>(
     send: SendStream,
     sock_read: R,
     sock_write: W,
+    on_exit: impl FnOnce() + Send + 'static,
 ) -> JoinHandle<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -965,6 +1028,10 @@ where
         // Worker side: stream errors need no marking — the serve session
         // ends with its socket either way.
         let _ = pump_streams(recv, send, sock_read, sock_write).await;
+        // Never reached when the pump is ABORTED at teardown — exactly
+        // right: an aborted pump's plan is being replaced or shut down,
+        // and its liveness bookkeeping dies with the plan.
+        on_exit();
     })
 }
 
@@ -1181,6 +1248,7 @@ mod tests {
             name: "tinystories-260k".into(),
             paths: vec![PathBuf::from("C:/models/t.gguf")],
             size_bytes: 42,
+            draft_reference: None,
         });
         let source = state.loaded_source().expect("recorded");
         assert_eq!(source.reference, "tinystories-260k");
@@ -1210,6 +1278,25 @@ mod tests {
         assert_eq!(epoch, Epoch(3));
         assert_eq!(head.0, "head-id");
         state.set_worker_shard(None);
+        assert!(state.worker_shard().is_none());
+    }
+
+    /// The stream-end retire path (M7 bench-gate fix): clearing is
+    /// epoch-guarded so an old epoch's late stream end never wipes a newer
+    /// adoption's record.
+    #[test]
+    fn worker_shard_retire_is_epoch_guarded() {
+        let state = ClusterState::new();
+        // Retiring with nothing recorded is a no-op.
+        state.clear_worker_shard_for(Epoch(3));
+        assert!(state.worker_shard().is_none());
+
+        state.set_worker_shard(Some((Epoch(3), NodeId("head-id".into()))));
+        // A stale epoch's retire leaves the newer record alone...
+        state.clear_worker_shard_for(Epoch(2));
+        assert!(state.worker_shard().is_some());
+        // ...and the matching epoch retires it.
+        state.clear_worker_shard_for(Epoch(3));
         assert!(state.worker_shard().is_none());
     }
 
@@ -1311,6 +1398,7 @@ mod tests {
             name: "m".into(),
             paths: vec![PathBuf::from("m.gguf")],
             size_bytes: 1,
+            draft_reference: None,
         });
         handle_peer_event(&state, &sup_tx, event("w2", PeerState::Connected));
         assert!(state.take_rejoin_request());

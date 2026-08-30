@@ -39,8 +39,65 @@ pub struct Config {
     pub rpc_cache_max_bytes: u64,
     /// Mesh transport switches (`[mesh]` table, docs/mesh.md).
     pub mesh: MeshSection,
+    /// Performance levers (`[perf]` table, docs/perf.md). Every M7 knob is
+    /// defined here up front so config files written against the contract
+    /// parse from day one; individual features consume their knob as they
+    /// land.
+    pub perf: PerfSection,
     /// Test-only knobs (`[debug]` table, docs/distributed.md).
     pub debug: DebugSection,
+}
+
+/// The `[perf]` table (docs/perf.md): the M7 performance program's knobs.
+/// Defaults are the contract's defaults; setting a knob to its "off" value
+/// restores the corresponding pre-M7 behavior (the constructed M3 baseline
+/// for benches and the sim proof).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PerfSection {
+    /// Generations that may run CONCURRENTLY on the one engine session
+    /// (micro-batched decode, docs/perf.md §6). The session is created with
+    /// `n_seq_max = max_concurrent_requests` and a unified KV cache; `1`
+    /// restores single-flight decode. Values below 1 are treated as 1.
+    pub max_concurrent_requests: u32,
+    /// Generation requests that may WAIT beyond the concurrent set
+    /// (docs/perf.md §6 admission control). A request arriving with
+    /// `max_concurrent_requests` running and `queue_depth` queued is
+    /// rejected with a 429-equivalent typed error instead of queueing
+    /// unboundedly.
+    pub queue_depth: u32,
+    /// Physical micro-batch size handed to the engine session
+    /// (docs/perf.md §3): `llama_decode` splits each batch into `n_ubatch`
+    /// slices, and per-slice activation copies bound distributed prefill
+    /// cost. The engine caps it at the batch size.
+    pub n_ubatch: u32,
+    /// Overlapped chunked prefill over RPC (docs/perf.md §3, vendor patch
+    /// 0003). `false` restores the exact sequential M3 path — the
+    /// constructed M3 baseline. Applied process-wide before each
+    /// distributed load; live contexts keep the mode they were created
+    /// with.
+    pub prefill_overlap: bool,
+    /// Cross-request prefix/KV reuse (docs/perf.md §4). Defined now so the
+    /// contract's config surface is complete; consumed when the reuse
+    /// feature lands. `false` = today's reset-per-request behavior.
+    pub kv_reuse: bool,
+    /// Draft model reference for speculative decoding (docs/perf.md §5).
+    /// Defined now for the contract's config surface; consumed when the
+    /// speculative loop lands. `None` = no draft configured.
+    pub draft_model: Option<String>,
+}
+
+impl Default for PerfSection {
+    fn default() -> Self {
+        PerfSection {
+            max_concurrent_requests: 4,
+            queue_depth: 8,
+            n_ubatch: 512,
+            prefill_overlap: true,
+            kv_reuse: true,
+            draft_model: None,
+        }
+    }
 }
 
 /// The `[debug]` table: test-only knobs for the cluster simulator. Nothing
@@ -108,6 +165,7 @@ impl Default for Config {
             cache_max_bytes: 0,
             rpc_cache_max_bytes: 20 * 1024 * 1024 * 1024,
             mesh: MeshSection::default(),
+            perf: PerfSection::default(),
             debug: DebugSection::default(),
         }
     }
@@ -340,6 +398,69 @@ mod tests {
         };
         c.save(&path).unwrap();
         assert_eq!(Config::load(&path).unwrap(), c);
+    }
+
+    #[test]
+    fn perf_section_defaults_match_the_contract() {
+        // docs/perf.md: these are the contract's binding defaults; drifting
+        // one silently changes every daemon's concurrency/overlap posture.
+        let p = PerfSection::default();
+        assert_eq!(p.max_concurrent_requests, 4);
+        assert_eq!(p.queue_depth, 8);
+        assert_eq!(p.n_ubatch, 512);
+        assert!(p.prefill_overlap);
+        assert!(p.kv_reuse);
+        assert_eq!(p.draft_model, None);
+        // A config file without a [perf] table parses to the same defaults.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "ctx_len = 2048\n").unwrap();
+        assert_eq!(Config::load(&path).unwrap().perf, PerfSection::default());
+    }
+
+    #[test]
+    fn perf_section_parses_and_roundtrips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        // Parse from a hand-written file (the operator's usual route);
+        // unset knobs in a partial [perf] table keep their defaults.
+        std::fs::write(
+            &path,
+            "[perf]\nmax_concurrent_requests = 2\nprefill_overlap = false\n",
+        )
+        .unwrap();
+        let c = Config::load(&path).unwrap();
+        assert_eq!(c.perf.max_concurrent_requests, 2);
+        assert!(!c.perf.prefill_overlap);
+        assert_eq!(c.perf.queue_depth, 8);
+        assert_eq!(c.perf.n_ubatch, 512);
+        assert!(c.perf.kv_reuse);
+        // Full save/load roundtrip with every knob set.
+        let c = Config {
+            perf: PerfSection {
+                max_concurrent_requests: 8,
+                queue_depth: 16,
+                n_ubatch: 256,
+                prefill_overlap: false,
+                kv_reuse: false,
+                draft_model: Some("tinystories-260k".into()),
+            },
+            ..Default::default()
+        };
+        c.save(&path).unwrap();
+        assert_eq!(Config::load(&path).unwrap(), c);
+    }
+
+    #[test]
+    fn unknown_keys_in_perf_section_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[perf]\nmax_concurrent = 4\n").unwrap();
+        // Typo'd knobs must fail loudly (deny_unknown_fields convention).
+        assert!(matches!(
+            Config::load(&path),
+            Err(DaemonError::ConfigParse { .. })
+        ));
     }
 
     #[test]

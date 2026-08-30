@@ -14,7 +14,7 @@ use tokio::sync::Notify;
 
 use crate::cluster::{self, ClusterState};
 use crate::config::Config;
-use crate::engine_host::{DaemonBackend, EngineHost, HostMsg};
+use crate::engine_host::{DaemonBackend, EngineHost, HostMsg, HostPerf};
 use crate::lock::{self, DaemonLock, RunInfo};
 use crate::paths::AppPaths;
 use crate::server::{internal_router, InternalState};
@@ -82,7 +82,18 @@ pub fn run_blocking() -> Result<(), DaemonError> {
             "[debug] decode_delay_ms is set; token streaming is artificially slowed (test-only)"
         );
     }
-    let (host, host_thread) = EngineHost::spawn(decode_delay);
+    // [perf] levers the engine host consumes (docs/perf.md §3/§4/§6):
+    // session shape (concurrency, micro-batch), the prefill-overlap
+    // switch, and cross-request KV reuse. n_batch stays at the pre-M7 512
+    // (not a config knob).
+    let host_perf = HostPerf {
+        max_concurrent: config.perf.max_concurrent_requests.max(1),
+        n_ubatch: config.perf.n_ubatch,
+        prefill_overlap: config.perf.prefill_overlap,
+        kv_reuse: config.perf.kv_reuse,
+        ..HostPerf::default()
+    };
+    let (host, host_thread) = EngineHost::spawn(decode_delay, host_perf);
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -138,11 +149,26 @@ pub fn run_blocking() -> Result<(), DaemonError> {
         })?],
         None => Vec::new(),
     };
+    // Cluster-session state: epoch counter, active plan, plan acks. Created
+    // before the mesh config because the bench source below consults it
+    // (worker-shard check); the cluster task consumes it further down.
+    let cluster = ClusterState::new();
     let mesh_config = MeshConfig {
         enable_mdns: config.mesh.enable_mdns,
         enable_relays: config.mesh.enable_relays,
         bind_addrs,
         engine_build: onebrain_engine::engine_build_hash().0,
+        // M7 cluster bench (docs/perf.md §10): answer peers' on-demand
+        // `BenchRequest`s with the same microbench `POST /api/internal/bench`
+        // runs; busy/shard-serving/uncached-model nodes decline with the
+        // wire's cannot-bench-now marker.
+        bench_source: Some(Arc::new(crate::server::DaemonBenchSource {
+            host: host.clone(),
+            cluster: cluster.clone(),
+            cache_root: cache_root.clone(),
+            profile: profile.clone(),
+            profile_path: profile_path.clone(),
+        })),
         node_status: Some(Arc::new(move || {
             let (usable_memory_bytes, devices) = cluster::local_node_status(debug_override);
             let stored = *status_profile.lock().expect("profile state poisoned");
@@ -187,7 +213,6 @@ pub fn run_blocking() -> Result<(), DaemonError> {
             // Cluster task: consumes plan traffic, rpc streams, and — M5 —
             // peer events from the mesh (worker path + death/drain/rejoin
             // detection) and records acks (head path).
-            let cluster = ClusterState::new();
             let cluster_task = runtime.block_on(async {
                 let ctrl_rx = mesh.incoming_control().await?;
                 let rpc_rx = mesh.incoming_rpc().await?;
@@ -349,6 +374,10 @@ async fn serve(
             supervisor_tx,
             mesh.clone(),
             config.cache_max_bytes,
+            // Admission control (docs/perf.md §6): at most
+            // max_concurrent_requests running + queue_depth waiting.
+            config.perf.max_concurrent_requests,
+            config.perf.queue_depth,
         )),
         auth: Arc::new(AuthConfig {
             token: token.clone(),
@@ -366,6 +395,7 @@ async fn serve(
         },
         cache_root: cache_root.to_path_buf(),
         ctx_len: config.ctx_len,
+        n_ubatch: config.perf.n_ubatch,
         port: local_addr.port(),
         started: Instant::now(),
         product_version,
@@ -381,6 +411,10 @@ async fn serve(
         battery_probe: Arc::from(crate::power::platform_battery_probe()),
         battery_threshold: config.battery_drain_threshold,
         cache_max_bytes: config.cache_max_bytes,
+        // [perf] draft_model (docs/perf.md §5): the default speculative
+        // draft for loads that ask for `speculative` without naming one.
+        draft_model: config.perf.draft_model.clone(),
+        retry: tokio::sync::Mutex::new(crate::supervisor::RetryLedger::default()),
     });
     // M5 supervisor: owns every generation job's lifecycle (transparent
     // retry) plus the death-teardown and lazy rejoin re-plan follow-ups

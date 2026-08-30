@@ -18,7 +18,9 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use onebrain_api::auth::AuthConfig;
 use onebrain_api::ApiError;
-use onebrain_mesh::{MeshError, MeshHandle, PairEvent, PairTarget, PeerState, PeerStatus};
+use onebrain_mesh::{
+    MeshError, MeshHandle, PairEvent, PairTarget, PeerBenchReport, PeerState, PeerStatus,
+};
 use onebrain_models::registry::{ModelRef, Resolved};
 use onebrain_proto::message::{Envelope, Message};
 use onebrain_proto::plan::{Assignment, NodeId, Plan, Strategy};
@@ -29,7 +31,9 @@ use tokio::sync::{mpsc, oneshot, Notify};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::cluster::{ActivePlanView, ClusterState, LoadedSource};
-use crate::engine_host::{EngineHost, HostMsg, LoadProgress, LoadedModel, ProgressThrottle};
+use crate::engine_host::{
+    DraftRequest, EngineHost, HostMsg, LoadProgress, LoadedModel, ProgressThrottle,
+};
 
 /// Registry id of the microbench test model (docs/scheduler-v1.md
 /// "Profiles"): pulled through the normal registry path on first bench —
@@ -49,6 +53,10 @@ pub struct InternalState {
     pub auth: AuthConfig,
     pub cache_root: PathBuf,
     pub ctx_len: u32,
+    /// `[perf] n_ubatch` (docs/perf.md §3/§7): the effective microbatch,
+    /// handed to the planner so the v2 transfer term and pipeline reserve
+    /// size the per-ubatch boundary copy from the real knob.
+    pub n_ubatch: u32,
     pub port: u16,
     pub started: Instant,
     pub product_version: &'static str,
@@ -79,6 +87,16 @@ pub struct InternalState {
     /// `config.cache_max_bytes`: the post-download GC trigger's cap
     /// (docs/logistics.md "LRU GC + pinning"; 0 = GC disabled).
     pub cache_max_bytes: u64,
+    /// `[perf] draft_model` (docs/perf.md §5): the default speculative
+    /// draft reference when a load asks for `speculative` without naming
+    /// one.
+    pub draft_model: Option<String>,
+    /// Serialization point for epoch surgery (M7, docs/perf.md §6): the
+    /// supervisor's interruption lifecycle, no-job teardown, and rejoin
+    /// re-plan take this one at a time, and it remembers each failed
+    /// epoch's outcome so concurrently interrupted jobs resolve
+    /// consistently (see crate::supervisor's module docs).
+    pub retry: tokio::sync::Mutex<crate::supervisor::RetryLedger>,
 }
 
 /// Build the internal router with its always-on token middleware.
@@ -87,6 +105,8 @@ pub fn internal_router(state: Arc<InternalState>) -> Router {
         .route("/api/internal/status", get(status))
         .route("/api/internal/load", post(load))
         .route("/api/internal/bench", post(bench))
+        .route("/api/internal/bench/peers", post(bench_peers))
+        .route("/api/internal/perf", post(perf_toggles))
         .route("/api/internal/shutdown", post(shutdown))
         .route("/api/internal/pair/start", post(pair_start))
         .route("/api/internal/pair/join", post(pair_join))
@@ -155,6 +175,11 @@ async fn status(State(state): State<Arc<InternalState>>) -> Json<serde_json::Val
         "port": state.port,
         "uptime_secs": state.started.elapsed().as_secs(),
         "model": model,
+        // The reference the loaded model was requested with (registry id,
+        // `hf:…`, or local path) — what a client re-issues to reload the
+        // same model (`onebrain bench --cluster` does exactly that for its
+        // end-to-end runs, docs/perf.md §10). Null when nothing is loaded.
+        "model_reference": state.cluster.loaded_source().map(|s| s.reference),
         "peers_summary": { "paired": peer_list.len(), "connected": connected },
         // docs/distributed.md: the active plan (epoch, strategy,
         // assignments) or null when nothing distributed is active.
@@ -171,6 +196,15 @@ struct LoadBody {
     /// `--explain`: include the scheduler's prose in the `plan` line.
     #[serde(default)]
     explain: bool,
+    /// `--speculative` (docs/perf.md §5): load a draft model alongside the
+    /// target. The draft is `draft` when given, else the config's
+    /// `[perf] draft_model`; neither ⇒ a typed error naming the remedy.
+    #[serde(default)]
+    speculative: bool,
+    /// `--draft <ref>`: explicit draft-model reference (implies
+    /// speculative).
+    #[serde(default)]
+    draft: Option<String>,
 }
 
 /// One NDJSON line sender.
@@ -368,6 +402,216 @@ async fn bench(State(state): State<Arc<InternalState>>) -> Response {
     }
 
     Json(serde_json::json!({ "profile": profile_json, "links": links })).into_response()
+}
+
+/// `POST /api/internal/bench/peers` (docs/perf.md §10): ask every Connected
+/// peer to run its microbench on demand via the mesh's
+/// `BenchRequest`/`BenchReport` exchange. Queries run CONCURRENTLY — each
+/// peer's bench takes seconds and the mesh bounds each reply at 60 s, so
+/// serializing them would make a 3-node bench a 3-minute wait. Per-peer
+/// failures (timeout, disconnect) become per-peer `error` entries, never a
+/// failed call: `bench --cluster` reports what it could measure.
+async fn bench_peers(State(state): State<Arc<InternalState>>) -> Response {
+    let peers = match state.mesh.peers().await {
+        Ok(peers) => peers,
+        Err(err) => return mesh_error_response(err),
+    };
+    let mut queries = tokio::task::JoinSet::new();
+    for p in peers
+        .into_iter()
+        .filter(|p| p.state == PeerState::Connected)
+    {
+        let mesh = state.mesh.clone();
+        queries.spawn(async move {
+            // Resolve by endpoint id: names can be re-used across unpair/
+            // re-pair cycles within one bench, ids cannot.
+            let result = mesh.bench_query(&p.id).await;
+            (p.name, p.id, result)
+        });
+    }
+    let mut rows: Vec<(String, serde_json::Value)> = Vec::new();
+    while let Some(joined) = queries.join_next().await {
+        let Ok((name, id, result)) = joined else {
+            continue; // a panicked query task reports nothing for its peer
+        };
+        let sort_key = name.clone();
+        let row = match result {
+            Ok(report) if !report.is_unavailable() => serde_json::json!({
+                "peer": name, "id": id, "available": true,
+                "prefill_tps": report.prefill_tps,
+                "decode_tps": report.decode_tps,
+                "disk_mbps": report.disk_mbps,
+                "measured_unix": report.measured_unix,
+            }),
+            // The wire's cannot-bench-now marker (measured_unix == 0): the
+            // throughput fields are meaningless and deliberately omitted.
+            Ok(_) => serde_json::json!({ "peer": name, "id": id, "available": false }),
+            Err(err) => serde_json::json!({
+                "peer": name, "id": id, "available": false, "error": err.to_string(),
+            }),
+        };
+        rows.push((sort_key, row));
+    }
+    // Concurrent completion order is nondeterministic; name-sort for the
+    // reproducible-report rule (docs/perf.md §10).
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    let rows: Vec<serde_json::Value> = rows.into_iter().map(|(_, row)| row).collect();
+    Json(serde_json::json!({ "peers": rows })).into_response()
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct PerfBody {
+    /// `Some` overrides the lever; `None` leaves it as it is.
+    #[serde(default)]
+    prefill_overlap: Option<bool>,
+    #[serde(default)]
+    kv_reuse: Option<bool>,
+}
+
+/// `POST /api/internal/perf` (docs/perf.md §10): read or override the
+/// runtime-togglable `[perf]` levers. An empty body `{}` changes nothing
+/// and answers with the current values. Overrides take effect at the NEXT
+/// model (re)load — live sessions keep the mode they were created with —
+/// which is how `onebrain bench --cluster` constructs the M3 baseline
+/// (`prefill_overlap=false` + `kv_reuse=false`) without a daemon restart:
+/// flip, reload, measure, flip back, reload. Overrides do not persist;
+/// a daemon restart returns to config.toml's values.
+async fn perf_toggles(
+    State(state): State<Arc<InternalState>>,
+    Json(body): Json<PerfBody>,
+) -> Json<serde_json::Value> {
+    let (prefill_overlap, kv_reuse) = state
+        .host
+        .set_perf_toggles(body.prefill_overlap, body.kv_reuse);
+    tracing::info!(
+        prefill_overlap,
+        kv_reuse,
+        "runtime perf toggles read/set via /api/internal/perf"
+    );
+    Json(serde_json::json!({
+        "prefill_overlap": prefill_overlap,
+        "kv_reuse": kv_reuse,
+        // Documented for humans poking the endpoint; machines key off the
+        // two booleans.
+        "applies_at": "next model load",
+    }))
+}
+
+/// The daemon's [`onebrain_mesh::BenchSource`]: answers peers'
+/// `BenchRequest` control messages (docs/perf.md §10) by running the SAME
+/// measurement `POST /api/internal/bench` runs — the compute microbench on
+/// the registry test model plus the disk probe — and persisting the result
+/// to `profile.toml` and the [`SharedProfile`], so a bench a peer asked for
+/// leaves this node's own profile fresh too. The mesh calls
+/// [`onebrain_mesh::BenchSource::bench`] on its blocking pool, so the
+/// seconds-long measurement never stalls mesh traffic.
+///
+/// Declines (`None` → the wire's cannot-bench-now marker) instead of
+/// measuring when:
+/// - a generation is queued or in flight (the figures would be noise, and
+///   the microbench would steal compute from a real request);
+/// - this node is serving a pipeline shard (head-driven decode traffic
+///   arrives outside the local job counter's view, and the shard owns this
+///   node's memory);
+/// - the test model is not fully cached (a passive peer never spends WAN
+///   bandwidth answering a query — run `onebrain bench` on that node once).
+pub struct DaemonBenchSource {
+    pub host: EngineHost,
+    pub cluster: Arc<ClusterState>,
+    pub cache_root: PathBuf,
+    pub profile: SharedProfile,
+    pub profile_path: PathBuf,
+}
+
+impl onebrain_mesh::BenchSource for DaemonBenchSource {
+    fn bench(&self) -> Option<PeerBenchReport> {
+        if !self.host.is_idle() {
+            tracing::info!("declining a peer's bench request: a generation is queued or in flight");
+            return None;
+        }
+        if let Some((epoch, _head)) = self.cluster.worker_shard() {
+            tracing::info!(
+                epoch = epoch.0,
+                "declining a peer's bench request: serving a pipeline shard"
+            );
+            return None;
+        }
+        let Some(path) = cached_bench_model(&self.cache_root) else {
+            tracing::info!(
+                "declining a peer's bench request: the {BENCH_MODEL_ID:?} test model is not \
+                 cached here (run `onebrain bench` on this node once to fetch it)"
+            );
+            return None;
+        };
+        let compute = match onebrain_scheduler::measure_compute(&path) {
+            Ok(compute) => compute,
+            Err(e) => {
+                tracing::warn!(error = %e, "peer-requested compute microbench failed; declining");
+                return None;
+            }
+        };
+        let disk_mbps = match onebrain_scheduler::measure_disk(&path) {
+            Ok(disk) => disk,
+            Err(e) => {
+                tracing::warn!(error = %e, "peer-requested disk probe failed; declining");
+                return None;
+            }
+        };
+        let stored = StoredProfile {
+            measured_unix: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            prefill_tps: compute.prefill_tps,
+            decode_tps: compute.decode_tps,
+            disk_mbps,
+        };
+        // Persist + publish exactly like `POST /api/internal/bench`; a
+        // failed persist keeps the fresh in-memory profile (the NodeStatus
+        // provider and planner read that) and still answers the peer.
+        if let Err(e) = onebrain_scheduler::save_profile(&self.profile_path, &stored) {
+            tracing::warn!(
+                error = %e,
+                "peer-requested bench could not persist profile.toml; keeping it in memory"
+            );
+        }
+        *self.profile.lock().expect("profile state poisoned") = Some(stored);
+        tracing::info!(
+            prefill_tps = stored.prefill_tps,
+            decode_tps = stored.decode_tps,
+            disk_mbps = stored.disk_mbps,
+            "device profile refreshed by a peer's bench request"
+        );
+        Some(PeerBenchReport {
+            prefill_tps: stored.prefill_tps,
+            decode_tps: stored.decode_tps,
+            disk_mbps: stored.disk_mbps,
+            measured_unix: stored.measured_unix,
+        })
+    }
+}
+
+/// The bench test model's local path IF it is fully cached: a manifest
+/// recording the registry URL plus a complete file — the same fast-path
+/// check the download machinery applies, without ever touching the
+/// network. `None` = not cached (or the registry cannot resolve, which
+/// `POST /api/internal/bench` reports as a packaging bug on the local
+/// path).
+fn cached_bench_model(cache_root: &Path) -> Option<PathBuf> {
+    let spec = match BENCH_MODEL_ID.parse::<ModelRef>().ok()?.resolve().ok()? {
+        Resolved::Remote(spec) => spec,
+        Resolved::Local(_) => return None,
+    };
+    let dir = cache_root.join(&spec.cache_key);
+    let manifest = onebrain_models::download::read_manifest(&dir).ok()?;
+    if manifest.url != spec.url {
+        return None;
+    }
+    let path = dir.join(&spec.file_name);
+    let complete = std::fs::metadata(&path)
+        .map(|m| m.len() == manifest.size_bytes)
+        .unwrap_or(false);
+    complete.then_some(path)
 }
 
 /// A model reference resolved to local files (downloaded if needed). Split
@@ -663,6 +907,11 @@ pub(crate) async fn plan_load(
                 a: NodeId(own_id.clone()),
                 b: NodeId(p.id.clone()),
                 rtt_ms,
+                // Measured link bandwidth from the mesh probe rides along
+                // for the v2 transfer term (docs/perf.md §7); None (or a
+                // nonsense non-positive figure) keeps the link RTT-only —
+                // exactly the pre-M7 costing.
+                bandwidth_mbps: p.bandwidth_mbps.filter(|b| *b > 0.0),
             });
         }
     }
@@ -684,6 +933,7 @@ pub(crate) async fn plan_load(
         ctx_len: state.ctx_len,
         forced_nodes,
         links,
+        n_ubatch: state.n_ubatch,
     };
     let placed = match onebrain_scheduler::plan_v1(&request) {
         Ok(p) => p,
@@ -726,6 +976,38 @@ async fn drive_load(state: Arc<InternalState>, body: LoadBody, tx: LineSender) {
         return;
     };
 
+    // Speculative draft (docs/perf.md §5): an explicit `draft` implies
+    // speculative; `speculative` alone falls back to `[perf] draft_model`.
+    // The draft is made local HERE (progress streams to the client) so the
+    // engine host's own resolve is a cache hit; it always loads solo on
+    // this head node, whatever the target's plan says.
+    let draft_req: Option<DraftRequest> = if body.speculative || body.draft.is_some() {
+        let reference = match body.draft.clone().or_else(|| state.draft_model.clone()) {
+            Some(reference) => reference,
+            None => {
+                emit_error(
+                    &tx,
+                    "speculative decoding needs a draft model: pass --draft <ref> or set \
+                     [perf] draft_model in config.toml. The draft must share the target's \
+                     vocabulary — in the built-in registry, 'qwen3-0.6b' pairs with \
+                     'qwen3-1.7b', 'qwen3-4b', and 'qwen3-32b'"
+                        .to_string(),
+                )
+                .await;
+                return;
+            }
+        };
+        if ensure_local(&state, &reference, &tx).await.is_none() {
+            return; // the error line was already emitted
+        }
+        Some(DraftRequest {
+            reference,
+            cache_root: state.cache_root.clone(),
+        })
+    } else {
+        None
+    };
+
     // Phase B: plan (M4 scheduler v1 — factored into `plan_load`, shared
     // with the M5 supervisor's re-plan paths).
     let _ = emit(&tx, serde_json::json!({ "status": "planning" })).await;
@@ -766,10 +1048,10 @@ async fn drive_load(state: Arc<InternalState>, body: LoadBody, tx: LineSender) {
     }
 
     if solo {
-        solo_load(&state, &body.model, &local, planned, &tx).await;
+        solo_load(&state, &body.model, &local, planned, draft_req, &tx).await;
     } else {
         let _ = emit(&tx, serde_json::json!({ "status": "loading" })).await;
-        match activate_distributed_plan(&state, &body.model, &local, planned).await {
+        match activate_distributed_plan(&state, &body.model, &local, planned, draft_req).await {
             Ok(model) => {
                 let _ = emit(
                     &tx,
@@ -842,6 +1124,7 @@ fn install_solo_active(
     local: &LocalModel,
     plan: Plan,
     explanation: String,
+    draft_reference: Option<String>,
 ) {
     state.cluster.set_active(Some(ActivePlanView {
         role: "head",
@@ -855,6 +1138,7 @@ fn install_solo_active(
         name: local.name.clone(),
         paths: local.paths.clone(),
         size_bytes: local.size_bytes,
+        draft_reference,
     });
 }
 
@@ -865,16 +1149,19 @@ async fn solo_load(
     reference: &str,
     local: &LocalModel,
     planned: PlannedLoad,
+    draft: Option<DraftRequest>,
     tx: &LineSender,
 ) {
     let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<LoadProgress>();
     let (resp_tx, resp_rx) = oneshot::channel();
+    let draft_reference = draft.as_ref().map(|d| d.reference.clone());
     if state
         .host
         .send(HostMsg::Load {
             reference: reference.to_string(),
             cache_root: state.cache_root.clone(),
             ctx_len: state.ctx_len,
+            draft,
             progress: progress_tx,
             resp: resp_tx,
         })
@@ -896,7 +1183,14 @@ async fn solo_load(
     }
     match resp_rx.await {
         Ok(Ok(model)) => {
-            install_solo_active(state, reference, local, planned.plan, planned.explanation);
+            install_solo_active(
+                state,
+                reference,
+                local,
+                planned.plan,
+                planned.explanation,
+                draft_reference,
+            );
             let _ = emit(tx, serde_json::json!({ "status": "ready", "model": model })).await;
         }
         Ok(Err(message)) => {
@@ -925,15 +1219,18 @@ pub(crate) async fn activate_solo_plan(
     reference: &str,
     local: &LocalModel,
     planned: PlannedLoad,
+    draft: Option<DraftRequest>,
 ) -> Result<LoadedModel, String> {
     let (progress_tx, mut progress_rx) = mpsc::unbounded_channel::<LoadProgress>();
     let (resp_tx, resp_rx) = oneshot::channel();
+    let draft_reference = draft.as_ref().map(|d| d.reference.clone());
     if state
         .host
         .send(HostMsg::Load {
             reference: reference.to_string(),
             cache_root: state.cache_root.clone(),
             ctx_len: state.ctx_len,
+            draft,
             progress: progress_tx,
             resp: resp_tx,
         })
@@ -944,7 +1241,14 @@ pub(crate) async fn activate_solo_plan(
     while progress_rx.recv().await.is_some() {}
     match resp_rx.await {
         Ok(Ok(model)) => {
-            install_solo_active(state, reference, local, planned.plan, planned.explanation);
+            install_solo_active(
+                state,
+                reference,
+                local,
+                planned.plan,
+                planned.explanation,
+                draft_reference,
+            );
             Ok(model)
         }
         Ok(Err(message)) => {
@@ -969,6 +1273,7 @@ pub(crate) async fn activate_distributed_plan(
     reference: &str,
     local: &LocalModel,
     planned: PlannedLoad,
+    draft: Option<DraftRequest>,
 ) -> Result<LoadedModel, String> {
     let PlannedLoad {
         plan,
@@ -1035,6 +1340,7 @@ pub(crate) async fn activate_distributed_plan(
     }
 
     let (resp_tx, resp_rx) = oneshot::channel();
+    let draft_reference = draft.as_ref().map(|d| d.reference.clone());
     if state
         .host
         .send(HostMsg::LoadDistributed {
@@ -1045,6 +1351,7 @@ pub(crate) async fn activate_distributed_plan(
             endpoints,
             tensor_split,
             use_local_device,
+            draft,
             resp: resp_tx,
         })
         .is_err()
@@ -1069,6 +1376,7 @@ pub(crate) async fn activate_distributed_plan(
                 name: local.name.clone(),
                 paths: local.paths.clone(),
                 size_bytes: local.size_bytes,
+                draft_reference,
             });
             Ok(model)
         }
@@ -1329,7 +1637,7 @@ mod tests {
         tempfile::TempDir,
     ) {
         let dir = tempfile::tempdir().unwrap();
-        let (host, host_thread) = EngineHost::spawn(None);
+        let (host, host_thread) = EngineHost::spawn(None, crate::engine_host::HostPerf::default());
         let shutdown = Arc::new(Notify::new());
         let mesh = spawn_test_mesh(dir.path()).await;
         let state = Arc::new(InternalState {
@@ -1340,6 +1648,7 @@ mod tests {
             },
             cache_root: dir.path().join("models"),
             ctx_len: 4096,
+            n_ubatch: 512,
             port: 0,
             started: Instant::now(),
             product_version: "test",
@@ -1358,6 +1667,8 @@ mod tests {
             }),
             battery_threshold: 25,
             cache_max_bytes: 0,
+            draft_model: None,
+            retry: tokio::sync::Mutex::new(crate::supervisor::RetryLedger::default()),
         });
         let app = internal_router(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1497,6 +1808,35 @@ mod tests {
         teardown(host, host_thread);
     }
 
+    /// docs/perf.md §5: `speculative` without a draft (request or config)
+    /// is a typed error naming both remedies and a registry pairing —
+    /// emitted before any planning or engine work.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn speculative_load_without_a_draft_errors_with_remedy() {
+        let Ok(smoke) = std::env::var("OB_SMOKE_MODEL") else {
+            eprintln!("OB_SMOKE_MODEL not set; skipping speculative load test");
+            return;
+        };
+        let (base, _notify, host, host_thread, _dir) = serve_internal("sekrit").await;
+        let resp = reqwest::Client::new()
+            .post(format!("{base}/api/internal/load"))
+            .bearer_auth("sekrit")
+            .json(&serde_json::json!({ "model": smoke, "speculative": true }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body = resp.text().await.unwrap();
+        let last_line = body.lines().last().expect("stream must not be empty");
+        let parsed: serde_json::Value = serde_json::from_str(last_line).unwrap();
+        assert_eq!(parsed["status"], "error", "body: {body}");
+        let message = parsed["message"].as_str().unwrap();
+        assert!(message.contains("--draft"), "remedy missing: {message}");
+        assert!(message.contains("draft_model"), "remedy missing: {message}");
+        assert!(message.contains("qwen3-0.6b"), "pairing missing: {message}");
+        teardown(host, host_thread);
+    }
+
     /// Bench endpoint shape over the hermetic mesh. Needs the engine, so it
     /// runs only when OB_SMOKE_MODEL points at a tiny GGUF (same gating as
     /// the engine smoke tests). The registry test model is seeded into the
@@ -1577,6 +1917,62 @@ mod tests {
             profile["measured_unix"].as_u64().unwrap()
         );
         assert!(stored.decode_tps > 0.0);
+        teardown(host, host_thread);
+    }
+
+    /// docs/perf.md §10: `POST /api/internal/perf` reads with an empty body
+    /// and overrides per-lever; overrides land in the engine host's runtime
+    /// toggles (applied at the next model load).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn perf_endpoint_reads_and_flips_the_runtime_toggles() {
+        let (base, _notify, host, host_thread, _dir) = serve_internal("sekrit").await;
+        let client = reqwest::Client::new();
+        let read = |body: serde_json::Value| {
+            let client = client.clone();
+            let url = format!("{base}/api/internal/perf");
+            async move {
+                let resp = client
+                    .post(&url)
+                    .bearer_auth("sekrit")
+                    .json(&body)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), 200);
+                resp.json::<serde_json::Value>().await.unwrap()
+            }
+        };
+        // Empty body: pure read of the config-time defaults.
+        let current = read(serde_json::json!({})).await;
+        assert_eq!(current["prefill_overlap"], true);
+        assert_eq!(current["kv_reuse"], true);
+        // Flip one lever; the other keeps its value.
+        let flipped = read(serde_json::json!({ "prefill_overlap": false })).await;
+        assert_eq!(flipped["prefill_overlap"], false);
+        assert_eq!(flipped["kv_reuse"], true);
+        assert_eq!(host.perf_toggles(), (false, true));
+        // Flip both back and forth; the host handle sees every change.
+        let both = read(serde_json::json!({ "prefill_overlap": true, "kv_reuse": false })).await;
+        assert_eq!(both["prefill_overlap"], true);
+        assert_eq!(both["kv_reuse"], false);
+        assert_eq!(host.perf_toggles(), (true, false));
+        teardown(host, host_thread);
+    }
+
+    /// docs/perf.md §10: `POST /api/internal/bench/peers` with nothing
+    /// connected answers an empty peers list, not an error.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bench_peers_with_no_peers_is_an_empty_list() {
+        let (base, _notify, host, host_thread, _dir) = serve_internal("sekrit").await;
+        let resp = reqwest::Client::new()
+            .post(format!("{base}/api/internal/bench/peers"))
+            .bearer_auth("sekrit")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["peers"], serde_json::json!([]));
         teardown(host, host_thread);
     }
 
@@ -1672,7 +2068,7 @@ mod tests {
         onebrain_models::cache::set_pinned(&cache_root, "listed-model", true).unwrap();
         onebrain_models::cache::touch(&cache_root, "listed-model").unwrap();
 
-        let (host, host_thread) = EngineHost::spawn(None);
+        let (host, host_thread) = EngineHost::spawn(None, crate::engine_host::HostPerf::default());
         let mesh = spawn_test_mesh(dir.path()).await;
         let (sup_tx, _sup_rx) = crate::supervisor::channel();
         let backend = crate::engine_host::DaemonBackend::new(
@@ -1681,6 +2077,8 @@ mod tests {
             sup_tx,
             mesh.clone(),
             0,
+            4,
+            8,
         );
         let models = tokio::task::spawn_blocking(move || {
             onebrain_api::backend::EngineBackend::models(&backend)
