@@ -1,0 +1,477 @@
+onebrain vendor patch 0003: RPC client-side async pipelining
+(docs/perf.md §3 — overlapped chunked prefill)
+
+Applies on top of 0001 + 0002. Client paths of ggml-rpc.cpp (plus one
+additive declaration in ggml-rpc.h) only; the server side and the wire
+format are untouched.
+
+Correctness argument (also at the ob_rpc_pending block in the file): the
+RPC server executes commands serially, in order, per connection, and
+several commands carry no response (GRAPH_COMPUTE, GRAPH_RECOMPUTE,
+SET_TENSOR, MEMSET_TENSOR). Deferring "acks" is therefore free: the
+response of ANY later response-bearing command on the same socket proves
+every command before it fully executed. The patch adds a per-socket
+pending-command ledger (submitted/completed counters — the pending-ack
+FIFO with implicit, batched acks), implements synchronize as a drain
+(fence = one GET_DEVICE_MEMORY round trip when the ledger cannot prove
+completion), events as markers into the ledger (record = snapshot
+submitted; wait/synchronize = drain to the marker), async set/get/cpy
+tensor entry points, and flips device caps to async=true, events=true —
+which is exactly what llama.cpp's pipeline_parallel gate requires.
+ggml_backend_rpc_pipeline_enable(false) reverts the caps advertisement
+process-wide (contexts created afterwards run without parallel copies) —
+the hook behind OneBrain's `[perf] prefill_overlap = false` constructed
+M3 baseline.
+Failures compose with 0002: a failed fence marks the socket dead and the
+error surfaces on whichever status-returning call drains or runs next.
+
+diff --git a/ggml/include/ggml-rpc.h b/ggml/include/ggml-rpc.h
+index 1d1646d..3ae4ff9 100644
+--- a/ggml/include/ggml-rpc.h
++++ b/ggml/include/ggml-rpc.h
+@@ -36,6 +36,13 @@ GGML_BACKEND_API void ggml_backend_rpc_start_server(const char * endpoint, const
+ GGML_BACKEND_API void ggml_backend_rpc_serve_fd(long long fd, const char * cache_dir,
+                                                 size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices);
+ 
++// Process-wide switch for the RPC device's async/events capability
++// advertisement (default: enabled). Disabled, llama.cpp's pipeline-parallel
++// gate fails for RPC devices, so schedulers created afterwards run without
++// parallel copies. Takes effect for contexts created after the call; a live
++// context keeps the mode it was created with.
++GGML_BACKEND_API void ggml_backend_rpc_pipeline_enable(bool enable);
++
+ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_rpc_reg(void);
+ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_rpc_add_server(const char * endpoint);
+ 
+diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
+index 815e9ad..a95324a 100644
+--- a/ggml/src/ggml-rpc/ggml-rpc.cpp
++++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
+@@ -34,6 +34,13 @@ namespace fs = std::filesystem;
+ // server fails the in-flight request, not the process. The first failure on a
+ // socket marks it dead; later commands on it fail fast without touching the
+ // wire. Server-side paths and the wire format are untouched.
++//
++// onebrain: client-side async pipelining (patches/0003)
++// The client backend advertises async + events and keeps a per-socket
++// pending-command ledger, so llama.cpp's scheduler can pipeline multiple
++// ubatches across RPC devices. Correctness rests on the server executing
++// commands serially, in order, per connection; see the block comment at
++// ob_rpc_pending. Server-side paths and the wire format remain untouched.
+ 
+ // all RPC structures must be packed
+ #pragma pack(push, 1)
+@@ -348,6 +355,75 @@ static void ob_rpc_log_fail(const char * where) {
+     }
+ }
+ 
++// onebrain: client-side async pipelining (patches/0003)
++//
++// The RPC protocol sends several commands with NO response on the wire
++// (GRAPH_COMPUTE, GRAPH_RECOMPUTE, SET_TENSOR, MEMSET_TENSOR): the client
++// returns as soon as the bytes are written, while the server executes them
++// later. The server processes commands strictly serially, in order, per
++// connection — so the response of ANY later response-bearing command on the
++// same socket proves that every command submitted before it has fully
++// executed. That in-order guarantee is the whole correctness argument:
++//
++//  - the "pending-ack FIFO" per socket degenerates to a pair of counters
++//    (`submitted`, `completed`): acks are implicit, and one response
++//    acknowledges every command before it at once;
++//  - "drain" = one response-bearing fence round trip (GET_DEVICE_MEMORY, an
++//    existing command with untouched semantics — NO wire-format change);
++//  - reads (GET_TENSOR / COPY_TENSOR) need no explicit fence: their own
++//    response cannot arrive before prior computes finished, so a get on a
++//    pipelined endpoint always observes completed data;
++//  - remote write-after-read hazards (the sched overwriting an input copy a
++//    previous graph may still be reading) are ordered by the socket itself:
++//    the overwrite is a later command on the same connection.
++//
++// This lets the backend advertise `caps.async = true, events = true`:
++// `graph_compute` submits without waiting, `synchronize` drains everything,
++// `event_record` snapshots the submitted count as a marker, and
++// `event_wait`/`event_synchronize` drain to that marker (conservatively to
++// "now" when a fence is needed — a fence cannot wait for less than the whole
++// queue, and the marker check keeps fences amortized across the scheduler's
++// rotating pipeline copies). llama.cpp's own `pipeline_parallel` gate then
++// passes for multi-device RPC loads, overlapping per-ubatch prefill work
++// across nodes with zero server/protocol changes.
++//
++// Failure composition with patches/0002: a fence that fails marks the socket
++// dead exactly like any other round trip; the draining call surfaces the
++// error where its signature allows (graph_compute -> GGML_STATUS_FAILED,
++// cpy -> false), and void paths (synchronize/event_wait) log loudly and let
++// the next status-returning command on the dead socket fail fast.
++struct ob_rpc_pending {
++    // Serializes whole transactions (send, or send+recv) on one socket, so a
++    // cross-thread event wait can never interleave bytes into another
++    // thread's exchange. Recursive because the response-bearing overload of
++    // send_rpc_cmd nests the fire-and-forget one.
++    std::recursive_mutex mtx;
++    // Count of commands written to the socket (with or without a response).
++    uint64_t submitted = 0;
++    // Highest `submitted` value proven executed by a later response.
++    uint64_t completed = 0;
++};
++
++static std::mutex ob_rpc_pending_map_mutex;
++static std::unordered_map<socket_t *, std::pair<std::weak_ptr<socket_t>, std::shared_ptr<ob_rpc_pending>>> ob_rpc_pending_map;
++
++// Per-socket pending ledger. Keyed like the dead-socket registry: raw
++// pointer for lookup, weak_ptr for exact identity, so a recycled allocation
++// at the same address gets a fresh ledger (the stale entry is replaced).
++static std::shared_ptr<ob_rpc_pending> ob_rpc_pending_for(const socket_ptr & sock) {
++    if (sock == nullptr) {
++        return nullptr;
++    }
++    std::lock_guard<std::mutex> lock(ob_rpc_pending_map_mutex);
++    auto it = ob_rpc_pending_map.find(sock.get());
++    if (it != ob_rpc_pending_map.end() && it->second.first.lock() == sock) {
++        return it->second.second;
++    }
++    auto state = std::make_shared<ob_rpc_pending>();
++    ob_rpc_pending_map[sock.get()] = {sock, state};
++    return state;
++}
++
+ // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
+ // No response
+ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size) {
+@@ -356,6 +432,12 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input,
+     if (ob_rpc_is_dead(sock)) {
+         return false;
+     }
++    // onebrain: client-side async pipelining (patches/0003): every command
++    // counts as submitted work; the transaction lock keeps concurrent
++    // submitters (event waits run on other backends' threads) from
++    // interleaving bytes on the wire.
++    auto pending = ob_rpc_pending_for(sock);
++    std::lock_guard<std::recursive_mutex> lock(pending->mtx);
+     uint8_t cmd_byte = cmd;
+     if (!sock->send_data(&cmd_byte, sizeof(cmd_byte)) ||
+         !sock->send_data(&input_size, sizeof(input_size)) ||
+@@ -364,15 +446,30 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input,
+         ob_rpc_mark_dead(sock); // onebrain: error-return semantics (patches/0002)
+         return false;
+     }
++    pending->submitted++;
+     return true;
+ }
+ 
+ // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
+ // RPC response: | response_size (8 bytes) | response_data (response_size bytes) |
+ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size, void * output, size_t output_size) {
++    // onebrain: error-return semantics (patches/0002): fail fast (also
++    // covers a null socket, keeping the ledger lookup below non-null).
++    if (ob_rpc_is_dead(sock)) {
++        return false;
++    }
++    // onebrain: client-side async pipelining (patches/0003): hold the
++    // transaction lock across send AND recv — response matching relies on
++    // strict request/response alternation per socket.
++    auto pending = ob_rpc_pending_for(sock);
++    std::lock_guard<std::recursive_mutex> lock(pending->mtx);
+     if (!send_rpc_cmd(sock, cmd, input, input_size)) {
+         return false;
+     }
++    // The server is serial and in-order per connection: this command's
++    // response proves every command submitted before it (itself included)
++    // has fully executed — the implicit ack that drains the pending FIFO.
++    uint64_t fence = pending->submitted;
+     uint64_t out_size;
+     if (!sock->recv_data(&out_size, sizeof(out_size)) ||
+         out_size != output_size ||
+@@ -382,9 +479,69 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input,
+         ob_rpc_mark_dead(sock);
+         return false;
+     }
++    if (fence > pending->completed) {
++        pending->completed = fence; // onebrain: patches/0003 implicit ack
++    }
+     return true;
+ }
+ 
++// onebrain: client-side async pipelining (patches/0003): block until the
++// server has executed at least the first `target` submitted commands on this
++// socket. When the ledger cannot prove that already happened, one
++// response-bearing fence round trip (GET_DEVICE_MEMORY — an existing command,
++// unchanged wire semantics) does: the server answers it only after finishing
++// everything queued before it. A fence necessarily waits for the whole queue
++// (there are no per-command acks to wait on), which over-synchronizes past
++// `target`; the completed-marker check keeps that amortized. A fence failure
++// marks the socket dead (patches/0002) and logs loudly; the caller's
++// signature decides where the error return surfaces.
++static void ob_rpc_drain_to(const socket_ptr & sock, uint32_t device, uint64_t target) {
++    auto pending = ob_rpc_pending_for(sock);
++    if (pending == nullptr) {
++        return; // never-connected socket: nothing was ever submitted
++    }
++    std::lock_guard<std::recursive_mutex> lock(pending->mtx);
++    if (pending->completed >= target) {
++        return;
++    }
++    rpc_msg_get_device_memory_req request = {device};
++    rpc_msg_get_device_memory_rsp response;
++    if (!send_rpc_cmd(sock, RPC_CMD_GET_DEVICE_MEMORY, &request, sizeof(request), &response, sizeof(response))) {
++        ob_rpc_log_fail(__func__);
++    }
++}
++
++// onebrain: patches/0003: drain everything currently submitted on `sock`.
++static void ob_rpc_drain_all(const socket_ptr & sock, uint32_t device) {
++    auto pending = ob_rpc_pending_for(sock);
++    if (pending == nullptr) {
++        return;
++    }
++    uint64_t submitted;
++    {
++        std::lock_guard<std::recursive_mutex> lock(pending->mtx);
++        submitted = pending->submitted;
++    }
++    ob_rpc_drain_to(sock, device, submitted);
++}
++
++// onebrain: patches/0003: process-wide switch for the async/events capability
++// ADVERTISEMENT (default on) — the hook behind OneBrain's
++// `[perf] prefill_overlap` config knob (docs/perf.md §3). Disabled, get_props
++// reports async=false/events=false, llama.cpp's pipeline_parallel gate fails,
++// and schedulers created afterwards run without parallel copies: the
++// constructed M3 baseline for benches and the sim proof. Only the caps are
++// gated; the pending ledger, drains, and async entry points stay active (they
++// are correct either way — the server is serial in-order per connection), so
++// a context created while enabled keeps working if the flag flips under it.
++// llama caches the gate result per context (cparams.pipeline_parallel), so a
++// flip affects the NEXT context created, never a live one.
++static std::atomic<bool> ob_rpc_pipeline_enabled{true};
++
++void ggml_backend_rpc_pipeline_enable(bool enable) {
++    ob_rpc_pipeline_enabled.store(enable, std::memory_order_relaxed);
++}
++
+ // RPC client-side implementation
+ 
+ // Performs HELLO handshake with transport auto-negotiation.
+@@ -776,8 +933,136 @@ static void ggml_backend_rpc_free(ggml_backend_t backend) {
+ }
+ 
+ static void ggml_backend_rpc_synchronize(ggml_backend_t backend) {
++    // onebrain: client-side async pipelining (patches/0003): drain all
++    // pending (unacked) commands on this backend's socket. Cheap when the
++    // ledger already proves completion (a response-bearing command ran after
++    // the last submission); one fence round trip otherwise. On a dead socket
++    // this fails fast per patches/0002 — the error surfaces on the next
++    // status-returning call.
++    ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *)backend->context;
++    auto sock = get_socket(rpc_ctx->endpoint);
++    if (sock == nullptr) {
++        return;
++    }
++    ob_rpc_drain_all(sock, rpc_ctx->device);
++}
++
++// onebrain: client-side async pipelining (patches/0003): async tensor entry
++// points. "Async" set is natural: SET_TENSOR has no response, and the data is
++// serialized into the request before the call returns, so the caller's
++// buffer is immediately reusable. A get MUST observe all pending computes on
++// the endpoint first — GET_TENSOR is response-bearing and the server is
++// serial in-order per connection, so its reply cannot arrive before every
++// previously submitted command executed: the drain is implicit in reading
++// the response (and the ledger advances inside send_rpc_cmd).
++static void ggml_backend_rpc_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
++    GGML_ASSERT(tensor->buffer != nullptr && ggml_backend_buffer_is_rpc(tensor->buffer) && "tensor is not on an RPC buffer");
++    ggml_backend_rpc_buffer_set_tensor(tensor->buffer, tensor, data, offset, size);
++    GGML_UNUSED(backend);
++}
++
++static void ggml_backend_rpc_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
++    GGML_ASSERT(tensor->buffer != nullptr && ggml_backend_buffer_is_rpc(tensor->buffer) && "tensor is not on an RPC buffer");
++    ggml_backend_rpc_buffer_get_tensor(tensor->buffer, tensor, data, offset, size);
++    GGML_UNUSED(backend);
++}
++
++// onebrain: patches/0003: pipelined copy INTO this RPC backend. The
++// profitable case is a host-resident source (the scheduler's split-boundary
++// input copy): it becomes one fire-and-forget SET_TENSOR that queues behind
++// the remote's in-flight graphs instead of stalling the host. Host data is
++// complete only when the producing backend is synchronous, so that case is
++// gated on a CPU source backend. Same-server copies reuse the remote-side
++// COPY_TENSOR (response-bearing, still correct); everything else returns
++// false and the scheduler falls back to its synchronized copy path.
++static bool ggml_backend_rpc_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
++    if (dst->buffer == nullptr || !ggml_backend_buffer_is_rpc(dst->buffer)) {
++        return false;
++    }
++    if (src->buffer != nullptr && ggml_backend_buffer_is_rpc(src->buffer)) {
++        ggml_backend_rpc_buffer_context * src_ctx = (ggml_backend_rpc_buffer_context *)src->buffer->context;
++        ggml_backend_rpc_buffer_context * dst_ctx = (ggml_backend_rpc_buffer_context *)dst->buffer->context;
++        if (src_ctx->sock == dst_ctx->sock) {
++            return ggml_backend_rpc_buffer_cpy_tensor(dst->buffer, src, dst);
++        }
++        // Cross-server: the host must relay; let the sched's fallback do it.
++        return false;
++    }
++    if (src->buffer == nullptr || !ggml_backend_buffer_is_host(src->buffer)) {
++        return false;
++    }
++    // Only a synchronous producer guarantees host data is ready right now.
++    if (ggml_backend_dev_type(ggml_backend_get_device(backend_src)) != GGML_BACKEND_DEVICE_TYPE_CPU) {
++        return false;
++    }
++    if (src->type != dst->type || !ggml_is_contiguous(src) || !ggml_is_contiguous(dst) ||
++        ggml_nbytes(src) != ggml_nbytes(dst)) {
++        return false;
++    }
++    ggml_backend_rpc_buffer_set_tensor(dst->buffer, dst, src->data, 0, ggml_nbytes(dst));
++    return true;
++    GGML_UNUSED(backend_dst);
++}
++
++// onebrain: patches/0003: events. An event is a marker into a socket's
++// pending-command FIFO: record snapshots the submitted count, wait/
++// synchronize drain that socket to the marker. Waits may run on another
++// backend's thread (the sched does cross-backend waits), hence the ledger's
++// transaction mutex and the event's own lock.
++struct ob_rpc_event_context {
++    std::mutex mtx;                 // guards the fields against record/wait races
++    std::weak_ptr<socket_t> sock;   // socket the marker was recorded on
++    uint32_t device   = 0;          // device id for the fence command
++    uint64_t marker   = 0;          // ledger position at record time
++    bool     recorded = false;
++};
++
++static void ggml_backend_rpc_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
++    ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *)backend->context;
++    ob_rpc_event_context * ev = (ob_rpc_event_context *)event->context;
++    auto sock = get_socket(rpc_ctx->endpoint);
++    if (sock == nullptr) {
++        return; // never-connected endpoint: nothing to mark
++    }
++    uint64_t submitted = 0;
++    if (auto pending = ob_rpc_pending_for(sock)) {
++        std::lock_guard<std::recursive_mutex> lock(pending->mtx);
++        submitted = pending->submitted;
++    }
++    std::lock_guard<std::mutex> lock(ev->mtx);
++    ev->sock     = sock;
++    ev->device   = rpc_ctx->device;
++    ev->marker   = submitted;
++    ev->recorded = true;
++}
++
++static void ob_rpc_event_drain(ggml_backend_event_t event) {
++    ob_rpc_event_context * ev = (ob_rpc_event_context *)event->context;
++    socket_ptr sock;
++    uint32_t device;
++    uint64_t marker;
++    {
++        std::lock_guard<std::mutex> lock(ev->mtx);
++        if (!ev->recorded) {
++            return; // an event never recorded is complete by definition
++        }
++        sock   = ev->sock.lock();
++        device = ev->device;
++        marker = ev->marker;
++    }
++    if (sock == nullptr) {
++        return; // socket already freed: no work can still be in flight on it
++    }
++    ob_rpc_drain_to(sock, device, marker);
++}
++
++static void ggml_backend_rpc_event_wait(ggml_backend_t backend, ggml_backend_event_t event) {
++    // The client has no remote command queue to insert a dependency into, so
++    // "make `backend` wait for `event`" is implemented as the strongest
++    // correct form: block the calling thread until the event's socket has
++    // executed past the marker.
++    ob_rpc_event_drain(event);
+     GGML_UNUSED(backend);
+-    // this is no-op because we don't have any async operations
+ }
+ 
+ static void add_tensor(ggml_tensor * tensor, const ggml_cgraph * cgraph, std::vector<rpc_tensor> & tensors, std::unordered_set<ggml_tensor*> & visited) {
+@@ -865,19 +1150,20 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
+ static ggml_backend_i ggml_backend_rpc_interface = {
+     /* .get_name                = */ ggml_backend_rpc_name,
+     /* .free                    = */ ggml_backend_rpc_free,
+-    /* .set_tensor_async        = */ NULL,
+-    /* .get_tensor_async        = */ NULL,
++    // onebrain: client-side async pipelining (patches/0003)
++    /* .set_tensor_async        = */ ggml_backend_rpc_set_tensor_async,
++    /* .get_tensor_async        = */ ggml_backend_rpc_get_tensor_async,
+     /* .set_tensor_2d_async     = */ NULL,
+     /* .get_tensor_2d_async     = */ NULL,
+-    /* .cpy_tensor_async        = */ NULL,
++    /* .cpy_tensor_async        = */ ggml_backend_rpc_cpy_tensor_async,
+     /* .synchronize             = */ ggml_backend_rpc_synchronize,
+     /* .graph_plan_create       = */ NULL,
+     /* .graph_plan_free         = */ NULL,
+     /* .graph_plan_update       = */ NULL,
+     /* .graph_plan_compute      = */ NULL,
+     /* .graph_compute           = */ ggml_backend_rpc_graph_compute,
+-    /* .event_record            = */ NULL,
+-    /* .event_wait              = */ NULL,
++    /* .event_record            = */ ggml_backend_rpc_event_record,
++    /* .event_wait              = */ ggml_backend_rpc_event_wait,
+     /* .graph_optimize          = */ NULL,
+ };
+ 
+@@ -2055,15 +2341,43 @@ static void ggml_backend_rpc_device_get_props(ggml_backend_dev_t dev, struct ggm
+     props->description = ggml_backend_rpc_device_get_description(dev);
+     props->type        = ggml_backend_rpc_device_get_type(dev);
+     ggml_backend_rpc_device_get_memory(dev, &props->memory_free, &props->memory_total);
++    // onebrain: client-side async pipelining (patches/0003): graph
++    // submission is fire-and-forget with a fenceable pending ledger, and
++    // events mark positions in the per-socket FIFO — that satisfies
++    // llama.cpp's pipeline-parallel gate for multi-device RPC loads.
++    // `ggml_backend_rpc_pipeline_enable(false)` reverts the advertisement
++    // (OneBrain's `[perf] prefill_overlap = false` baseline).
++    const bool pipeline = ob_rpc_pipeline_enabled.load(std::memory_order_relaxed);
+     props->caps = {
+-        /* .async                 = */ false,
++        /* .async                 = */ pipeline,
+         /* .host_buffer           = */ false,
+         /* .buffer_from_host_ptr  = */ false,
+-        /* .events                = */ false,
++        /* .events                = */ pipeline,
+         /* .mmap_support          = */ true,
+     };
+ }
+ 
++// onebrain: client-side async pipelining (patches/0003): device-level event
++// surface. Events are heap-allocated markers into a socket's pending-command
++// ledger; see ob_rpc_event_context.
++static ggml_backend_event_t ggml_backend_rpc_device_event_new(ggml_backend_dev_t dev) {
++    return new ggml_backend_event {
++        /* .device  = */ dev,
++        /* .context = */ new ob_rpc_event_context,
++    };
++}
++
++static void ggml_backend_rpc_device_event_free(ggml_backend_dev_t dev, ggml_backend_event_t event) {
++    delete (ob_rpc_event_context *)event->context;
++    delete event;
++    GGML_UNUSED(dev);
++}
++
++static void ggml_backend_rpc_device_event_synchronize(ggml_backend_dev_t dev, ggml_backend_event_t event) {
++    ob_rpc_event_drain(event);
++    GGML_UNUSED(dev);
++}
++
+ static ggml_backend_t ggml_backend_rpc_device_init(ggml_backend_dev_t dev, const char * params) {
+     ggml_backend_rpc_device_context * ctx = (ggml_backend_rpc_device_context *)dev->context;
+ 
+@@ -2109,9 +2423,10 @@ static const struct ggml_backend_device_i ggml_backend_rpc_device_i = {
+     /* .supports_op          = */ ggml_backend_rpc_device_supports_op,
+     /* .supports_buft        = */ ggml_backend_rpc_device_supports_buft,
+     /* .offload_op           = */ NULL,
+-    /* .event_new            = */ NULL,
+-    /* .event_free           = */ NULL,
+-    /* .event_synchronize    = */ NULL,
++    // onebrain: client-side async pipelining (patches/0003)
++    /* .event_new            = */ ggml_backend_rpc_device_event_new,
++    /* .event_free           = */ ggml_backend_rpc_device_event_free,
++    /* .event_synchronize    = */ ggml_backend_rpc_device_event_synchronize,
+ };
+ 
+ // backend reg interface

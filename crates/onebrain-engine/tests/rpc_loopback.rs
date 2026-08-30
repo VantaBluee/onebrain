@@ -93,7 +93,7 @@ fn greedy_tokens(model: &Model, max_new: usize) -> Vec<i32> {
         &SessionParams {
             n_ctx: 256,
             n_batch: 64,
-            n_threads: 0,
+            ..SessionParams::default()
         },
     )
     .expect("session");

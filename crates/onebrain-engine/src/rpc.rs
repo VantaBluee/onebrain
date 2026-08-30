@@ -11,11 +11,99 @@
 
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpStream};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, Once};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::{init, sys, EngineError};
+
+// ---- pipeline-parallel engagement observable (docs/perf.md §3) ----
+//
+// `init()` silences the C side entirely (null logger), so llama.cpp's
+// `llama_context: pipeline parallelism enabled` line — the vendor's own proof
+// that patch 0003's caps flip passed the pipeline-parallel gate — would
+// vanish. Registering a remote server (the only entry into distributed
+// loads) swaps the null logger for a filter that stays silent EXCEPT for two
+// surgical forwards into `tracing`:
+//
+//  - the pipeline-parallelism engagement line (info; also counted below so
+//    tests can assert engagement without capturing a subscriber), and
+//  - the patched client's RPC transport-failure line (warn; patches/0002).
+//
+// Everything else is swallowed, preserving init()'s silence contract. The
+// daemon's tracing output therefore carries the exact vendor text
+// `llama_context: pipeline parallelism enabled`, which the sim greps for.
+
+extern "C" {
+    // llama.h: `void llama_log_set(ggml_log_callback cb, void * user_data)`;
+    // declared here (not sys.rs) to keep this observable wholly inside the
+    // rpc module. The callback also receives ggml-level logs (llama_log_set
+    // forwards to ggml_log_set upstream).
+    fn llama_log_set(
+        log_callback: Option<
+            unsafe extern "C" fn(i32, *const std::os::raw::c_char, *mut std::ffi::c_void),
+        >,
+        user_data: *mut std::ffi::c_void,
+    );
+    // ggml-rpc.h (patches/0003): process-wide switch for the RPC device's
+    // async/events capability advertisement. Declared here (not sys.rs) for
+    // the same reason as llama_log_set: the §3 perf surface lives wholly in
+    // the rpc module.
+    fn ggml_backend_rpc_pipeline_enable(enable: bool);
+}
+
+/// Process-wide switch for RPC pipeline parallelism (docs/perf.md §3 —
+/// the engine end of the `[perf] prefill_overlap` config knob). `false`
+/// stops the RPC devices from advertising async + events, so llama.cpp's
+/// own pipeline-parallel gate fails and every context created AFTERWARDS
+/// runs the exact M3 sequential path (scheduler without parallel copies) —
+/// the constructed baseline for benches and the sim proof. Live sessions
+/// keep the mode they were created with; flip before loading, not mid-use.
+/// Default (never calling this) is enabled.
+pub fn set_pipeline_overlap(enabled: bool) {
+    init();
+    unsafe { ggml_backend_rpc_pipeline_enable(enabled) };
+}
+
+static LLAMA_LOG_FILTER: Once = Once::new();
+static PIPELINE_PARALLEL_ENGAGEMENTS: AtomicU64 = AtomicU64::new(0);
+
+/// How many llama contexts have logged `pipeline parallelism enabled` since
+/// process start (docs/perf.md §3 — overlapped chunked prefill). Monotonic
+/// and process-wide: snapshot before and after a session is created to prove
+/// THAT session engaged llama.cpp's pipeline-parallel scheduler path. The
+/// counter only moves after [`RemoteServer::register`] has run in this
+/// process (solo daemons keep the C side fully silent).
+pub fn pipeline_parallel_engagements() -> u64 {
+    PIPELINE_PARALLEL_ENGAGEMENTS.load(Ordering::Relaxed)
+}
+
+unsafe extern "C" fn ob_llama_log_filter(
+    _level: i32,
+    text: *const std::os::raw::c_char,
+    _user: *mut std::ffi::c_void,
+) {
+    if text.is_null() {
+        return;
+    }
+    let text = std::ffi::CStr::from_ptr(text).to_string_lossy();
+    if text.contains("pipeline parallelism enabled") {
+        PIPELINE_PARALLEL_ENGAGEMENTS.fetch_add(1, Ordering::Relaxed);
+        tracing::info!("{}", text.trim_end());
+    } else if text.contains("RPC client: transport failure") {
+        tracing::warn!("{}", text.trim_end());
+    }
+    // Every other line stays silenced, exactly as init() promises.
+}
+
+/// Install the filtering logger (idempotent). Runs after [`init`] so it
+/// replaces the null logger rather than being replaced by it.
+fn install_llama_log_filter() {
+    LLAMA_LOG_FILTER.call_once(|| unsafe {
+        llama_log_set(Some(ob_llama_log_filter), std::ptr::null_mut());
+    });
+}
 
 /// Platform stream type for the bridge end of a [`SocketPair`]: the end the
 /// daemon (or a test pump) reads/writes while the other end is served by
@@ -314,6 +402,10 @@ impl RemoteServer {
     /// ports.
     pub fn register(endpoint: &str) -> Result<RemoteServer, EngineError> {
         init();
+        // Every distributed load flows through here, so this is the earliest
+        // (and only lib.rs-free) hook to surface the vendor's
+        // pipeline-parallelism engagement line before any context exists.
+        install_llama_log_filter();
         let cendpoint = std::ffi::CString::new(endpoint)
             .map_err(|_| EngineError::BadEndpoint(endpoint.into()))?;
         let guard = REGISTER_LOCK.lock().unwrap_or_else(|e| e.into_inner());

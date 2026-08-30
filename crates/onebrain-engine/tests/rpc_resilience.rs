@@ -136,7 +136,7 @@ fn bridge_death_mid_generation_is_an_error_not_an_abort() {
             &SessionParams {
                 n_ctx: 256,
                 n_batch: 64,
-                n_threads: 0,
+                ..SessionParams::default()
             },
         )
         .expect("session");

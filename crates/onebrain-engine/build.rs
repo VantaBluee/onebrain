@@ -44,6 +44,7 @@ fn main() {
     for patch in [
         "0001-rpc-serve-fd.patch",
         "0002-rpc-client-error-returns.patch",
+        "0003-rpc-client-async-pipeline.patch",
     ] {
         println!(
             "cargo:rerun-if-changed={}",
@@ -217,7 +218,7 @@ fn main() {
 fn apply_vendor_patches(manifest_dir: &Path, vendor: &Path) {
     // Each patch declares a marker symbol it introduces; its presence in the
     // named file means the patch is already applied.
-    let patches: [(&str, &str, &str); 2] = [
+    let patches: [(&str, &str, &str); 3] = [
         (
             "0001-rpc-serve-fd.patch",
             "ggml/include/ggml-rpc.h",
@@ -227,6 +228,13 @@ fn apply_vendor_patches(manifest_dir: &Path, vendor: &Path) {
             "0002-rpc-client-error-returns.patch",
             "ggml/src/ggml-rpc/ggml-rpc.cpp",
             "ob_rpc_mark_dead",
+        ),
+        // Applies on top of 0002 (hunks share context in ggml-rpc.cpp);
+        // the order of this table is the application order.
+        (
+            "0003-rpc-client-async-pipeline.patch",
+            "ggml/src/ggml-rpc/ggml-rpc.cpp",
+            "ob_rpc_drain_to",
         ),
     ];
     for (patch_name, marker_file, marker) in patches {
