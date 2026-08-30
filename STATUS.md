@@ -166,7 +166,7 @@ fmt, clippy, tests, CPU smoke inference with a tiny GGUF on all three OSes;
       pair-sim-netem leg — the pre-existing peers.toml save race, fixed
       for good in M6's gate: see M6 "Fixed en route".)
 
-## M6 — Model logistics (implementation landed; CI gate in progress)
+## M6 — Model logistics (CI proof met: run 33304706553 green)
 
 - [x] Range-level cache (contract: docs/logistics.md): tensor-aligned
       ranges from GGUF metadata + one header range, per-range BLAKE3
@@ -205,7 +205,10 @@ fmt, clippy, tests, CPU smoke inference with a tiny GGUF on all three OSes;
       store; now atomic rename + serialized read-modify-write
 - [x] Full local gate green: fmt, clippy -Dwarnings, workspace tests
       (21 binaries), e2e, pair-sim, sim (chaos + M6 steps)
-- [ ] CI green on all three OSes (rides the M6 push)
+- [x] CI green on all three OSes + netem: run 33304706553 (70a412f).
+      Two clippy-only red runs first — the rust-version bump (below)
+      un-gated MSRV-aware lints (repeat_n, is_none_or) AFTER the local
+      gate's clippy pass had run; both fixed, full workspace sweep clean
 - Note: workspace rust-version 1.80 → 1.91 (iroh-blobs 0.103 floor)
 
 ## Upcoming
