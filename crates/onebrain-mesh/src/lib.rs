@@ -48,6 +48,17 @@
 //! answered from the peer's configured [`RangeInventorySource`]), and pulls
 //! bytes with [`MeshHandle::fetch_blob`]. See `docs/logistics.md`.
 //!
+//! # Cluster bench (M7)
+//!
+//! [`MeshHandle::bench_query`] asks a connected peer to run its compute/disk
+//! microbench on demand (docs/perf.md §10): a `BenchRequest`/`BenchReport`
+//! exchange on one short-lived control stream, answered from the peer's
+//! configured [`BenchSource`] — the same request/reply-on-one-stream pattern
+//! as `range_query`, so replies never mix into the daemon's control
+//! consumer. A peer without a source (or one that declines) answers with the
+//! wire's cannot-bench-now marker, surfaced as
+//! [`PeerBenchReport::is_unavailable`].
+//!
 //! # Reconnection across restarts (M2 DoD)
 //!
 //! The peer store (`peers.toml`) persists each peer's last-known
@@ -133,6 +144,64 @@ pub struct NodeStatusReport {
 /// established mesh session, right after a compatible `Hello`, so peers
 /// learn this node's schedulable memory and (when benched) its profile.
 pub type NodeStatusFn = Arc<dyn Fn() -> NodeStatusReport + Send + Sync>;
+
+/// A peer's answer to [`MeshHandle::bench_query`]: its fresh microbench
+/// figures (M7 `onebrain bench --cluster`, docs/perf.md §10). Field
+/// semantics match the M4 profile carried by `NodeStatus`: throughputs in
+/// tokens/sec, disk in MB/s (page-cache upper bound, relative ordering
+/// only).
+///
+/// `measured_unix == 0` is the wire contract's cannot-bench-now marker (no
+/// [`BenchSource`] wired on the peer, or it declined — e.g. a generation in
+/// flight). Check [`Self::is_unavailable`] before trusting the throughput
+/// fields: an unavailable report means "no data", never "0 tok/s".
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PeerBenchReport {
+    /// Measured prefill throughput (tokens/sec).
+    pub prefill_tps: f64,
+    /// Measured decode throughput (tokens/sec).
+    pub decode_tps: f64,
+    /// Measured sequential disk read rate (MB/s).
+    pub disk_mbps: f64,
+    /// Unix seconds when the microbench finished; `0` = cannot bench now.
+    pub measured_unix: u64,
+}
+
+impl PeerBenchReport {
+    /// The cannot-bench-now reply: all-zero figures with the
+    /// `measured_unix == 0` marker. What the mesh sends for peers without a
+    /// [`BenchSource`], and what sources that decline collapse to.
+    pub const UNAVAILABLE: PeerBenchReport = PeerBenchReport {
+        prefill_tps: 0.0,
+        decode_tps: 0.0,
+        disk_mbps: 0.0,
+        measured_unix: 0,
+    };
+
+    /// `true` when this report is the cannot-bench-now marker
+    /// (`measured_unix == 0`): treat the peer as unbenchable this round and
+    /// ignore the throughput fields.
+    pub fn is_unavailable(&self) -> bool {
+        self.measured_unix == 0
+    }
+}
+
+/// Answers peers' `BenchRequest` control messages by running this node's
+/// compute/disk microbench on demand (M7, docs/perf.md §10). The daemon
+/// wires the real bench behind this; the mesh only relays.
+///
+/// Unlike [`RangeInventorySource`], implementations MAY take seconds — a
+/// real microbench runs a prefill+decode workload. The mesh calls this off
+/// the async runtime via `spawn_blocking` while the requesting peer waits on
+/// the reply stream (bounded by the requester's own timeout), so a slow
+/// bench delays only its own answer, never other mesh traffic.
+pub trait BenchSource: Send + Sync {
+    /// This node's fresh microbench figures. `None` when the node cannot
+    /// bench right now (nothing to bench with, a generation in flight, …) —
+    /// the mesh then replies with [`PeerBenchReport::UNAVAILABLE`], the wire
+    /// marker the requester reads as "peer can't bench now".
+    fn bench(&self) -> Option<PeerBenchReport>;
+}
 
 /// Errors from the mesh service. Every user-facing variant carries a one-line
 /// remedy in its message (§12 of the product spec).
@@ -351,6 +420,12 @@ pub struct MeshConfig {
     /// replies with an empty inventory ("this node has no ranges"), which
     /// keeps non-sharing embedders honest on the wire.
     pub range_source: Option<Arc<dyn RangeInventorySource>>,
+    /// Answers peers' `BenchRequest` control messages (M7, docs/perf.md
+    /// §10). `None` (default) replies with the cannot-bench-now marker
+    /// ([`PeerBenchReport::UNAVAILABLE`]), which keeps non-benching
+    /// embedders honest on the wire — the daemon wires the real microbench
+    /// here.
+    pub bench_source: Option<Arc<dyn BenchSource>>,
 }
 
 impl std::fmt::Debug for MeshConfig {
@@ -364,6 +439,7 @@ impl std::fmt::Debug for MeshConfig {
             .field("node_status", &self.node_status.as_ref().map(|_| "<fn>"))
             .field("blobs_dir", &self.blobs_dir)
             .field("range_source", &self.range_source.as_ref().map(|_| "<dyn>"))
+            .field("bench_source", &self.bench_source.as_ref().map(|_| "<dyn>"))
             .finish()
     }
 }
@@ -379,6 +455,7 @@ impl Default for MeshConfig {
             node_status: None,
             blobs_dir: None,
             range_source: None,
+            bench_source: None,
         }
     }
 }

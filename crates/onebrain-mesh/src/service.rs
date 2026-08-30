@@ -31,7 +31,10 @@ use crate::pairing::{
     PairOutcome,
 };
 use crate::store::{PeerRecord, PeerStore};
-use crate::{MeshConfig, MeshError, NodeStatusFn, PairTarget, PeerState, PeerStatus};
+use crate::{
+    BenchSource, MeshConfig, MeshError, NodeStatusFn, PairTarget, PeerBenchReport, PeerState,
+    PeerStatus,
+};
 
 /// ALPN for pairing exchanges. Accepted from ANY endpoint while (and only
 /// while) a pairing window is open.
@@ -67,6 +70,12 @@ const DIAL_TIMEOUT: Duration = Duration::from_secs(30);
 /// is a manifest read on the peer, so anything slower means the link or the
 /// peer is in trouble and the downloader should fall back to the WAN.
 const RANGE_QUERY_TIMEOUT: Duration = Duration::from_secs(15);
+/// Bound on waiting for a peer's `BenchReport` reply. Deliberately much
+/// longer than [`RANGE_QUERY_TIMEOUT`]: the peer runs a REAL prefill+decode
+/// microbench on demand (seconds on slow hardware). Beyond this the peer or
+/// the link is in trouble and `bench --cluster` should report it
+/// unbenchable rather than hang the whole table.
+const BENCH_QUERY_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// A newly paired (or requested) peer: id + final (deduplicated) name.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -234,6 +243,10 @@ enum Internal {
         peer: String,
         model: String,
         reply: oneshot::Sender<Result<PeerRangeInventory, MeshError>>,
+    },
+    BenchQuery {
+        peer: String,
+        reply: oneshot::Sender<Result<PeerBenchReport, MeshError>>,
     },
     Shutdown {
         reply: oneshot::Sender<()>,
@@ -702,6 +715,20 @@ impl MeshHandle {
             .await?
     }
 
+    /// Ask a connected peer (by name or endpoint id) to run its compute/disk
+    /// microbench on demand and report the result (M7 `onebrain bench
+    /// --cluster`, docs/perf.md §10). The exchange rides one short-lived
+    /// `Control` stream — request out, report back on the SAME stream (like
+    /// [`Self::range_query`]) — so replies never mix into the daemon's
+    /// control consumer. A reply with [`PeerBenchReport::is_unavailable`]
+    /// means the peer cannot bench right now (no [`BenchSource`] wired, or
+    /// it declined); treat it as "no data", never as zero throughput.
+    pub async fn bench_query(&self, peer: &str) -> Result<PeerBenchReport, MeshError> {
+        let peer = peer.to_string();
+        self.request(|reply| Internal::BenchQuery { peer, reply })
+            .await?
+    }
+
     /// Stop the service: close every mesh connection and the endpoint.
     /// Idempotent — succeeds if the service is already gone.
     pub async fn shutdown(&self) -> Result<(), MeshError> {
@@ -814,6 +841,16 @@ impl Service {
                     Ok(conn) => {
                         tokio::spawn(async move {
                             let _ = reply.send(range_query_exchange(&conn, model).await);
+                        });
+                    }
+                    Err(err) => {
+                        let _ = reply.send(Err(err));
+                    }
+                },
+                Internal::BenchQuery { peer, reply } => match self.resolve_conn(&peer) {
+                    Ok(conn) => {
+                        tokio::spawn(async move {
+                            let _ = reply.send(bench_query_exchange(&conn).await);
                         });
                     }
                     Err(err) => {
@@ -1418,6 +1455,7 @@ impl Service {
             ctrl_tx: self.ctrl_tx.clone(),
             event_tx: self.event_tx.clone(),
             range_source: self.cfg.range_source.clone(),
+            bench_source: self.cfg.bench_source.clone(),
         };
         let runner = tokio::spawn(session_runner(ctx));
         self.sessions.insert(
@@ -1699,6 +1737,9 @@ struct SessionCtx {
     event_tx: mpsc::Sender<PeerEvent>,
     /// Answers this peer's `RangeQuery`s; `None` replies "no ranges".
     range_source: Option<Arc<dyn RangeInventorySource>>,
+    /// Answers this peer's `BenchRequest`s; `None` replies with the
+    /// cannot-bench-now marker.
+    bench_source: Option<Arc<dyn BenchSource>>,
 }
 
 /// The remote transport addresses of a connection's live QUIC paths, split
@@ -1847,6 +1888,7 @@ async fn run_session(ctx: &SessionCtx) -> SessionEnd {
             ctrl_tx: ctx.ctrl_tx.clone(),
             event_tx: ctx.event_tx.clone(),
             range_source: ctx.range_source.clone(),
+            bench_source: ctx.bench_source.clone(),
         },
     ));
     workers.spawn(uni_drainer(ctx.conn.clone()));
@@ -1959,6 +2001,43 @@ async fn range_query_exchange(
         } => Ok(PeerRangeInventory { total_size, ranges }),
         other => Err(MeshError::Stream {
             detail: format!("expected RangeInventory as the query reply, got {other:?}"),
+        }),
+    }
+}
+
+/// One `BenchRequest` → `BenchReport` exchange on a fresh short-lived
+/// `Control` stream (M7 `bench --cluster`, docs/perf.md §10) — the same
+/// reply-on-one-stream pattern as [`range_query_exchange`], so the report
+/// never mixes into the daemon's control consumer. The generous timeout
+/// covers a real on-demand microbench on the peer.
+async fn bench_query_exchange(conn: &Connection) -> Result<PeerBenchReport, MeshError> {
+    let (mut tx, mut rx) = conn.open_bi().await.map_err(stream_err)?;
+    write_frame(&mut tx, &control_header()).await?;
+    write_frame(&mut tx, &Envelope::new(Message::BenchRequest {})).await?;
+    let _ = tx.finish();
+    let envelope = match timeout(BENCH_QUERY_TIMEOUT, read_frame::<Envelope>(&mut rx)).await {
+        Ok(result) => result?,
+        Err(_) => {
+            return Err(MeshError::Timeout {
+                what: "bench query",
+                secs: BENCH_QUERY_TIMEOUT.as_secs(),
+            })
+        }
+    };
+    match envelope.message {
+        Message::BenchReport {
+            prefill_tps,
+            decode_tps,
+            disk_mbps,
+            measured_unix,
+        } => Ok(PeerBenchReport {
+            prefill_tps,
+            decode_tps,
+            disk_mbps,
+            measured_unix,
+        }),
+        other => Err(MeshError::Stream {
+            detail: format!("expected BenchReport as the query reply, got {other:?}"),
         }),
     }
 }
@@ -2116,6 +2195,9 @@ struct StreamPeerCtx {
     event_tx: mpsc::Sender<PeerEvent>,
     /// Answers the peer's `RangeQuery`s; `None` replies "no ranges".
     range_source: Option<Arc<dyn RangeInventorySource>>,
+    /// Answers the peer's `BenchRequest`s; `None` replies with the
+    /// cannot-bench-now marker.
+    bench_source: Option<Arc<dyn BenchSource>>,
 }
 
 /// Accept the peer's bi-streams and dispatch them by their `StreamHeader`
@@ -2222,6 +2304,40 @@ async fn control_stream(ctx: StreamPeerCtx, mut tx: SendStream, mut rx: RecvStre
                         model: model.clone(),
                         total_size,
                         ranges,
+                    });
+                    if write_frame(&mut tx, &reply).await.is_err() {
+                        return;
+                    }
+                    continue;
+                }
+                if matches!(envelope.message, Message::BenchRequest {}) {
+                    // Answered in-mesh on the SAME stream (the RangeQuery
+                    // pattern, M7 docs/perf.md §10); the request never
+                    // reaches the daemon's control consumer. Missing source
+                    // or a source that declines = the wire contract's
+                    // cannot-bench-now marker (measured_unix = 0).
+                    let report = match ctx.bench_source.clone() {
+                        Some(source) => {
+                            // Off the runtime: a real microbench runs a
+                            // prefill+decode workload and may take seconds.
+                            tokio::task::spawn_blocking(move || source.bench())
+                                .await
+                                .ok()
+                                .flatten()
+                        }
+                        None => None,
+                    }
+                    .unwrap_or(PeerBenchReport::UNAVAILABLE);
+                    debug!(
+                        peer = %peer.fmt_short(),
+                        unavailable = report.is_unavailable(),
+                        "answering bench request"
+                    );
+                    let reply = Envelope::new(Message::BenchReport {
+                        prefill_tps: report.prefill_tps,
+                        decode_tps: report.decode_tps,
+                        disk_mbps: report.disk_mbps,
+                        measured_unix: report.measured_unix,
                     });
                     if write_frame(&mut tx, &reply).await.is_err() {
                         return;

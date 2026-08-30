@@ -151,6 +151,36 @@ pub enum Message {
         /// blob address (both are plain BLAKE3 of content).
         ranges: Vec<(u64, u64, [u8; 32])>,
     },
+    /// Ask a peer to run its compute/disk microbench (the M4 `onebrain
+    /// bench` measurement) on demand and report the result — M7 `onebrain
+    /// bench --cluster`, docs/perf.md §10. Appended as a NEW message kind
+    /// (postcard keeps earlier variant tags stable) and gated on the
+    /// `CLUSTER_BENCH` capability bit; `PROTO_VERSION` 5 accompanies it per
+    /// the M6 precedent. The peer answers on the SAME control stream with
+    /// [`Message::BenchReport`] — the mesh handles the exchange like a
+    /// heartbeat echo (the `RangeQuery` pattern), so requesters never have
+    /// to correlate replies out of the shared control-consumer firehose.
+    BenchRequest {},
+    /// Reply to [`Message::BenchRequest`]: the sender's fresh microbench
+    /// figures. `measured_unix == 0` is the reserved cannot-bench-now
+    /// marker (no bench wired up, or the node is busy generating); the
+    /// throughput fields are meaningless then and the caller must treat the
+    /// peer as unbenchable this round — never as measuring 0 tok/s.
+    /// Introduced with `PROTO_VERSION` 5 / `CLUSTER_BENCH` alongside
+    /// `BenchRequest`.
+    BenchReport {
+        /// Measured prefill throughput (tokens/sec).
+        prefill_tps: f64,
+        /// Measured decode throughput (tokens/sec).
+        decode_tps: f64,
+        /// Measured sequential disk read rate (MB/s). An upper bound (OS
+        /// page cache) used only for relative ordering, exactly like
+        /// `NodeStatus.disk_mbps`.
+        disk_mbps: f64,
+        /// Unix seconds when the microbench finished; `0` = the
+        /// cannot-bench-now marker described above.
+        measured_unix: u64,
+    },
 }
 
 /// Wire envelope: message plus the sender's view of the active epoch.
@@ -339,6 +369,63 @@ mod tests {
                 assert!(ranges.is_empty());
             }
             other => panic!("expected RangeInventory, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bench_request_roundtrip() {
+        let env = Envelope::new(Message::BenchRequest {});
+        let bytes = crate::encode(&env).unwrap();
+        let back: Envelope = crate::decode(&bytes).unwrap();
+        assert!(matches!(back.message, Message::BenchRequest {}));
+    }
+
+    #[test]
+    fn bench_report_roundtrip() {
+        // Values mirror the M4 microbench shape carried by NodeStatus; every
+        // field must survive the wire bit-exact (f64 throughputs included).
+        let env = Envelope::new(Message::BenchReport {
+            prefill_tps: 812.5,
+            decode_tps: 41.25,
+            disk_mbps: 1732.0,
+            measured_unix: 1_756_252_800,
+        });
+        let bytes = crate::encode(&env).unwrap();
+        let back: Envelope = crate::decode(&bytes).unwrap();
+        match back.message {
+            Message::BenchReport {
+                prefill_tps,
+                decode_tps,
+                disk_mbps,
+                measured_unix,
+            } => {
+                assert_eq!(prefill_tps, 812.5);
+                assert_eq!(decode_tps, 41.25);
+                assert_eq!(disk_mbps, 1732.0);
+                assert_eq!(measured_unix, 1_756_252_800);
+            }
+            other => panic!("expected BenchReport, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bench_report_roundtrip_unavailable_marker() {
+        // The wire contract's "peer cannot bench right now" reply is
+        // measured_unix == 0; it must encode/decode cleanly so callers can
+        // distinguish "no data" from a real measurement.
+        let env = Envelope::new(Message::BenchReport {
+            prefill_tps: 0.0,
+            decode_tps: 0.0,
+            disk_mbps: 0.0,
+            measured_unix: 0,
+        });
+        let bytes = crate::encode(&env).unwrap();
+        let back: Envelope = crate::decode(&bytes).unwrap();
+        match back.message {
+            Message::BenchReport { measured_unix, .. } => {
+                assert_eq!(measured_unix, 0, "the marker must survive the wire");
+            }
+            other => panic!("expected BenchReport, got {other:?}"),
         }
     }
 

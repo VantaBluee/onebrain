@@ -36,7 +36,12 @@ pub const PRODUCT_NAME: &str = "OneBrain";
 ///   the version bump is mandated by the M6 logistics contract so genuinely
 ///   mixed builds refuse with a truthful message instead of silently
 ///   degrading the zero-WAN guarantee.
-pub const PROTO_VERSION: u16 = 4;
+/// - `5` — M7: new `BenchRequest`/`BenchReport` message kinds for on-demand
+///   cluster benchmarking (`onebrain bench --cluster`, docs/perf.md §10),
+///   riding the `CLUSTER_BENCH` capability bit (lit as of this build). The
+///   bump follows the M6 precedent: genuinely mixed builds refuse with a
+///   truthful message instead of one side silently never answering benches.
+pub const PROTO_VERSION: u16 = 5;
 
 /// Errors produced while encoding or decoding protocol messages.
 #[derive(Debug, thiserror::Error)]

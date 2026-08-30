@@ -22,14 +22,20 @@ impl Capabilities {
     pub const SPECULATIVE: u64 = 1 << 3;
     /// int8 activation compression on slow links (M7, flagged).
     pub const ACT_COMPRESSION: u64 = 1 << 4;
+    /// On-demand cluster benchmarking (M7): answers `BenchRequest` with a
+    /// fresh microbench `BenchReport` (docs/perf.md §10).
+    pub const CLUSTER_BENCH: u64 = 1 << 5;
 
     /// The capabilities this build of OneBrain implements.
     pub fn current() -> Self {
         // Bits light up as milestones land so that mixed-version clusters
         // degrade gracefully. M3: pipeline-parallel inference. M6: P2P
         // weight-range sharing over blobs (`RangeQuery`/`RangeInventory`
-        // plus the mesh blobs provider, docs/logistics.md).
-        Capabilities(Self::PIPELINE_PARALLEL | Self::BLOB_SHARING)
+        // plus the mesh blobs provider, docs/logistics.md). M7: on-demand
+        // cluster benchmarking (`BenchRequest`/`BenchReport`, docs/perf.md
+        // §10) — every build with the bit answers the request, at minimum
+        // with the cannot-bench-now marker.
+        Capabilities(Self::PIPELINE_PARALLEL | Self::BLOB_SHARING | Self::CLUSTER_BENCH)
     }
 
     pub fn supports(&self, bit: u64) -> bool {
@@ -54,5 +60,17 @@ mod tests {
         assert!(c.supports(Capabilities::PIPELINE_PARALLEL));
         assert!(!c.supports(Capabilities::BLOB_SHARING));
         assert!(!c.supports(Capabilities::SPECULATIVE));
+    }
+
+    #[test]
+    fn current_lights_the_landed_milestones_only() {
+        let caps = Capabilities::current();
+        assert!(caps.supports(Capabilities::PIPELINE_PARALLEL), "M3");
+        assert!(caps.supports(Capabilities::BLOB_SHARING), "M6");
+        assert!(caps.supports(Capabilities::CLUSTER_BENCH), "M7 bench");
+        // Unlanded M7 features stay dark until their milestones ship.
+        assert!(!caps.supports(Capabilities::TENSOR_PARALLEL));
+        assert!(!caps.supports(Capabilities::SPECULATIVE));
+        assert!(!caps.supports(Capabilities::ACT_COMPRESSION));
     }
 }
