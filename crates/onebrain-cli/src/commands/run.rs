@@ -8,20 +8,33 @@ use std::io::Write;
 use onebraind::paths::AppPaths;
 
 use super::{plan_lines, up, CliError};
+use crate::client::LoadOptions;
 
 pub fn run(
     model: &str,
     ctx: Option<u32>,
     explain: bool,
     nodes: Option<u32>,
+    speculative: bool,
+    draft: Option<&str>,
     json: bool,
 ) -> Result<(), CliError> {
     let paths = AppPaths::resolve()?;
     let outcome = up::ensure_up(&paths)?;
     let client = outcome.client;
 
+    let opts = LoadOptions {
+        ctx,
+        nodes,
+        explain,
+        // `--speculative`/`--draft` (docs/perf.md §5): forwarded verbatim;
+        // the daemon owns the draft-selection and same-vocab rules and its
+        // NDJSON error line carries the remedy.
+        speculative,
+        draft,
+    };
     let mut progress_line_open = false;
-    let result = client.load(model, ctx, nodes, explain, |event| {
+    let result = client.load(model, &opts, |event| {
         if json {
             // NDJSON pass-through: scripts see exactly what the daemon sent.
             println!("{event}");

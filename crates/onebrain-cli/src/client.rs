@@ -68,6 +68,24 @@ pub enum ClientError {
     NoTerminal { what: &'static str },
 }
 
+/// Options for [`DaemonClient::load`] beyond the model reference — mirrors
+/// the `/api/internal/load` body (`--nodes`/`--explain` per
+/// docs/distributed.md; `--speculative`/`--draft` per docs/perf.md §5).
+#[derive(Debug, Default, Clone)]
+pub struct LoadOptions<'a> {
+    /// Requested context length (forwarded; the daemon may ignore it).
+    pub ctx: Option<u32>,
+    /// Force a node count (`1` = solo) instead of the auto-plan.
+    pub nodes: Option<u32>,
+    /// Ask for the scheduler's prose explanation on the `plan` line.
+    pub explain: bool,
+    /// Load a speculative draft model alongside the target (the daemon
+    /// picks `[perf] draft_model` when `draft` is not given).
+    pub speculative: bool,
+    /// Explicit draft-model reference (implies speculative daemon-side).
+    pub draft: Option<&'a str>,
+}
+
 /// A connected view of the local daemon's internal API.
 #[derive(Debug)]
 pub struct DaemonClient {
@@ -157,27 +175,33 @@ impl DaemonClient {
     /// `POST /api/internal/load` — NDJSON progress stream. `on_progress`
     /// sees every intermediate line (`downloading`, `planning`, `plan`,
     /// `loading`); the terminal line (`ready` or `error`) is returned
-    /// instead. `nodes`/`explain` pass `--nodes`/`--explain` through per
-    /// docs/distributed.md (M3).
+    /// instead. The options mirror the request body: `nodes`/`explain` per
+    /// docs/distributed.md (M3), `speculative`/`draft` per docs/perf.md §5.
     pub fn load(
         &self,
         model: &str,
-        ctx: Option<u32>,
-        nodes: Option<u32>,
-        explain: bool,
+        opts: &LoadOptions<'_>,
         on_progress: impl FnMut(&serde_json::Value),
     ) -> Result<serde_json::Value, ClientError> {
         let mut body = serde_json::json!({ "model": model });
-        if let Some(n) = ctx {
+        if let Some(n) = opts.ctx {
             // The daemon may ignore unknown fields in M1; sent anyway for
             // forward compatibility.
             body["ctx"] = n.into();
         }
-        if let Some(n) = nodes {
+        if let Some(n) = opts.nodes {
             body["nodes"] = n.into();
         }
-        if explain {
+        if opts.explain {
             body["explain"] = true.into();
+        }
+        if opts.speculative {
+            body["speculative"] = true.into();
+        }
+        if let Some(reference) = opts.draft {
+            // An explicit draft implies speculative daemon-side; sent as
+            // its own field so the daemon owns that rule.
+            body["draft"] = reference.into();
         }
         let url = format!("{}/api/internal/load", self.base_url);
         let resp = self
@@ -265,6 +289,96 @@ impl DaemonClient {
             .post(&url)
             .bearer_auth(&self.token)
             .timeout(Duration::from_secs(120))
+            .send()
+            .map_err(|e| ClientError::Unreachable {
+                url: url.clone(),
+                detail: e.to_string(),
+            })?;
+        Self::success_json(resp)
+    }
+
+    /// `POST /api/internal/bench/peers` — ask every Connected peer to run
+    /// its microbench on demand (docs/perf.md §10). Returns
+    /// `{ "peers": [{ peer, id, available, prefill_tps?, decode_tps?,
+    /// disk_mbps?, measured_unix?, error? }] }` — throughput fields are
+    /// present only when `available` is true. Generous timeout: the daemon
+    /// queries peers concurrently but each bench may take tens of seconds
+    /// (the mesh bounds each reply at 60 s).
+    pub fn bench_peers(&self) -> Result<serde_json::Value, ClientError> {
+        let url = format!("{}/api/internal/bench/peers", self.base_url);
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(&self.token)
+            .timeout(Duration::from_secs(90))
+            .send()
+            .map_err(|e| ClientError::Unreachable {
+                url: url.clone(),
+                detail: e.to_string(),
+            })?;
+        Self::success_json(resp)
+    }
+
+    /// `POST /api/internal/perf` — read or override the runtime-togglable
+    /// `[perf]` levers (docs/perf.md §10). `None` leaves a lever unchanged,
+    /// so two `None`s just read the current values; overrides take effect
+    /// at the daemon's NEXT model load (which is how `bench --cluster`
+    /// constructs the M3 baseline: flip, reload, measure, flip back).
+    /// Returns `{ "prefill_overlap": bool, "kv_reuse": bool, ... }`.
+    pub fn set_perf_toggles(
+        &self,
+        prefill_overlap: Option<bool>,
+        kv_reuse: Option<bool>,
+    ) -> Result<serde_json::Value, ClientError> {
+        let mut body = serde_json::json!({});
+        if let Some(v) = prefill_overlap {
+            body["prefill_overlap"] = v.into();
+        }
+        if let Some(v) = kv_reuse {
+            body["kv_reuse"] = v.into();
+        }
+        let url = format!("{}/api/internal/perf", self.base_url);
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(&self.token)
+            .json(&body)
+            .timeout(Duration::from_secs(10))
+            .send()
+            .map_err(|e| ClientError::Unreachable {
+                url: url.clone(),
+                detail: e.to_string(),
+            })?;
+        Self::success_json(resp)
+    }
+
+    /// `POST /api/generate` — the PUBLIC Ollama dialect, `stream:false`,
+    /// greedy sampling and a fixed budget: the timed end-to-end measurement
+    /// `bench --cluster` reads `prompt_eval_duration`/`eval_duration`
+    /// (nanoseconds, docs/perf.md §1) from. Deliberately generous timeout:
+    /// a large model on a slow cluster legitimately decodes for minutes.
+    pub fn generate_timed(
+        &self,
+        model: &str,
+        prompt: &str,
+        max_tokens: u32,
+    ) -> Result<serde_json::Value, ClientError> {
+        let url = format!("{}/api/generate", self.base_url);
+        let body = serde_json::json!({
+            "model": model,
+            "prompt": prompt,
+            "stream": false,
+            // Greedy (temperature 0) so repeated benches are comparable;
+            // the fixed seed is inert at temperature 0 but pins sampled
+            // paths should a dialect default ever change.
+            "options": { "temperature": 0.0, "num_predict": max_tokens, "seed": 0 },
+        });
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(&self.token)
+            .json(&body)
+            .timeout(Duration::from_secs(600))
             .send()
             .map_err(|e| ClientError::Unreachable {
                 url: url.clone(),

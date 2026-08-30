@@ -50,6 +50,15 @@ enum Command {
         /// Requested context length.
         #[arg(long)]
         ctx: Option<u32>,
+        /// Speculative decoding: also load a draft model (from --draft or
+        /// the config's [perf] draft_model) that proposes tokens the target
+        /// verifies.
+        #[arg(long)]
+        speculative: bool,
+        /// Draft model reference for speculative decoding (implies
+        /// --speculative). Must share the target's vocabulary.
+        #[arg(long)]
+        draft: Option<String>,
     },
     /// Show topology, active plan, endpoint, and API token.
     Status,
@@ -64,7 +73,13 @@ enum Command {
     /// Make a pinned model evictable again.
     Unpin { model: String },
     /// Re-profile this node and its links; print the report.
-    Bench,
+    Bench {
+        /// Also ask every connected peer for a fresh microbench and time an
+        /// end-to-end generation against the constructed M3 baseline and a
+        /// solo run (markdown report; --json for machines).
+        #[arg(long)]
+        cluster: bool,
+    },
     /// Diagnose GPU/driver/firewall/version problems with remedies.
     Doctor,
     /// Stop the daemon, draining politely.
@@ -93,7 +108,17 @@ fn main() {
             explain,
             nodes,
             ctx,
-        } => commands::run::run(&model, ctx, explain, nodes, cli.json),
+            speculative,
+            draft,
+        } => commands::run::run(
+            &model,
+            ctx,
+            explain,
+            nodes,
+            speculative,
+            draft.as_deref(),
+            cli.json,
+        ),
         Command::Status => commands::status::run(cli.json),
         Command::Pull { reference } => commands::pull::run(&reference, cli.json),
         Command::Ls => commands::ls::run(cli.json),
@@ -109,7 +134,7 @@ fn main() {
             commands::pair::run(target.as_deref(), code.as_deref(), cli.json)
         }
         Command::Unpair { name } => commands::unpair::run(&name, cli.json),
-        Command::Bench => commands::bench::run(cli.json),
+        Command::Bench { cluster } => commands::bench::run(cli.json, cluster),
     };
 
     if let Err(err) = outcome {
@@ -144,6 +169,63 @@ mod tests {
         }
         // The model argument is mandatory — a bare `pin` is a usage error.
         assert!(Cli::try_parse_from(["onebrain", "pin"]).is_err());
+    }
+
+    #[test]
+    fn run_parses_speculative_and_draft() {
+        let cli = Cli::try_parse_from(["onebrain", "run", "qwen3-4b", "--speculative"]).unwrap();
+        match cli.command {
+            Some(Command::Run {
+                model,
+                speculative,
+                draft,
+                ..
+            }) => {
+                assert_eq!(model, "qwen3-4b");
+                assert!(speculative);
+                assert!(draft.is_none());
+            }
+            _ => panic!("expected Run"),
+        }
+        // --draft alone implies speculative daemon-side; the CLI just
+        // forwards both fields.
+        let cli =
+            Cli::try_parse_from(["onebrain", "run", "qwen3-4b", "--draft", "qwen3-0.6b"]).unwrap();
+        match cli.command {
+            Some(Command::Run {
+                speculative, draft, ..
+            }) => {
+                assert!(!speculative);
+                assert_eq!(draft.as_deref(), Some("qwen3-0.6b"));
+            }
+            _ => panic!("expected Run"),
+        }
+        // A bare run keeps both off.
+        let cli = Cli::try_parse_from(["onebrain", "run", "m"]).unwrap();
+        match cli.command {
+            Some(Command::Run {
+                speculative, draft, ..
+            }) => {
+                assert!(!speculative);
+                assert!(draft.is_none());
+            }
+            _ => panic!("expected Run"),
+        }
+    }
+
+    #[test]
+    fn bench_parses_the_cluster_flag() {
+        let cli = Cli::try_parse_from(["onebrain", "bench"]).unwrap();
+        match cli.command {
+            Some(Command::Bench { cluster }) => assert!(!cluster),
+            _ => panic!("expected Bench"),
+        }
+        let cli = Cli::try_parse_from(["onebrain", "bench", "--cluster", "--json"]).unwrap();
+        assert!(cli.json);
+        match cli.command {
+            Some(Command::Bench { cluster }) => assert!(cluster),
+            _ => panic!("expected Bench"),
+        }
     }
 
     #[test]
