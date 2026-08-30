@@ -148,14 +148,32 @@ bool ob_token_is_eog(const ob_model * m, int32_t token) {
     return llama_vocab_is_eog(m->vocab, token);
 }
 
-ob_session * ob_session_new(ob_model * m, uint32_t n_ctx, uint32_t n_batch, int32_t n_threads) {
-    struct llama_context_params params = llama_context_default_params();
-    params.n_ctx = n_ctx;
-    params.n_batch = n_batch;
-    if (n_threads > 0) {
-        params.n_threads = n_threads;
-        params.n_threads_batch = n_threads;
+ob_session * ob_session_new(ob_model * m, const ob_session_params * p) {
+    if (p == NULL) {
+        return NULL;
     }
+    // Start from llama.cpp's defaults and override only what
+    // ob_session_params carries: a zero scalar keeps the engine default, so
+    // the widened struct with default values reproduces the pre-widening
+    // session bit-for-bit (docs/perf.md §2).
+    struct llama_context_params params = llama_context_default_params();
+    params.n_ctx = p->n_ctx;
+    params.n_batch = p->n_batch;
+    if (p->n_ubatch > 0) {
+        params.n_ubatch = p->n_ubatch;
+    }
+    if (p->n_seq_max > 0) {
+        params.n_seq_max = p->n_seq_max;
+    }
+    if (p->n_threads > 0) {
+        params.n_threads = p->n_threads;
+        params.n_threads_batch = p->n_threads;
+    }
+    params.flash_attn_type = (enum llama_flash_attn_type) p->flash_attn_type;
+    params.type_k = (enum ggml_type) p->type_k;
+    params.type_v = (enum ggml_type) p->type_v;
+    params.kv_unified = p->kv_unified;
+    params.offload_kqv = p->offload_kqv;
 
     struct llama_context * ctx = llama_init_from_model(m->model, params);
     if (ctx == NULL) {
@@ -243,6 +261,93 @@ void ob_session_set_sampler(ob_session * s, float temp, float top_p,
 
 int32_t ob_sample(ob_session * s) {
     return llama_sampler_sample(s->sampler, s->ctx, -1);
+}
+
+// ---- explicit multi-sequence batches (docs/perf.md §2) ----
+
+struct ob_batch {
+    struct llama_batch batch;
+    int32_t capacity;
+    int32_t n_seq_max;
+};
+
+ob_batch * ob_batch_new(int32_t n_tokens_max, int32_t n_seq_max) {
+    if (n_tokens_max <= 0 || n_seq_max <= 0) {
+        return NULL;
+    }
+    ob_batch * b = calloc(1, sizeof(ob_batch));
+    if (b == NULL) {
+        return NULL;
+    }
+    // llama_batch_init allocates every per-token array (token/pos/n_seq_id/
+    // seq_id/logits) at n_tokens_max and leaves n_tokens = 0.
+    b->batch = llama_batch_init(n_tokens_max, /*embd=*/0, n_seq_max);
+    b->capacity = n_tokens_max;
+    b->n_seq_max = n_seq_max;
+    return b;
+}
+
+void ob_batch_free(ob_batch * b) {
+    if (b == NULL) {
+        return;
+    }
+    llama_batch_free(b->batch);
+    free(b);
+}
+
+void ob_batch_clear(ob_batch * b) {
+    b->batch.n_tokens = 0;
+}
+
+bool ob_batch_push(ob_batch * b, int32_t token, int32_t pos, int32_t seq_id, bool logits) {
+    if (b->batch.n_tokens >= b->capacity || seq_id < 0 || seq_id >= b->n_seq_max) {
+        return false;
+    }
+    const int32_t i = b->batch.n_tokens;
+    b->batch.token[i] = token;
+    b->batch.pos[i] = pos;
+    // Exactly one sequence id per token: shared prefixes go through
+    // ob_memory_seq_cp instead of multi-tagging, so rollback (seq_rm) never
+    // has to reason about tokens co-owned by other sequences.
+    b->batch.n_seq_id[i] = 1;
+    b->batch.seq_id[i][0] = seq_id;
+    b->batch.logits[i] = logits ? 1 : 0;
+    b->batch.n_tokens = i + 1;
+    return true;
+}
+
+int32_t ob_batch_n_tokens(const ob_batch * b) {
+    return b->batch.n_tokens;
+}
+
+int32_t ob_decode_batch(ob_session * s, const ob_batch * b) {
+    if (b->batch.n_tokens <= 0) {
+        return -1;
+    }
+    return llama_decode(s->ctx, b->batch);
+}
+
+int32_t ob_sample_ith(ob_session * s, int32_t i) {
+    return llama_sampler_sample(s->sampler, s->ctx, i);
+}
+
+// ---- per-sequence KV surgery (docs/perf.md §2) ----
+
+bool ob_memory_seq_rm(ob_session * s, int32_t seq_id, int32_t p0, int32_t p1) {
+    return llama_memory_seq_rm(llama_get_memory(s->ctx), seq_id, p0, p1);
+}
+
+void ob_memory_seq_cp(ob_session * s, int32_t seq_id_src, int32_t seq_id_dst,
+                      int32_t p0, int32_t p1) {
+    llama_memory_seq_cp(llama_get_memory(s->ctx), seq_id_src, seq_id_dst, p0, p1);
+}
+
+void ob_memory_seq_keep(ob_session * s, int32_t seq_id) {
+    llama_memory_seq_keep(llama_get_memory(s->ctx), seq_id);
+}
+
+int32_t ob_memory_seq_pos_max(ob_session * s, int32_t seq_id) {
+    return llama_memory_seq_pos_max(llama_get_memory(s->ctx), seq_id);
 }
 
 int32_t ob_dev_count(void) {

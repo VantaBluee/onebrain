@@ -135,8 +135,39 @@ int32_t ob_chat_apply_template(const ob_model * m,
                                bool add_assistant, char * buf, int32_t buf_len);
 
 // ---- session: one llama_context + a sampler chain ----
-// Returns NULL on failure. n_threads <= 0 lets the engine pick.
-ob_session * ob_session_new(ob_model * m, uint32_t n_ctx, uint32_t n_batch, int32_t n_threads);
+
+// Session creation parameters (perf contract, docs/perf.md §2). This struct
+// is OWNED BY THE SHIM (not a llama.cpp mirror): sys.rs mirrors it with
+// #[repr(C)], and both sides live in this crate, so the two definitions can
+// only drift together. Zero-values mean "engine default" for the scalar
+// fields noted below; the bool fields carry their value directly, so Rust
+// must set them explicitly (its Default mirrors llama.cpp's defaults).
+typedef struct ob_session_params {
+    uint32_t n_ctx;     // context length
+    uint32_t n_batch;   // logical max tokens per llama_decode call
+    // Physical micro-batch: llama_decode splits each call into n_ubatch
+    // slices (per-slice activations bound distributed transfer cost —
+    // docs/perf.md §0/§3). 0 = engine default (512).
+    uint32_t n_ubatch;
+    // Max concurrent sequences in this context (micro-batched decode,
+    // docs/perf.md §6). 0 = engine default (1).
+    uint32_t n_seq_max;
+    int32_t  n_threads; // <= 0 lets the engine pick
+    // Mirrors enum llama_flash_attn_type: -1 AUTO, 0 disabled, 1 enabled.
+    int32_t  flash_attn_type;
+    // ggml_type codes for the KV cache (0 = F32, 1 = F16, 2 = Q4_0,
+    // 8 = Q8_0). llama.cpp's default is F16 for both.
+    int32_t  type_k;
+    int32_t  type_v;
+    // One KV buffer shared across sequences: required for the §6 unified-KV
+    // admission headroom math. llama.cpp's default is false.
+    bool     kv_unified;
+    // Offload KQV ops (incl. the KV cache) to GPU. llama.cpp default: true.
+    bool     offload_kqv;
+} ob_session_params;
+
+// Returns NULL on failure (including p == NULL).
+ob_session * ob_session_new(ob_model * m, const ob_session_params * p);
 void ob_session_free(ob_session * s);
 // Decode tokens (appended to the tracked position). 0 = ok; llama_decode
 // codes otherwise (1 = no KV slot, 2 = aborted, <0 = error).
@@ -153,6 +184,58 @@ void ob_session_set_sampler(ob_session * s, float temp, float top_p,
                             int32_t top_k, uint32_t seed);
 // Sample from the last decoded logits with the configured chain.
 int32_t ob_sample(ob_session * s);
+
+// ---- explicit multi-sequence batches (docs/perf.md §2) ----
+// A reusable token batch with per-token position, sequence id, and logits
+// flag — the substrate for KV reuse (§4), speculative verify (§5), and
+// micro-batched decode (§6). Thin wrappers over llama_batch_init /
+// llama_decode; no policy lives here.
+//
+// POSITION RULE (upstream-enforced, llama-batch.cpp consistency checks):
+// each sequence's positions must stay consecutive — the first position a
+// batch adds to a sequence must be exactly seq_pos_max + 1, and positions
+// within the batch ascend by 1 per sequence. Rolling back is a real
+// ob_memory_seq_rm of the divergent suffix, never a rewound counter.
+typedef struct ob_batch ob_batch;
+
+// Allocate a batch holding up to n_tokens_max tokens, each taggable with a
+// sequence id in [0, n_seq_max). Returns NULL on invalid args or OOM.
+ob_batch * ob_batch_new(int32_t n_tokens_max, int32_t n_seq_max);
+void ob_batch_free(ob_batch * b);
+// Drop all queued tokens (capacity is retained for reuse).
+void ob_batch_clear(ob_batch * b);
+// Append one token; `logits` asks the decode to produce logits for this
+// position (sample with ob_sample_ith at the index this token got, i.e.
+// the batch length before the push). Each token carries exactly one
+// sequence id — shared prefixes are expressed via ob_memory_seq_cp, never
+// by multi-tagging. Returns false when the batch is full or seq_id is out
+// of range.
+bool ob_batch_push(ob_batch * b, int32_t token, int32_t pos, int32_t seq_id, bool logits);
+int32_t ob_batch_n_tokens(const ob_batch * b);
+// Decode the queued tokens in one llama_decode call. Same return codes as
+// ob_decode (0 = ok, 1 = no KV slot, 2 = aborted, <0 = error); -1 for an
+// empty batch.
+int32_t ob_decode_batch(ob_session * s, const ob_batch * b);
+// Sample with the session's configured chain from the logits of batch
+// token index i (only valid for indexes pushed with logits=true in the
+// most recent decode; -1 = last output).
+int32_t ob_sample_ith(ob_session * s, int32_t i);
+
+// ---- per-sequence KV surgery (docs/perf.md §2) ----
+// Thin wrappers over llama_memory_seq_*. p0/p1 follow upstream range
+// conventions: p0 < 0 means "from 0", p1 < 0 means "to the end"; the range
+// is [p0, p1).
+// Remove a position range from one sequence. Returns false when a partial
+// range cannot be removed (recurrent/SWA memories); removing a whole
+// sequence never fails.
+bool ob_memory_seq_rm(ob_session * s, int32_t seq_id, int32_t p0, int32_t p1);
+// Copy a position range from one sequence to another (cheap KV sharing).
+void ob_memory_seq_cp(ob_session * s, int32_t seq_id_src, int32_t seq_id_dst,
+                      int32_t p0, int32_t p1);
+// Drop every sequence except seq_id.
+void ob_memory_seq_keep(ob_session * s, int32_t seq_id);
+// Largest position present for seq_id, or -1 when the sequence is empty.
+int32_t ob_memory_seq_pos_max(ob_session * s, int32_t seq_id);
 
 #ifdef __cplusplus
 }

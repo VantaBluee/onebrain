@@ -12,11 +12,15 @@ mod sys;
 use std::ffi::{CStr, CString};
 use std::path::Path;
 use std::sync::Once;
+use std::time::Instant;
 
 use onebrain_proto::handshake::EngineBuildHash;
 
 /// Token id in the model's vocabulary.
 pub type Token = i32;
+
+/// Sequence id within a session's KV memory (`0..n_seq_max`).
+pub type SeqId = i32;
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -87,6 +91,27 @@ pub enum EngineError {
          listed in split order (part -00001- first); `onebrain doctor` shows free memory."
     )]
     SplitLoad { first: String, n_parts: usize },
+    #[error(
+        "failed to allocate a token batch ({capacity} tokens, {n_seq_max} sequences); \
+         both must be at least 1 and the process must have free memory."
+    )]
+    BatchAlloc { capacity: usize, n_seq_max: usize },
+    #[error(
+        "the token batch is full ({capacity} tokens); decode it (or clear it) before \
+         pushing more, or create it with a larger capacity."
+    )]
+    BatchFull { capacity: usize },
+    #[error(
+        "sequence id {seq_id} is out of range for this batch (n_seq_max {n_seq_max}); \
+         create the batch (and the session) with n_seq_max covering every sequence used."
+    )]
+    BatchSeqId { seq_id: i32, n_seq_max: i32 },
+    #[error(
+        "could not remove positions [{p0}, {p1}) of sequence {seq_id}: this model's \
+         memory cannot drop a partial position range (recurrent / SWA models); roll \
+         back by clearing the whole sequence instead."
+    )]
+    SeqRemove { seq_id: i32, p0: i32, p1: i32 },
     #[error("RPC tensor cache directory path contains an interior NUL byte: {0}")]
     BadCacheDir(String),
     #[error(
@@ -564,7 +589,56 @@ impl Drop for Model {
     }
 }
 
-/// Options for creating a [`Session`].
+/// When to enable Flash Attention (mirrors `llama_flash_attn_type`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FlashAttnType {
+    /// Let the engine decide per model/backend (llama.cpp's default).
+    #[default]
+    Auto,
+    Disabled,
+    Enabled,
+}
+
+impl FlashAttnType {
+    fn code(self) -> i32 {
+        match self {
+            FlashAttnType::Auto => -1,
+            FlashAttnType::Disabled => 0,
+            FlashAttnType::Enabled => 1,
+        }
+    }
+}
+
+/// Element type for the KV cache (the `ggml_type` subset OneBrain exposes).
+/// Quantized KV trades accuracy for memory; F16 is llama.cpp's default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[allow(non_camel_case_types)] // Q8_0/Q4_0 are the upstream quant names
+pub enum KvCacheType {
+    #[default]
+    F16,
+    F32,
+    Q8_0,
+    Q4_0,
+}
+
+impl KvCacheType {
+    fn code(self) -> i32 {
+        // ggml_type enum values (ggml.h); the shim casts them back.
+        match self {
+            KvCacheType::F32 => 0,
+            KvCacheType::F16 => 1,
+            KvCacheType::Q4_0 => 2,
+            KvCacheType::Q8_0 => 8,
+        }
+    }
+}
+
+/// Options for creating a [`Session`] (perf contract, docs/perf.md §2).
+///
+/// The `Default` values reproduce the pre-M7 session EXACTLY (each new
+/// field defaults to what llama.cpp already chose when the field was not
+/// exposed), so existing callers that spread `..SessionParams::default()`
+/// keep today's behavior bit-for-bit.
 #[derive(Debug, Clone)]
 pub struct SessionParams {
     pub n_ctx: u32,
@@ -572,6 +646,25 @@ pub struct SessionParams {
     pub n_batch: u32,
     /// <= 0 lets the engine choose.
     pub n_threads: i32,
+    /// Physical micro-batch: `llama_decode` splits each `n_batch` chunk
+    /// into `n_ubatch` slices internally; per-slice activation copies bound
+    /// distributed prefill cost (docs/perf.md §0/§3). 0 = engine default;
+    /// the engine also caps it at `n_batch`.
+    pub n_ubatch: u32,
+    /// Max concurrent sequences in this context (micro-batched decode,
+    /// docs/perf.md §6). Sequence ids passed to [`Batch::push`] and the
+    /// `seq_*` methods must stay below this.
+    pub n_seq_max: u32,
+    /// One KV buffer shared across sequences instead of one per sequence —
+    /// the §6 admission headroom math assumes this layout when running
+    /// concurrent requests.
+    pub kv_unified: bool,
+    pub flash_attn_type: FlashAttnType,
+    /// KV cache element types (K and V independently).
+    pub type_k: KvCacheType,
+    pub type_v: KvCacheType,
+    /// Offload the KQV ops (including the KV cache) to GPU backends.
+    pub offload_kqv: bool,
 }
 
 impl Default for SessionParams {
@@ -580,6 +673,32 @@ impl Default for SessionParams {
             n_ctx: 4096,
             n_batch: 512,
             n_threads: 0,
+            // llama.cpp's own default; spelled out because it becomes a
+            // `[perf]` config knob (docs/perf.md §3).
+            n_ubatch: 512,
+            n_seq_max: 1,
+            kv_unified: false,
+            flash_attn_type: FlashAttnType::Auto,
+            type_k: KvCacheType::F16,
+            type_v: KvCacheType::F16,
+            offload_kqv: true,
+        }
+    }
+}
+
+impl SessionParams {
+    fn to_ffi(&self) -> sys::ObSessionParams {
+        sys::ObSessionParams {
+            n_ctx: self.n_ctx,
+            n_batch: self.n_batch,
+            n_ubatch: self.n_ubatch,
+            n_seq_max: self.n_seq_max,
+            n_threads: self.n_threads,
+            flash_attn_type: self.flash_attn_type.code(),
+            type_k: self.type_k.code(),
+            type_v: self.type_v.code(),
+            kv_unified: self.kv_unified,
+            offload_kqv: self.offload_kqv,
         }
     }
 }
@@ -619,11 +738,161 @@ pub enum FinishReason {
 }
 
 /// Outcome of one [`Session::generate`] call.
+///
+/// The wall-clock fields are measured inside `generate` itself (perf
+/// contract §1: timing lands before any optimization, so every M7 lever has
+/// the instrument that proves it). Milliseconds as `f64` because the sim
+/// model decodes in microseconds — integer ms would round real work to 0.
 #[derive(Debug, Clone, Copy)]
 pub struct GenerationStats {
     pub prompt_tokens: usize,
     pub generated_tokens: usize,
     pub finished: FinishReason,
+    /// Wall-clock of the prompt prefill decode, in milliseconds.
+    pub prefill_ms: f64,
+    /// Wall-clock of the sample/decode loop (everything after prefill), in
+    /// milliseconds.
+    pub decode_ms: f64,
+    /// Time from `generate` entry to the first emitted piece, in
+    /// milliseconds; 0 when nothing was emitted (immediate EOG).
+    pub ttft_ms: f64,
+    /// Speculative decoding counters (docs/perf.md §5); always 0 until the
+    /// speculative loop lands.
+    pub drafted: u32,
+    pub accepted: u32,
+}
+
+/// A reusable multi-sequence token batch (perf contract, docs/perf.md §2):
+/// per-token position, sequence id, and logits flag, decoded in one engine
+/// call via [`Session::decode_batch`]. The substrate for KV reuse (§4),
+/// speculative verify (§5), and micro-batched decode (§6) — no scheduling
+/// policy lives here.
+///
+/// # Position rule (upstream-enforced)
+///
+/// A sequence's positions must stay CONSECUTIVE: the first position a batch
+/// adds to a sequence must be exactly `seq_pos_max + 1` (0 for an empty
+/// sequence), and further pushes to that sequence ascend by 1. llama.cpp
+/// rejects the decode otherwise (llama-batch.cpp consistency checks).
+/// Rolling back is a real [`Session::seq_rm`] of the divergent suffix,
+/// never a rewound counter — the KV cache holds state per position, so a
+/// "rewound" position would silently attend to stale entries. Both rules
+/// are debug-asserted here and in [`Session::decode_batch`].
+pub struct Batch {
+    ptr: *mut sys::ObBatch,
+    capacity: usize,
+    n_seq_max: i32,
+    /// (seq_id, first_pos, last_pos) per sequence present in the batch.
+    /// Tiny linear-scan bookkeeping that powers the position-rule debug
+    /// assertions and lets `decode_batch` verify continuity against the
+    /// session's KV state cheaply (one entry per sequence, not per token).
+    seqs: Vec<(SeqId, i32, i32)>,
+}
+
+// The batch owns plain heap arrays with no thread affinity.
+unsafe impl Send for Batch {}
+
+impl Batch {
+    /// Allocate a batch holding up to `capacity` tokens tagged with
+    /// sequence ids in `0..n_seq_max`. Reuse one batch across decode steps
+    /// (via [`Batch::clear`]) instead of reallocating per step.
+    pub fn new(capacity: usize, n_seq_max: usize) -> Result<Batch, EngineError> {
+        let alloc_err = EngineError::BatchAlloc {
+            capacity,
+            n_seq_max,
+        };
+        if capacity == 0 || n_seq_max == 0 || capacity > i32::MAX as usize {
+            return Err(alloc_err);
+        }
+        let Ok(n_seq) = i32::try_from(n_seq_max) else {
+            return Err(alloc_err);
+        };
+        let ptr = unsafe { sys::ob_batch_new(capacity as i32, n_seq) };
+        if ptr.is_null() {
+            return Err(alloc_err);
+        }
+        Ok(Batch {
+            ptr,
+            capacity,
+            n_seq_max: n_seq,
+            seqs: Vec::new(),
+        })
+    }
+
+    /// Append one token. `logits` requests logits for this position — the
+    /// returned batch index is what [`Session::sample_ith`] takes after the
+    /// decode. Each token carries exactly one sequence id; shared prefixes
+    /// are expressed with [`Session::seq_cp`], never by multi-tagging.
+    pub fn push(
+        &mut self,
+        token: Token,
+        pos: i32,
+        seq_id: SeqId,
+        logits: bool,
+    ) -> Result<usize, EngineError> {
+        let index = self.len();
+        if index >= self.capacity {
+            return Err(EngineError::BatchFull {
+                capacity: self.capacity,
+            });
+        }
+        if seq_id < 0 || seq_id >= self.n_seq_max {
+            return Err(EngineError::BatchSeqId {
+                seq_id,
+                n_seq_max: self.n_seq_max,
+            });
+        }
+        match self.seqs.iter_mut().find(|(s, _, _)| *s == seq_id) {
+            Some(entry) => {
+                debug_assert_eq!(
+                    pos,
+                    entry.2 + 1,
+                    "positions within a batch must ascend consecutively per \
+                     sequence (seq {seq_id}: pushed pos {pos} after {})",
+                    entry.2
+                );
+                entry.2 = pos;
+            }
+            None => self.seqs.push((seq_id, pos, pos)),
+        }
+        let ok = unsafe { sys::ob_batch_push(self.ptr, token, pos, seq_id, logits) };
+        debug_assert!(ok, "shim push rejected an argument lib.rs validated");
+        Ok(index)
+    }
+
+    /// Drop all queued tokens; capacity is retained.
+    pub fn clear(&mut self) {
+        unsafe { sys::ob_batch_clear(self.ptr) };
+        self.seqs.clear();
+    }
+
+    /// Number of tokens currently queued.
+    pub fn len(&self) -> usize {
+        (unsafe { sys::ob_batch_n_tokens(self.ptr) }).max(0) as usize
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Maximum tokens this batch can hold.
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+}
+
+impl Drop for Batch {
+    fn drop(&mut self) {
+        unsafe { sys::ob_batch_free(self.ptr) };
+    }
+}
+
+/// One (sequence, token) pair for a multi-sequence decode step — see
+/// [`Session::decode_step`].
+#[derive(Debug, Clone, Copy)]
+pub struct SeqToken {
+    pub seq_id: SeqId,
+    pub token: Token,
 }
 
 /// One inference context over a model with a configurable sampler chain
@@ -632,15 +901,15 @@ pub struct Session<'m> {
     ptr: *mut sys::ObSession,
     model: &'m Model,
     n_batch: u32,
+    n_seq_max: u32,
 }
 
 unsafe impl Send for Session<'_> {}
 
 impl<'m> Session<'m> {
     pub fn new(model: &'m Model, params: &SessionParams) -> Result<Session<'m>, EngineError> {
-        let ptr = unsafe {
-            sys::ob_session_new(model.ptr, params.n_ctx, params.n_batch, params.n_threads)
-        };
+        let ffi = params.to_ffi();
+        let ptr = unsafe { sys::ob_session_new(model.ptr, &ffi) };
         if ptr.is_null() {
             return Err(EngineError::SessionCreate);
         }
@@ -648,11 +917,19 @@ impl<'m> Session<'m> {
             ptr,
             model,
             n_batch: params.n_batch.max(1),
+            n_seq_max: params.n_seq_max.max(1),
         })
     }
 
     pub fn model(&self) -> &Model {
         self.model
+    }
+
+    /// Max concurrent sequences this session was created with — the bound
+    /// on sequence ids for [`Batch::push`] and the `seq_*` methods (the
+    /// daemon's §6 admission math needs it back).
+    pub fn n_seq_max(&self) -> u32 {
+        self.n_seq_max
     }
 
     /// Decode tokens, chunked to the session's batch size.
@@ -674,6 +951,110 @@ impl<'m> Session<'m> {
     /// Sample with the configured chain (see [`Session::set_sampler`]).
     pub fn sample(&mut self) -> Token {
         unsafe { sys::ob_sample(self.ptr) }
+    }
+
+    /// Decode an explicit multi-sequence [`Batch`] in one engine call.
+    ///
+    /// The position rule (see [`Batch`]) is debug-asserted against the live
+    /// KV state here: the first position the batch adds to each sequence
+    /// must be that sequence's `seq_pos_max() + 1`. The batch is NOT
+    /// cleared on success so callers can inspect indexes for
+    /// [`Session::sample_ith`]; clear (or drop) it before reuse.
+    pub fn decode_batch(&mut self, batch: &Batch) -> Result<(), EngineError> {
+        debug_assert!(
+            batch
+                .seqs
+                .iter()
+                .all(|&(seq, first, _)| { first == self.seq_pos_max(seq).map_or(0, |p| p + 1) }),
+            "a batch must continue each sequence at seq_pos_max + 1 \
+             (rollback is seq_rm, never a rewound position counter)"
+        );
+        let status = unsafe { sys::ob_decode_batch(self.ptr, batch.ptr) };
+        if status != 0 {
+            return Err(EngineError::Decode { status });
+        }
+        Ok(())
+    }
+
+    /// Sample with the configured chain from the logits of batch token
+    /// index `i` — the index [`Batch::push`] returned for a token pushed
+    /// with `logits = true` in the most recently decoded batch (`-1` means
+    /// the last logits-bearing token).
+    ///
+    /// The sampler chain is shared across sequences; that is sound for
+    /// greedy (stateless) sampling, which is all the multi-sequence path
+    /// uses (docs/perf.md §6 — concurrent decode asserts greedy
+    /// determinism). Per-sequence sampler state is the caller's concern.
+    pub fn sample_ith(&mut self, i: i32) -> Token {
+        unsafe { sys::ob_sample_ith(self.ptr, i) }
+    }
+
+    /// Remove positions `[p0, p1)` of `seq_id` from the KV memory (negative
+    /// `p0` = from 0, negative `p1` = to the end). THE rollback primitive:
+    /// after removing a divergent suffix, re-decode from the removed range's
+    /// start so positions stay consecutive. Fails typed when the model's
+    /// memory cannot drop a partial range (recurrent/SWA); removing a whole
+    /// sequence never fails.
+    pub fn seq_rm(&mut self, seq_id: SeqId, p0: i32, p1: i32) -> Result<(), EngineError> {
+        if unsafe { sys::ob_memory_seq_rm(self.ptr, seq_id, p0, p1) } {
+            Ok(())
+        } else {
+            Err(EngineError::SeqRemove { seq_id, p0, p1 })
+        }
+    }
+
+    /// Copy positions `[p0, p1)` of `seq_id_src` onto `seq_id_dst` (same
+    /// range conventions as [`Session::seq_rm`]). Cheap KV sharing: this is
+    /// how a shared prompt prefix reaches a second sequence without
+    /// re-decoding it.
+    pub fn seq_cp(&mut self, seq_id_src: SeqId, seq_id_dst: SeqId, p0: i32, p1: i32) {
+        unsafe { sys::ob_memory_seq_cp(self.ptr, seq_id_src, seq_id_dst, p0, p1) };
+    }
+
+    /// Drop every sequence except `seq_id` from the KV memory.
+    pub fn seq_keep(&mut self, seq_id: SeqId) {
+        unsafe { sys::ob_memory_seq_keep(self.ptr, seq_id) };
+    }
+
+    /// Largest position present for `seq_id`, or `None` when the sequence
+    /// is empty. The next token for a sequence always decodes at
+    /// `seq_pos_max + 1` (0 when empty) — the position rule on [`Batch`].
+    pub fn seq_pos_max(&self, seq_id: SeqId) -> Option<i32> {
+        let pos = unsafe { sys::ob_memory_seq_pos_max(self.ptr, seq_id) };
+        (pos >= 0).then_some(pos)
+    }
+
+    /// One multi-sequence decode step (docs/perf.md §6 primitive): append
+    /// each `(seq_id, token)` at its sequence's next position, decode them
+    /// all in ONE batch, and greedy-position sample per sequence. Returns
+    /// the sampled next token per input, in input order.
+    ///
+    /// `batch` is only a reusable allocation — it is cleared on entry. A
+    /// sequence may appear at most once per step (a repeat would need the
+    /// position after a token this very call is still decoding; the batch
+    /// position debug-assert catches it). This is a stepping primitive,
+    /// NOT a scheduler: the caller decides which sequences are active each
+    /// step (admission, fairness, and starvation rules live in the
+    /// daemon).
+    pub fn decode_step(
+        &mut self,
+        batch: &mut Batch,
+        steps: &[SeqToken],
+    ) -> Result<Vec<Token>, EngineError> {
+        if steps.is_empty() {
+            return Ok(Vec::new());
+        }
+        batch.clear();
+        let mut indexes = Vec::with_capacity(steps.len());
+        for step in steps {
+            let pos = self.seq_pos_max(step.seq_id).map_or(0, |p| p + 1);
+            indexes.push(batch.push(step.token, pos, step.seq_id, true)?);
+        }
+        self.decode_batch(batch)?;
+        Ok(indexes
+            .into_iter()
+            .map(|i| self.sample_ith(i as i32))
+            .collect())
     }
 
     /// Clear the KV cache and sampler state so the next decode starts a
@@ -704,16 +1085,27 @@ impl<'m> Session<'m> {
         max_new: usize,
         mut on_token: impl FnMut(Token, &str) -> std::ops::ControlFlow<()>,
     ) -> Result<GenerationStats, EngineError> {
+        // Timing (docs/perf.md §1): measured at the source so every caller
+        // reports the same numbers the daemon's perf log line greps for.
+        let start = Instant::now();
         self.decode(prompt_tokens)?;
-        let mut generated = 0usize;
+        let mut stats = GenerationStats {
+            prompt_tokens: prompt_tokens.len(),
+            generated_tokens: 0,
+            finished: FinishReason::Length,
+            prefill_ms: start.elapsed().as_secs_f64() * 1e3,
+            decode_ms: 0.0,
+            ttft_ms: 0.0,
+            drafted: 0,
+            accepted: 0,
+        };
+        let decode_start = Instant::now();
         for _ in 0..max_new {
             let tok = self.sample();
             if self.model.is_eog(tok) {
-                return Ok(GenerationStats {
-                    prompt_tokens: prompt_tokens.len(),
-                    generated_tokens: generated,
-                    finished: FinishReason::Stop,
-                });
+                stats.finished = FinishReason::Stop;
+                stats.decode_ms = decode_start.elapsed().as_secs_f64() * 1e3;
+                return Ok(stats);
             }
             let piece = self.model.token_to_piece(tok)?;
             // Confirm-before-send (docs/resilience.md): a token's own
@@ -727,20 +1119,21 @@ impl<'m> Session<'m> {
             // the final budgeted token has no confirming decode (the tear
             // window is one token; documented in patches/README.md).
             self.decode(&[tok])?;
-            generated += 1;
+            stats.generated_tokens += 1;
+            if stats.generated_tokens == 1 {
+                // Time to first token = up to the first EMITTED piece, so
+                // it includes the confirming decode above — that is the
+                // moment the piece may actually reach the client.
+                stats.ttft_ms = start.elapsed().as_secs_f64() * 1e3;
+            }
             if on_token(tok, &piece).is_break() {
-                return Ok(GenerationStats {
-                    prompt_tokens: prompt_tokens.len(),
-                    generated_tokens: generated,
-                    finished: FinishReason::Aborted,
-                });
+                stats.finished = FinishReason::Aborted;
+                stats.decode_ms = decode_start.elapsed().as_secs_f64() * 1e3;
+                return Ok(stats);
             }
         }
-        Ok(GenerationStats {
-            prompt_tokens: prompt_tokens.len(),
-            generated_tokens: generated,
-            finished: FinishReason::Length,
-        })
+        stats.decode_ms = decode_start.elapsed().as_secs_f64() * 1e3;
+        Ok(stats)
     }
 
     /// Convenience loop: prefill `prompt_tokens`, then greedily generate up
@@ -826,6 +1219,64 @@ mod tests {
         assert!(!llama_commit().is_empty());
     }
 
+    /// The widened SessionParams defaults must equal what llama.cpp chose
+    /// before the fields were exposed (docs/perf.md §2: bit-for-bit) —
+    /// verified against llama_context_default_params in the pinned vendor
+    /// tree. A drifted default here silently changes every session.
+    #[test]
+    fn session_params_defaults_preserve_pre_widening_behavior() {
+        let p = SessionParams::default();
+        assert_eq!(p.n_ctx, 4096);
+        assert_eq!(p.n_batch, 512);
+        assert_eq!(p.n_threads, 0);
+        assert_eq!(p.n_ubatch, 512, "llama.cpp default n_ubatch");
+        assert_eq!(p.n_seq_max, 1, "llama.cpp default n_seq_max");
+        assert!(!p.kv_unified, "llama.cpp default kv_unified = false");
+        assert_eq!(p.flash_attn_type, FlashAttnType::Auto);
+        assert_eq!(p.type_k, KvCacheType::F16);
+        assert_eq!(p.type_v, KvCacheType::F16);
+        assert!(p.offload_kqv, "llama.cpp default offload_kqv = true");
+        // The enum codes the shim casts back into llama/ggml enums.
+        assert_eq!(FlashAttnType::Auto.code(), -1);
+        assert_eq!(KvCacheType::F32.code(), 0);
+        assert_eq!(KvCacheType::F16.code(), 1);
+        assert_eq!(KvCacheType::Q4_0.code(), 2);
+        assert_eq!(KvCacheType::Q8_0.code(), 8);
+    }
+
+    /// Batch bookkeeping without a model: capacity and seq-id bounds fail
+    /// typed, clear() makes the allocation reusable, and push returns the
+    /// index sample_ith will want.
+    #[test]
+    fn batch_push_bounds_and_clear() {
+        match Batch::new(0, 1) {
+            Err(EngineError::BatchAlloc { .. }) => {}
+            Err(other) => panic!("expected BatchAlloc for zero capacity, got {other:?}"),
+            Ok(_) => panic!("expected BatchAlloc for zero capacity, got a batch"),
+        }
+        let mut b = Batch::new(3, 2).expect("batch alloc");
+        assert_eq!(b.capacity(), 3);
+        assert!(b.is_empty());
+        assert_eq!(b.push(11, 0, 0, false).unwrap(), 0);
+        assert_eq!(b.push(12, 1, 0, false).unwrap(), 1);
+        assert_eq!(b.push(21, 0, 1, true).unwrap(), 2);
+        assert_eq!(b.len(), 3);
+        match b.push(13, 2, 0, true) {
+            Err(EngineError::BatchFull { capacity: 3 }) => {}
+            other => panic!("expected BatchFull, got {other:?}"),
+        }
+        b.clear();
+        assert!(b.is_empty());
+        match b.push(31, 0, 2, false) {
+            Err(EngineError::BatchSeqId {
+                seq_id: 2,
+                n_seq_max: 2,
+            }) => {}
+            other => panic!("expected BatchSeqId, got {other:?}"),
+        }
+        assert_eq!(b.push(11, 0, 1, true).unwrap(), 0, "reusable after clear");
+    }
+
     /// The splits entry point over a single part must behave exactly like
     /// the plain load (the vendored loader ignores the splits list when the
     /// GGUF carries no split metadata): same layer count, same greedy
@@ -850,7 +1301,7 @@ mod tests {
                 &SessionParams {
                     n_ctx: 256,
                     n_batch: 64,
-                    n_threads: 0,
+                    ..SessionParams::default()
                 },
             )
             .unwrap();
@@ -884,7 +1335,7 @@ mod tests {
             &SessionParams {
                 n_ctx: 256,
                 n_batch: 64,
-                n_threads: 0,
+                ..SessionParams::default()
             },
         )
         .unwrap();
@@ -904,7 +1355,7 @@ mod tests {
             &SessionParams {
                 n_ctx: 256,
                 n_batch: 64,
-                n_threads: 0,
+                ..SessionParams::default()
             },
         )
         .unwrap();
@@ -939,5 +1390,60 @@ mod tests {
             .apply_chat_template(&[("user".into(), "hi".into())], true)
             .unwrap();
         assert!(rendered.is_none(), "stories260K declares no chat template");
+    }
+
+    /// GenerationStats wall-clock fields (docs/perf.md §1) are populated by
+    /// generate(): all three phases take measurable time even on the tiny
+    /// model (f64 ms keeps microsecond work above zero), and the
+    /// speculative counters stay 0 until §5 lands.
+    #[test]
+    fn smoke_generation_stats_timed() {
+        let Ok(model_path) = std::env::var("OB_SMOKE_MODEL") else {
+            eprintln!("OB_SMOKE_MODEL not set; skipping stats smoke test");
+            return;
+        };
+        let model = Model::load(Path::new(&model_path), &ModelParams::default()).unwrap();
+        let prompt = model.tokenize("Once upon a time", true).unwrap();
+        let mut session = Session::new(
+            &model,
+            &SessionParams {
+                n_ctx: 256,
+                n_batch: 64,
+                ..SessionParams::default()
+            },
+        )
+        .unwrap();
+        session.set_sampler(&SamplerParams {
+            temperature: 0.0,
+            ..Default::default()
+        });
+        let stats = session
+            .generate(&prompt, 8, |_, _| std::ops::ControlFlow::Continue(()))
+            .unwrap();
+        assert!(stats.generated_tokens > 0);
+        assert!(
+            stats.prefill_ms > 0.0,
+            "prefill must take measurable time (got {})",
+            stats.prefill_ms
+        );
+        assert!(
+            stats.decode_ms > 0.0,
+            "decode loop must take measurable time (got {})",
+            stats.decode_ms
+        );
+        assert!(
+            stats.ttft_ms > 0.0,
+            "a generation that emitted tokens must have a TTFT (got {})",
+            stats.ttft_ms
+        );
+        assert!(
+            stats.ttft_ms >= stats.prefill_ms,
+            "TTFT is measured from generate() entry, so it contains prefill \
+             (ttft {} < prefill {})",
+            stats.ttft_ms,
+            stats.prefill_ms
+        );
+        assert_eq!(stats.drafted, 0, "speculative counters are 0 until §5");
+        assert_eq!(stats.accepted, 0, "speculative counters are 0 until §5");
     }
 }

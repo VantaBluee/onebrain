@@ -13,6 +13,30 @@ pub struct ObSession {
     _private: [u8; 0],
 }
 
+#[repr(C)]
+pub struct ObBatch {
+    _private: [u8; 0],
+}
+
+/// Mirror of the shim-owned `ob_session_params` (shim/ob_shim.h). This is
+/// deliberately NOT a llama.cpp struct: the shim defines it and this crate
+/// compiles both sides, so the definitions can only drift together. Field
+/// semantics (zero = engine default for scalars, bools carried verbatim)
+/// are documented on the C side.
+#[repr(C)]
+pub struct ObSessionParams {
+    pub n_ctx: u32,
+    pub n_batch: u32,
+    pub n_ubatch: u32,
+    pub n_seq_max: u32,
+    pub n_threads: c_int,
+    pub flash_attn_type: i32,
+    pub type_k: i32,
+    pub type_v: i32,
+    pub kv_unified: bool,
+    pub offload_kqv: bool,
+}
+
 extern "C" {
     pub fn ob_backend_init();
     pub fn ob_backend_free();
@@ -46,18 +70,28 @@ extern "C" {
     pub fn ob_token_to_piece(m: *const ObModel, token: i32, buf: *mut c_char, buf_len: i32) -> i32;
     pub fn ob_token_is_eog(m: *const ObModel, token: i32) -> bool;
 
-    pub fn ob_session_new(
-        m: *mut ObModel,
-        n_ctx: u32,
-        n_batch: u32,
-        n_threads: c_int,
-    ) -> *mut ObSession;
+    pub fn ob_session_new(m: *mut ObModel, p: *const ObSessionParams) -> *mut ObSession;
     pub fn ob_session_free(s: *mut ObSession);
     pub fn ob_decode(s: *mut ObSession, tokens: *const i32, n_tokens: i32) -> i32;
     pub fn ob_sample_greedy(s: *mut ObSession) -> i32;
     pub fn ob_session_reset(s: *mut ObSession);
     pub fn ob_session_set_sampler(s: *mut ObSession, temp: f32, top_p: f32, top_k: i32, seed: u32);
     pub fn ob_sample(s: *mut ObSession) -> i32;
+
+    // Explicit multi-sequence batches + per-sequence KV surgery
+    // (docs/perf.md §2). The safe wrappers in lib.rs own the position rule
+    // (consecutive per sequence).
+    pub fn ob_batch_new(n_tokens_max: i32, n_seq_max: i32) -> *mut ObBatch;
+    pub fn ob_batch_free(b: *mut ObBatch);
+    pub fn ob_batch_clear(b: *mut ObBatch);
+    pub fn ob_batch_push(b: *mut ObBatch, token: i32, pos: i32, seq_id: i32, logits: bool) -> bool;
+    pub fn ob_batch_n_tokens(b: *const ObBatch) -> i32;
+    pub fn ob_decode_batch(s: *mut ObSession, b: *const ObBatch) -> i32;
+    pub fn ob_sample_ith(s: *mut ObSession, i: i32) -> i32;
+    pub fn ob_memory_seq_rm(s: *mut ObSession, seq_id: i32, p0: i32, p1: i32) -> bool;
+    pub fn ob_memory_seq_cp(s: *mut ObSession, seq_id_src: i32, seq_id_dst: i32, p0: i32, p1: i32);
+    pub fn ob_memory_seq_keep(s: *mut ObSession, seq_id: i32);
+    pub fn ob_memory_seq_pos_max(s: *mut ObSession, seq_id: i32) -> i32;
 
     pub fn ob_dev_count() -> i32;
     pub fn ob_dev_info(
