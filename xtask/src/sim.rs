@@ -119,10 +119,50 @@
 //!     pre-seed line ever appears and the WAN counter has still not moved
 //!     (re-plans reuse the bytes on disk, spec §6).
 //!
+//! After M6, the **M7 performance** proofs run (docs/perf.md "DoD
+//! hooks"). Gating is the INVERSE of chaos/M6: the overlap step (18) runs
+//! in BOTH modes but its timing asserts fire only under `--netem` — the
+//! shaped 1 Gbit / 0.5 ms link is the contract's noise rationale; the
+//! default loopback run prints the same measured numbers assert-free.
+//! Steps 19–22 are link-shape-independent correctness proofs and run in
+//! the default loopback mode only (like chaos, they drive streaming SSE
+//! and the CLI directly).
+//!
+//! 18. **perf overlap** — a synthetic transfer-heavy model ([`build_perf_model`]:
+//!     n_embd 8192 with thin 16-wide attention heads and a 32-wide FFN, 2
+//!     layers, all-zero f32 weights — SIZED so the per-ubatch boundary
+//!     activation copy at 1 Gbit is ≥ 40% of per-ubatch wall time; the
+//!     arithmetic lives at the constants) loads forced 2-node with
+//!     `[perf] n_ubatch = 64`; a ~3.4k-token prefill + 64-token decode is
+//!     timed 3× with `prefill_overlap=false` (the constructed M3 baseline,
+//!     asserted NOT to log llama.cpp's `pipeline parallelism enabled`
+//!     engagement line) and 3× with `true` (asserted to log it — the patch
+//!     0003 observable). Under `--netem` the medians must satisfy
+//!     `overlap ≤ 0.75 × sequential` with decode tok/s in [0.9, ∞) of the
+//!     baseline.
+//! 19. **speculative equivalence** — the same prompt with `--speculative`
+//!     (draft = the same tiny model) on and off, against a solo AND a
+//!     forced-distributed target: byte-identical greedy output, and the
+//!     perf log line's drafted/accepted counters move (accepted > 0).
+//! 20. **prefix reuse** — request B sharing request A's ≥ 64-token prefix
+//!     prefills exactly the suffix (`len(B) − len(A)` tokens), an
+//!     identical re-request prefills exactly 1, and both outputs are
+//!     byte-identical to cold-cache controls.
+//! 21. **micro-batch** — `[perf] max_concurrent_requests = 2` +
+//!     `queue_depth = 1`: two concurrent streams complete byte-identical
+//!     to their alone-runs while a third queues and completes too, and a
+//!     fourth in-flight request is refused with the typed 429
+//!     (`rate_limit_error` envelope + the config-knob remedy).
+//! 22. **bench smoke** — `onebrain bench --cluster` against the live pair
+//!     renders the parseable markdown report (Nodes/Links/End-to-end
+//!     tables; the peer row carries real figures via the mesh
+//!     BenchRequest; no failed runs).
+//!
 //! `--netem` (Linux, root only — SKIP + exit 0 anywhere else): the same
 //! M3/M4 scenario inside the pair-sim network namespaces, shaped to
-//! 1 Gbit / 0.5 ms per direction (chaos and the M6 logistics section
-//! skipped, see the skip note in `scenario`).
+//! 1 Gbit / 0.5 ms per direction (chaos and the M6 logistics section are
+//! skipped there, and of M7 only the overlap step runs — WITH its timing
+//! asserts; see the notes in `scenario`).
 //!
 //! One `[PASS]`/`[FAIL]` checklist line per step; daemon-log tails are
 //! dumped on failure; `OB_E2E_SKIP_BUILD=1` skips the inner build.
@@ -344,6 +384,24 @@ fn scenario(
         wait_connected(a, b, &peer_a, &peer_b, "after pairing")?;
         Ok((peer_a, peer_b))
     })?;
+
+    // Dev seam for perf work: `OB_SIM_M7_OVERLAP_ONLY=1` jumps from the
+    // freshly paired daemons straight to the M7 overlap step (skipping
+    // M3–M6) so its timing loop iterates in ~2 minutes instead of ~10.
+    // Never set in CI — the full sim is the gate.
+    if std::env::var("OB_SIM_M7_OVERLAP_ONLY").as_deref() == Ok("1") {
+        println!("[SKIP] OB_SIM_M7_OVERLAP_ONLY=1: jumping to the M7 overlap step");
+        let env = ChaosEnv {
+            a,
+            b,
+            c,
+            peer_a: &peer_a,
+            peer_b: &peer_b,
+            mesh,
+            model_arg,
+        };
+        return perf_overlap_step(&env, netem);
+    }
 
     // Scenario 1: distribution engages WITHOUT --nodes because neither
     // capped node fits the model alone.
@@ -601,6 +659,16 @@ fn scenario(
          (crates/onebrain-scheduler/src/v1.rs; docs/scheduler-v1.md \"DoD sim hooks\")"
     );
 
+    let env = ChaosEnv {
+        a,
+        b,
+        c,
+        peer_a: &peer_a,
+        peer_b: &peer_b,
+        mesh,
+        model_arg,
+    };
+
     // ---- M5 chaos section (docs/resilience.md "Sim / DoD hooks") --------
     if netem {
         println!(
@@ -613,21 +681,26 @@ fn scenario(
              namespace where the namespaced daemons' loopback cannot reach it; the proofs \
              run in the default loopback mode on every OS"
         );
+        // M7 overlap (docs/perf.md "DoD hooks", first bullet): the ONE
+        // netem-DEPENDENT step — its timing asserts need the shaped
+        // 1 Gbit / 0.5 ms link, the exact inverse of the chaos/M6 gating
+        // above. The remaining M7 proofs are link-shape-independent and
+        // run in the default loopback mode below.
+        perf_overlap_step(&env, true)?;
+        println!(
+            "[SKIP] m7 speculative/reuse/micro-batch/bench under --netem: correctness \
+             proofs independent of link shaping (and they drive the loopback-only SSE \
+             stream machinery, like chaos); they run in the default mode on every OS"
+        );
         return Ok(());
     }
-    let env = ChaosEnv {
-        a,
-        b,
-        c,
-        peer_a: &peer_a,
-        peer_b: &peer_b,
-        mesh,
-        model_arg,
-    };
     chaos_section(&env, dims)?;
 
     // ---- M6 logistics proofs (docs/logistics.md "DoD hooks") ------------
-    logistics_section(&env)
+    logistics_section(&env)?;
+
+    // ---- M7 performance proofs (docs/perf.md "DoD hooks") ---------------
+    perf_section(&env)
 }
 
 // ---------------------------------------------------------------------------
@@ -851,7 +924,7 @@ fn chaos_section(env: &ChaosEnv, dims: &SimModelDims) -> Result<()> {
     step(
         "chaos-1: streamed text equals a control run on the recovered topology (greedy)",
         || {
-            let (text, tokens, finish) = chat_full(env.a, &model, CHAOS_MAX_TOKENS)?;
+            let (text, tokens, finish) = chat_full(env.a, &model, PROMPT, CHAOS_MAX_TOKENS)?;
             if finish.as_deref() != Some("length") {
                 bail!("control run finished with {finish:?}, expected \"length\"");
             }
@@ -1267,6 +1340,24 @@ impl GgufBuilder {
     }
 }
 
+/// The minimal SPM byte-fallback vocabulary ([`M6_VOCAB`] pieces: `<unk>`,
+/// `<s>`, `</s>` + the 256 byte tokens) shared by the M6 and M7 synthetic
+/// models — enough for llama.cpp to tokenize anything, one token per byte.
+fn push_spm_byte_vocab(g: &mut GgufBuilder) {
+    g.kv_str("tokenizer.ggml.model", "llama");
+    let mut tokens: Vec<String> = vec!["<unk>".into(), "<s>".into(), "</s>".into()];
+    tokens.extend((0u32..256).map(|b| format!("<0x{b:02X}>")));
+    // SPM token types: 2 = unknown, 3 = control, 6 = byte.
+    let mut types: Vec<i32> = vec![2, 3, 3];
+    types.extend(std::iter::repeat_n(6, 256));
+    g.kv_str_array("tokenizer.ggml.tokens", &tokens);
+    g.kv_f32_array_zeroed("tokenizer.ggml.scores", u64::from(M6_VOCAB));
+    g.kv_i32_array("tokenizer.ggml.token_type", &types);
+    g.kv_u32("tokenizer.ggml.bos_token_id", 1);
+    g.kv_u32("tokenizer.ggml.eos_token_id", 2);
+    g.kv_u32("tokenizer.ggml.unknown_token_id", 0);
+}
+
 /// The synthetic GGUF: a real, loadable llama-arch model (all the
 /// metadata and tensors llama.cpp demands, a minimal SPM byte-fallback
 /// vocab) whose weights are all zero — generation is meaningless, but
@@ -1284,18 +1375,7 @@ fn build_m6_model() -> Vec<u8> {
     g.kv_f32("llama.attention.layer_norm_rms_epsilon", 1e-5);
     // Must equal head_dim for the llama arch or llama.cpp rejects it.
     g.kv_u32("llama.rope.dimension_count", M6_N_EMBD / M6_N_HEAD);
-    g.kv_str("tokenizer.ggml.model", "llama");
-    let mut tokens: Vec<String> = vec!["<unk>".into(), "<s>".into(), "</s>".into()];
-    tokens.extend((0u32..256).map(|b| format!("<0x{b:02X}>")));
-    // SPM token types: 2 = unknown, 3 = control, 6 = byte.
-    let mut types: Vec<i32> = vec![2, 3, 3];
-    types.extend(std::iter::repeat_n(6, 256));
-    g.kv_str_array("tokenizer.ggml.tokens", &tokens);
-    g.kv_f32_array_zeroed("tokenizer.ggml.scores", u64::from(M6_VOCAB));
-    g.kv_i32_array("tokenizer.ggml.token_type", &types);
-    g.kv_u32("tokenizer.ggml.bos_token_id", 1);
-    g.kv_u32("tokenizer.ggml.eos_token_id", 2);
-    g.kv_u32("tokenizer.ggml.unknown_token_id", 0);
+    push_spm_byte_vocab(&mut g);
 
     let e = u64::from(M6_N_EMBD);
     let v = u64::from(M6_VOCAB);
@@ -1805,6 +1885,944 @@ fn logistics_section(env: &ChaosEnv) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// M7 performance section (docs/perf.md "DoD hooks"; module docs steps 18–22)
+// ---------------------------------------------------------------------------
+
+// The overlap step's synthetic model, SIZED so the per-ubatch boundary
+// activation copy at the netem leg's 1 Gbit is a substantial (≥ 40%)
+// fraction of per-ubatch wall time — the contract's precondition for the
+// `overlap ≤ 0.75 × sequential` assert. The arithmetic (pinned by the
+// `perf_model_sizing_meets_the_overlap_contract` unit test):
+//
+//   transfer/ubatch  = 4 B · n_embd · n_ubatch = 4·8192·64 = 2,097,152 B
+//                    → 16.8 ms at 1 Gbit (125 MB/s) + 0.5 ms netem delay.
+//   weights/layer    = n_embd·(4·head_dim + 3·n_ff + 2 norms)
+//                    = 8192·162 = 1,327,104 params (5.3 MB f32) — THIN
+//                      16-wide attention heads (`attention.key_length`)
+//                      and a 32-wide FFN keep per-token compute LINEAR in
+//                      n_embd while the boundary copy grows with n_embd,
+//                      which is the whole trick: a fat 8192-wide hidden
+//                      state to ship, almost nothing to multiply it by.
+//   compute/stage    = 2 flops/param/token · 64 tok · 1.33M ≈ 170 MFLOP
+//                    → ≈ 8.5 ms per node per ubatch at a conservative
+//                      20 GFLOP/s effective f32 (llama.cpp's sgemm
+//                      sustains 2-3× that on any AVX2 4-core runner).
+//   per-ubatch wall  ≈ 2·8.5 + 16.8 + ~1 (RTT) ≈ 34.8 ms sequential
+//                    → the boundary copy is ≈ 48% of it.  ✓ (≥ 40%)
+//
+// Assert robustness: both daemons share ONE host CPU, so the overlapped
+// steady state is ≈ max(2·compute, transfer) per ubatch while sequential
+// pays their SUM plus the un-batched round trips; the 0.75 ratio holds for
+// effective throughput anywhere in ≈ [7, 90] GFLOP/s — machines outside
+// that band do not exist in CI.
+/// Transformer layers: one per node under the forced 2-node plan.
+const PERF_N_LAYERS: u32 = 2;
+/// The fat hidden state the boundary copy ships (4 B · 8192 per token).
+const PERF_N_EMBD: u32 = 8192;
+const PERF_N_HEAD: u32 = 1;
+const PERF_N_HEAD_KV: u32 = 1;
+/// `llama.attention.key_length`/`value_length` + rope dims: decouples the
+/// attention projections from n_embd (vendor llama-model.cpp reads it into
+/// `n_embd_head_k/v`, default n_embd/n_head; the llama arch demands
+/// `rope.dimension_count == n_embd_head_k`).
+const PERF_HEAD_DIM: u32 = 16;
+const PERF_N_FF: u32 = 32;
+/// On-disk name inside A's sandbox home; the load references the path, so
+/// the model surfaces as `local:perf-overlap`.
+const PERF_MODEL_FILE: &str = "perf-overlap.gguf";
+/// `[perf] n_ubatch` of the overlap phase: 8 ubatches per 512-token
+/// `n_batch` chunk. llama.cpp pipelines ubatches only WITHIN one
+/// `llama_decode` call (it syncs at the end for logits), so a deep
+/// per-call ubatch train is what the overlap can actually hide.
+const PERF_N_UBATCH: u32 = 64;
+/// New-token budget of every timed run: the decode-throughput sample. The
+/// all-zero model's logits tie at 0, greedy argmax always picks token 0
+/// (`<unk>`, never EOS id 2), so exactly this many tokens decode.
+const PERF_DECODE_TOKENS: u32 = 64;
+/// Timed generations per toggle setting (the contract's median-of-3).
+const PERF_RUNS: usize = 3;
+/// The vendor text patch 0003's caps flip makes llama.cpp log at context
+/// creation — forwarded verbatim into the head's tracing output (INFO,
+/// target onebrain_engine::rpc) once `RemoteServer::register` has run.
+const ENGAGEMENT_NEEDLE: &str = "pipeline parallelism enabled";
+/// Every completed generation logs exactly one of these (docs/perf.md §1).
+const PERF_LINE_NEEDLE: &str = "perf: prefill ";
+
+/// The overlap step's long prompt. On the byte-fallback vocab a non-space
+/// char is 1 byte token but every SPACE costs 3: SPM rewrites it to "▁"
+/// (U+2581), which is not in the vocab and byte-falls-back to its three
+/// UTF-8 bytes. One 62-char sentence (55 non-space + 7 spaces) is
+/// therefore exactly 76 tokens; 45 repeats + BOS/lead-in ≈ 3,424 tokens —
+/// ~53 ubatches of 64 across ~7 `n_batch` chunks, with the 64 new tokens
+/// still inside the 4096 context.
+fn perf_prompt() -> String {
+    "OneBrain overlaps distributed prefill with boundary transfer. ".repeat(45)
+}
+
+/// The transfer-heavy synthetic GGUF (shape + arithmetic above): a real,
+/// loadable llama-arch model with all-zero f32 weights — generation is
+/// meaningless (a stream of `<unk>`) but deterministic, and load,
+/// planning, RPC weight push, and the split-boundary activation traffic
+/// are fully real.
+fn build_perf_model() -> Vec<u8> {
+    let mut g = GgufBuilder::new();
+    g.kv_str("general.architecture", "llama");
+    g.kv_str("general.name", "onebrain-sim-perf-overlap");
+    g.kv_u32("llama.block_count", PERF_N_LAYERS);
+    g.kv_u32("llama.context_length", 4096);
+    g.kv_u32("llama.embedding_length", PERF_N_EMBD);
+    g.kv_u32("llama.feed_forward_length", PERF_N_FF);
+    g.kv_u32("llama.attention.head_count", PERF_N_HEAD);
+    g.kv_u32("llama.attention.head_count_kv", PERF_N_HEAD_KV);
+    g.kv_u32("llama.attention.key_length", PERF_HEAD_DIM);
+    g.kv_u32("llama.attention.value_length", PERF_HEAD_DIM);
+    g.kv_f32("llama.attention.layer_norm_rms_epsilon", 1e-5);
+    // The llama arch rejects rope dims != n_embd_head_k (llama-model.cpp
+    // "invalid n_rot").
+    g.kv_u32("llama.rope.dimension_count", PERF_HEAD_DIM);
+    push_spm_byte_vocab(&mut g);
+
+    let e = u64::from(PERF_N_EMBD);
+    let v = u64::from(M6_VOCAB);
+    let ff = u64::from(PERF_N_FF);
+    // n_head == n_head_kv == 1: every attention projection is head_dim wide.
+    let hd = u64::from(PERF_HEAD_DIM);
+    g.tensor_f32("token_embd.weight", &[e, v]);
+    for i in 0..PERF_N_LAYERS {
+        g.tensor_f32(&format!("blk.{i}.attn_norm.weight"), &[e]);
+        g.tensor_f32(&format!("blk.{i}.attn_q.weight"), &[e, hd]);
+        g.tensor_f32(&format!("blk.{i}.attn_k.weight"), &[e, hd]);
+        g.tensor_f32(&format!("blk.{i}.attn_v.weight"), &[e, hd]);
+        g.tensor_f32(&format!("blk.{i}.attn_output.weight"), &[hd, e]);
+        g.tensor_f32(&format!("blk.{i}.ffn_norm.weight"), &[e]);
+        g.tensor_f32(&format!("blk.{i}.ffn_gate.weight"), &[e, ff]);
+        g.tensor_f32(&format!("blk.{i}.ffn_up.weight"), &[e, ff]);
+        g.tensor_f32(&format!("blk.{i}.ffn_down.weight"), &[ff, e]);
+    }
+    g.tensor_f32("output_norm.weight", &[e]);
+    g.tensor_f32("output.weight", &[e, v]);
+    g.build()
+}
+
+/// One parsed `perf:` instrumentation line (docs/perf.md §1, extended by
+/// §5 with the draft counters).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PerfLine {
+    /// Tokens actually prefilled THIS attempt (a §4 reuse hit logs exactly
+    /// the decoded suffix; an identical re-request logs 1).
+    prefill_tok: u64,
+    prefill_ms: u64,
+    decode_tok: u64,
+    decode_ms: u64,
+    #[allow(dead_code)] // parsed for completeness; no step asserts on it
+    ttft_ms: u64,
+    drafted: u64,
+    accepted: u64,
+}
+
+/// Parse `… perf: prefill {n}tok {ms}ms decode {n}tok {ms}ms ttft {ms}ms
+/// drafted {n} accepted {n}`. Prefix-tolerant per the §5 handoff: the
+/// `drafted … accepted …` tail is optional (0/0 when absent) and anything
+/// after the accepted count is ignored.
+fn parse_perf_line(line: &str) -> Option<PerfLine> {
+    let rest = line.split(PERF_LINE_NEEDLE).nth(1)?;
+    let (prefill_tok, rest) = rest.split_once("tok ")?;
+    let (prefill_ms, rest) = rest.split_once("ms decode ")?;
+    let (decode_tok, rest) = rest.split_once("tok ")?;
+    let (decode_ms, rest) = rest.split_once("ms ttft ")?;
+    let (ttft_ms, rest) = rest.split_once("ms")?;
+    let (drafted, accepted) = match rest.strip_prefix(" drafted ") {
+        Some(tail) => {
+            let (drafted, tail) = tail.split_once(" accepted ")?;
+            let accepted: String = tail.chars().take_while(char::is_ascii_digit).collect();
+            (drafted.trim().parse().ok()?, accepted.parse().ok()?)
+        }
+        None => (0, 0),
+    };
+    Some(PerfLine {
+        prefill_tok: prefill_tok.trim().parse().ok()?,
+        prefill_ms: prefill_ms.trim().parse().ok()?,
+        decode_tok: decode_tok.trim().parse().ok()?,
+        decode_ms: decode_ms.trim().parse().ok()?,
+        ttft_ms: ttft_ms.trim().parse().ok()?,
+        drafted,
+        accepted,
+    })
+}
+
+/// How many perf lines the node's daemon log holds (appends across
+/// restarts, so callers track deltas, never absolutes).
+fn perf_line_count(node: &Node) -> usize {
+    daemon_log(node)
+        .lines()
+        .filter(|l| l.contains(PERF_LINE_NEEDLE))
+        .count()
+}
+
+/// Wait until a perf line BEYOND the first `prior` ones lands (the line is
+/// written just before the generation's terminal event, racing the HTTP
+/// response like the M6 transfer summary); returns the newest, parsed.
+fn wait_perf_line(node: &Node, prior: usize, window: Duration) -> Result<PerfLine> {
+    let deadline = Instant::now() + window;
+    loop {
+        let log = daemon_log(node);
+        let lines: Vec<&str> = log
+            .lines()
+            .filter(|l| l.contains(PERF_LINE_NEEDLE))
+            .collect();
+        if lines.len() > prior {
+            let last = lines[lines.len() - 1];
+            return parse_perf_line(last).with_context(|| format!("unparsable perf line: {last}"));
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "{}: no new {PERF_LINE_NEEDLE:?} line within {window:?} (have {}, want > \
+                 {prior})",
+                node.label,
+                lines.len()
+            );
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// How many pipeline-parallel engagement lines the node has ever logged.
+fn engagement_count(node: &Node) -> usize {
+    daemon_log(node)
+        .lines()
+        .filter(|l| l.contains(ENGAGEMENT_NEEDLE))
+        .count()
+}
+
+/// `POST /api/internal/perf`: flip (or with two `None`s read) the runtime
+/// toggles; asserts the reply carries the contract shape and adopted the
+/// requested values. Overrides apply at the NEXT model (re)load.
+fn set_perf_toggles(
+    node: &Node,
+    prefill_overlap: Option<bool>,
+    kv_reuse: Option<bool>,
+) -> Result<()> {
+    let mut body = serde_json::Map::new();
+    if let Some(v) = prefill_overlap {
+        body.insert("prefill_overlap".to_string(), Value::Bool(v));
+    }
+    if let Some(v) = kv_reuse {
+        body.insert("kv_reuse".to_string(), Value::Bool(v));
+    }
+    let resp = node.post_json(
+        "/api/internal/perf",
+        &Value::Object(body),
+        Duration::from_secs(10),
+    )?;
+    if resp["applies_at"] != "next model load" {
+        bail!("/api/internal/perf reply lacks applies_at=\"next model load\": {resp}");
+    }
+    for (key, want) in [("prefill_overlap", prefill_overlap), ("kv_reuse", kv_reuse)] {
+        if let Some(want) = want {
+            if resp[key] != Value::Bool(want) {
+                bail!("/api/internal/perf did not adopt {key}={want}: {resp}");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One non-streaming greedy `/api/generate` (RAW prompt — no chat
+/// template, so perf-line prefill counts map 1:1 onto prompt tokens, which
+/// the reuse step's exact-suffix assert depends on) plus the perf line it
+/// logged. Returns (response text, parsed perf line).
+fn generate_raw(
+    node: &Node,
+    model: &str,
+    prompt: &str,
+    num_predict: u32,
+) -> Result<(String, PerfLine)> {
+    let prior = perf_line_count(node);
+    let body = json!({
+        "model": model,
+        "prompt": prompt,
+        "stream": false,
+        "options": { "temperature": 0.0, "num_predict": num_predict, "seed": 0 },
+    });
+    let v = node.post_json("/api/generate", &body, GEN_TIMEOUT)?;
+    if v["done"] != Value::Bool(true) {
+        bail!("/api/generate on {} did not finish: {v}", node.label);
+    }
+    let text = v["response"]
+        .as_str()
+        .with_context(|| format!("/api/generate reply lacks `response`: {v}"))?
+        .to_string();
+    let line = wait_perf_line(node, prior, Duration::from_secs(5))?;
+    Ok((text, line))
+}
+
+/// Median of an odd-sized sample (the contract's median-of-3).
+fn median_u64(samples: &[u64]) -> u64 {
+    let mut v = samples.to_vec();
+    v.sort_unstable();
+    v[v.len() / 2]
+}
+
+fn median_f64(samples: &[f64]) -> f64 {
+    let mut v = samples.to_vec();
+    v.sort_by(f64::total_cmp);
+    v[v.len() / 2]
+}
+
+/// Decode throughput of one run, from the perf line's own numbers.
+fn decode_tps(line: &PerfLine) -> f64 {
+    line.decode_tok as f64 * 1000.0 / line.decode_ms.max(1) as f64
+}
+
+/// [`PERF_RUNS`] timed generations of the long perf prompt, with the token
+/// counts sanity-pinned: every run prefills the whole ~3.4k-token prompt
+/// cold (kv_reuse is off in this phase's config) and decodes the full
+/// budget (all-zero logits argmax to token 0, never EOS).
+fn perf_measure_runs(node: &Node, model: &str, label: &str) -> Result<Vec<PerfLine>> {
+    let prompt = perf_prompt();
+    let mut runs = Vec::with_capacity(PERF_RUNS);
+    for i in 1..=PERF_RUNS {
+        let (_text, line) = generate_raw(node, model, &prompt, PERF_DECODE_TOKENS)?;
+        if line.prefill_tok < 3_000 || line.prefill_tok > 4_000 {
+            bail!(
+                "{label} run {i}: prefill {}tok is not the ~3.4k-token cold prompt (is \
+                 [perf] kv_reuse off in this phase?): {line:?}",
+                line.prefill_tok
+            );
+        }
+        if line.decode_tok != u64::from(PERF_DECODE_TOKENS) {
+            bail!(
+                "{label} run {i}: decode {}tok, expected exactly {PERF_DECODE_TOKENS}: \
+                 {line:?}",
+                line.decode_tok
+            );
+        }
+        println!(
+            "       {label} run {i}: prefill {}tok {}ms, decode {}tok {}ms",
+            line.prefill_tok, line.prefill_ms, line.decode_tok, line.decode_ms
+        );
+        runs.push(line);
+    }
+    Ok(runs)
+}
+
+/// M7 step 18 (docs/perf.md "DoD hooks", first bullet): overlapped chunked
+/// prefill A/B-measured against the constructed M3 baseline. Runs in BOTH
+/// sim modes; `netem` decides whether the timing medians are ASSERTED
+/// (shaped 1 Gbit / 0.5 ms link) or only printed (loopback smoke —
+/// hosted-runner noise makes absolute numbers meaningless there).
+fn perf_overlap_step(env: &ChaosEnv, netem: bool) -> Result<()> {
+    let (mesh_a, mesh_b, _mesh_c) = env.mesh;
+    let knobs = SimKnobs {
+        n_ubatch: Some(PERF_N_UBATCH),
+        // The timed runs repeat one identical prompt: §4 reuse would turn
+        // runs 2..n into 1-token prefills, so it is off for this phase.
+        kv_reuse: Some(false),
+        ..SimKnobs::default()
+    };
+    let model_path = env.a.home.join(PERF_MODEL_FILE);
+    step(
+        "m7 overlap: transfer-heavy synthetic model; restart with [perf] n_ubatch 64",
+        || {
+            let bytes = build_perf_model();
+            println!(
+                "       {} ({} bytes; {} B boundary copy per {}-token ubatch = 16.8 ms at \
+                 1 Gbit, sized >= 40% of per-ubatch wall — arithmetic at the PERF_ consts)",
+                model_path.display(),
+                bytes.len(),
+                4 * u64::from(PERF_N_EMBD) * u64::from(PERF_N_UBATCH),
+                PERF_N_UBATCH,
+            );
+            std::fs::write(&model_path, bytes)
+                .with_context(|| format!("writing {}", model_path.display()))?;
+            // Head first, as everywhere: clean epoch teardown.
+            restart_with(env.a, mesh_a, netem, knobs)?;
+            restart_with(env.b, mesh_b, netem, knobs)?;
+            wait_connected(env.a, env.b, env.peer_a, env.peer_b, "after the m7 restart")
+        },
+    )?;
+    let model_arg = model_path
+        .to_str()
+        .context("perf model path is not valid UTF-8")?;
+    let load_body = json!({ "model": model_arg, "nodes": 2, "explain": true });
+
+    let engagements_start = engagement_count(env.a);
+    let sequential = step(
+        "m7 overlap: prefill_overlap=false — sequential M3 baseline, 3 timed runs",
+        || {
+            set_perf_toggles(env.a, Some(false), None)?;
+            let plan = load_model(env.a, &load_body)?;
+            assert_pipeline(&plan)?;
+            let name = model_name(env.a)?;
+            perf_measure_runs(env.a, &name, "sequential")
+        },
+    )?;
+    step(
+        "m7 overlap: the M3 baseline never logged the pipeline-engagement line",
+        || {
+            // Read AFTER seconds of generation traffic: an engagement line
+            // from the baseline load would long since have hit the file.
+            let now = engagement_count(env.a);
+            if now != engagements_start {
+                bail!(
+                    "prefill_overlap=false must construct the exact M3 sequential path, but \
+                     the head logged {} new {ENGAGEMENT_NEEDLE:?} line(s)",
+                    now - engagements_start
+                );
+            }
+            Ok(())
+        },
+    )?;
+
+    let overlapped = step(
+        "m7 overlap: prefill_overlap=true — reload logs the engagement line, 3 timed runs",
+        || {
+            set_perf_toggles(env.a, Some(true), None)?;
+            let before = engagement_count(env.a);
+            let plan = load_model(env.a, &load_body)?;
+            assert_pipeline(&plan)?;
+            // The line fires at context creation, during the load; only the
+            // file append can race us.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while engagement_count(env.a) <= before {
+                if Instant::now() >= deadline {
+                    bail!(
+                        "the overlap-enabled distributed load never logged \
+                         {ENGAGEMENT_NEEDLE:?} — llama.cpp's pipeline gate did not engage \
+                         (patch 0003 observable, docs/perf.md §3)"
+                    );
+                }
+                std::thread::sleep(POLL_INTERVAL);
+            }
+            let name = model_name(env.a)?;
+            perf_measure_runs(env.a, &name, "overlap")
+        },
+    )?;
+
+    // The comparison. Numbers print in BOTH modes (the contract wants them
+    // diffable in CI logs); only the netem leg asserts.
+    let seq_prefill = median_u64(&sequential.iter().map(|l| l.prefill_ms).collect::<Vec<_>>());
+    let ov_prefill = median_u64(&overlapped.iter().map(|l| l.prefill_ms).collect::<Vec<_>>());
+    let seq_tps = median_f64(&sequential.iter().map(decode_tps).collect::<Vec<_>>());
+    let ov_tps = median_f64(&overlapped.iter().map(decode_tps).collect::<Vec<_>>());
+    let ratio = ov_prefill as f64 / seq_prefill.max(1) as f64;
+    let name = if netem {
+        "m7 overlap: netem asserts — prefill overlap <= 0.75x sequential, decode >= 0.9x"
+    } else {
+        "m7 overlap: measured medians (assert-free smoke; the netem leg asserts)"
+    };
+    step(name, || {
+        println!(
+            "       prefill median {seq_prefill} ms sequential vs {ov_prefill} ms overlapped \
+             (ratio {ratio:.2}); decode median {seq_tps:.1} tok/s sequential vs {ov_tps:.1} \
+             tok/s overlapped"
+        );
+        if !netem {
+            println!(
+                "       (loopback link: the ratio is not meaningful here — the 1 Gbit netem \
+                 leg is where docs/perf.md's >= 25% saving is asserted)"
+            );
+            return Ok(());
+        }
+        if ratio > 0.75 {
+            bail!(
+                "overlapped prefill median {ov_prefill} ms is {ratio:.2}x the sequential \
+                 {seq_prefill} ms; docs/perf.md demands <= 0.75x (>= 25% saving) on the \
+                 1 Gbit / 0.5 ms link"
+            );
+        }
+        if ov_tps < 0.9 * seq_tps {
+            bail!(
+                "overlapped decode {ov_tps:.1} tok/s regressed below 0.9x the sequential \
+                 {seq_tps:.1} tok/s (docs/perf.md: no decode regression)"
+            );
+        }
+        Ok(())
+    })
+}
+
+/// M7 steps 19–22 (docs/perf.md "DoD hooks"): the loopback-mode
+/// performance proofs, run after the M6 logistics section on the same
+/// paired daemons. Non-netem only (module docs).
+fn perf_section(env: &ChaosEnv) -> Result<()> {
+    // The M6 fake-WAN override must not leak into daemons restarted here:
+    // the bench step pulls the real registry test model over the WAN.
+    std::env::remove_var("OB_HF_BASE_URL");
+    perf_overlap_step(env, false)?;
+    perf_speculative_step(env)?;
+    perf_reuse_step(env)?;
+    perf_microbatch_step(env)?;
+    perf_bench_step(env)
+}
+
+/// New-token budget of the speculative-equivalence generations: 3 draft
+/// rounds at K=8 — enough for the counters to move, small enough to stay
+/// quick times four loads.
+const SPEC_MAX_TOKENS: u32 = 24;
+
+/// M7 step 19: speculative greedy token-equivalence (docs/perf.md §5 DoD)
+/// — `--speculative` with the draft set to the SAME tiny model must stream
+/// byte-identical greedy output against a solo AND a distributed target,
+/// with the perf line's acceptance counter moving.
+fn perf_speculative_step(env: &ChaosEnv) -> Result<()> {
+    let (mesh_a, mesh_b, _mesh_c) = env.mesh;
+    step(
+        "m7 speculative: restart A+B on the default perf config",
+        || {
+            restart_with(env.a, mesh_a, false, SimKnobs::default())?;
+            restart_with(env.b, mesh_b, false, SimKnobs::default())?;
+            wait_connected(
+                env.a,
+                env.b,
+                env.peer_a,
+                env.peer_b,
+                "after the m7 speculative restart",
+            )
+        },
+    )?;
+    // One load + one greedy generation; asserts the plan shape and that
+    // the §5 counters move exactly when speculation is on.
+    let run = |body: &Value, speculative: bool, distributed: bool| -> Result<(String, PerfLine)> {
+        let plan = load_model(env.a, body)?;
+        if distributed {
+            assert_pipeline(&plan)?;
+        } else {
+            assert_solo(&plan)?;
+        }
+        let name = model_name(env.a)?;
+        let (text, line) = generate_raw(env.a, &name, PROMPT, SPEC_MAX_TOKENS)?;
+        if text.is_empty() {
+            bail!("empty greedy completion (speculative={speculative}): {line:?}");
+        }
+        if speculative {
+            if line.drafted == 0 || line.accepted == 0 {
+                bail!(
+                    "speculative run logged drafted {} accepted {} — the §5 counters must \
+                     move: {line:?}",
+                    line.drafted,
+                    line.accepted
+                );
+            }
+            if line.accepted > line.drafted {
+                bail!(
+                    "accepted {} exceeds drafted {}",
+                    line.accepted,
+                    line.drafted
+                );
+            }
+        } else if line.drafted != 0 || line.accepted != 0 {
+            bail!(
+                "non-speculative run logged drafted {} accepted {}; both must be 0",
+                line.drafted,
+                line.accepted
+            );
+        }
+        Ok((text, line))
+    };
+    step(
+        "m7 speculative: solo target — byte-identical to non-speculative, accepted > 0",
+        || {
+            let (control, _) = run(&json!({ "model": env.model_arg }), false, false)?;
+            let (spec, line) = run(
+                &json!({ "model": env.model_arg, "speculative": true, "draft": env.model_arg }),
+                true,
+                false,
+            )?;
+            if spec != control {
+                bail!(
+                    "solo speculative and control outputs differ:\n  speculative: \
+                     {spec:?}\n  control:     {control:?}"
+                );
+            }
+            println!(
+                "       solo: drafted {} accepted {} — output byte-identical",
+                line.drafted, line.accepted
+            );
+            Ok(())
+        },
+    )?;
+    step(
+        "m7 speculative: distributed target (forced 2 nodes) — byte-identical, accepted > 0",
+        || {
+            let (control, _) = run(&json!({ "model": env.model_arg, "nodes": 2 }), false, true)?;
+            let (spec, line) = run(
+                &json!({
+                    "model": env.model_arg, "nodes": 2,
+                    "speculative": true, "draft": env.model_arg,
+                }),
+                true,
+                true,
+            )?;
+            if spec != control {
+                bail!(
+                    "distributed speculative and control outputs differ:\n  speculative: \
+                     {spec:?}\n  control:     {control:?}"
+                );
+            }
+            println!(
+                "       distributed: drafted {} accepted {} — output byte-identical",
+                line.drafted, line.accepted
+            );
+            Ok(())
+        },
+    )
+}
+
+/// Prompt A of the reuse proof: long enough that its token count clears
+/// the contract's 64-token reuse floor on stories260K's 512-piece
+/// vocabulary (~3-4 chars per token; asserted at run time), ending on a
+/// clean sentence boundary so `tokens(A)` is a prefix of
+/// `tokens(A + REUSE_SUFFIX)`.
+const REUSE_PROMPT_A: &str = "Once upon a time there was a little girl named Lily. She loved \
+    to play in the garden behind her house every single day. One sunny morning she found a \
+    tiny golden key hidden under a big red flower. Lily picked up the key and wondered what \
+    it could open. She asked her mom, she asked her dad, and she even asked the old gray cat \
+    sleeping on the porch.";
+/// Request B's divergent suffix. Starts with a word no greedy TinyStories
+/// continuation of A produces, so the retained history's LCP stops exactly
+/// at A — the exact-suffix prefill assert below fails loudly (and
+/// deterministically: greedy, fixed model) if either assumption breaks.
+const REUSE_SUFFIX: &str = " Zanzibar was the name of the key maker, and nobody in town had \
+    ever met him before.";
+const REUSE_MAX_TOKENS: u32 = 24;
+
+/// M7 step 20: prefix/KV reuse (docs/perf.md §4 DoD) — warm requests
+/// decode exactly the divergent suffix (1 token for an identical
+/// re-request) and stay byte-identical to cold-cache controls.
+fn perf_reuse_step(env: &ChaosEnv) -> Result<()> {
+    let prompt_b = format!("{REUSE_PROMPT_A}{REUSE_SUFFIX}");
+    let (b_cold_text, b_cold) = step(
+        "m7 reuse: cold-cache control for the suffixed prompt",
+        || {
+            // Every load is a fresh phase: the engine host rebuilds the
+            // session at the barrier, dropping retained slots (§4 resets),
+            // so this B run is cold by construction.
+            let plan = load_model(env.a, &json!({ "model": env.model_arg }))?;
+            assert_solo(&plan)?;
+            let name = model_name(env.a)?;
+            let (text, line) = generate_raw(env.a, &name, &prompt_b, REUSE_MAX_TOKENS)?;
+            if text.is_empty() {
+                bail!("empty control completion");
+            }
+            Ok((text, line))
+        },
+    )?;
+    step(
+        "m7 reuse: warm prefill == suffix length; identical re-request == 1; bytes match cold",
+        || {
+            let plan = load_model(env.a, &json!({ "model": env.model_arg }))?;
+            assert_solo(&plan)?;
+            let name = model_name(env.a)?;
+            let (a_text, a_cold) = generate_raw(env.a, &name, REUSE_PROMPT_A, REUSE_MAX_TOKENS)?;
+            if a_cold.prefill_tok < 64 {
+                bail!(
+                    "prompt A is only {} tokens, under the 64-token reuse floor — lengthen \
+                     REUSE_PROMPT_A",
+                    a_cold.prefill_tok
+                );
+            }
+            let (a_warm_text, a_warm) =
+                generate_raw(env.a, &name, REUSE_PROMPT_A, REUSE_MAX_TOKENS)?;
+            if a_warm.prefill_tok != 1 {
+                bail!(
+                    "the identical re-request prefilled {}tok; §4 pins exactly 1 (LCP capped \
+                     one below the prompt length): cold {a_cold:?} warm {a_warm:?}",
+                    a_warm.prefill_tok
+                );
+            }
+            if a_warm_text != a_text {
+                bail!(
+                    "reuse changed greedy output for A:\n  cold: {a_text:?}\n  warm: \
+                     {a_warm_text:?}"
+                );
+            }
+            let (b_warm_text, b_warm) = generate_raw(env.a, &name, &prompt_b, REUSE_MAX_TOKENS)?;
+            let suffix_tokens = b_cold.prefill_tok - a_cold.prefill_tok;
+            if b_warm.prefill_tok != suffix_tokens {
+                bail!(
+                    "request B prefilled {}tok, expected exactly the suffix length \
+                     {suffix_tokens} (cold B {} - cold A {}); either the retained history's \
+                     LCP extended past A (A's greedy continuation collides with \
+                     REUSE_SUFFIX) or the tokenizer merged across the junction — both mean \
+                     the pinned prompts need adjusting, not the daemon",
+                    b_warm.prefill_tok,
+                    b_cold.prefill_tok,
+                    a_cold.prefill_tok
+                );
+            }
+            if b_warm_text != b_cold_text {
+                bail!(
+                    "warm B output differs from the cold-cache control:\n  warm: \
+                     {b_warm_text:?}\n  cold: {b_cold_text:?}"
+                );
+            }
+            println!(
+                "       cold A {}tok; identical re-request prefilled 1tok; B {}tok cold -> \
+                 {}tok warm (the suffix)",
+                a_cold.prefill_tok, b_cold.prefill_tok, b_warm.prefill_tok
+            );
+            Ok(())
+        },
+    )
+}
+
+const MB_PROMPT_Y: &str = "The three friends walked into the forest";
+const MB_MAX_TOKENS: u32 = 24;
+/// `[debug] decode_delay_ms` for the micro-batch phase: 24 tokens take
+/// ~1.9 s, so two running streams are still mid-flight when the queue
+/// overflow is probed (~0.7 s in).
+const MB_DECODE_DELAY_MS: u64 = 80;
+/// Between SSE events of a micro-batch stream: the queued stream's first
+/// piece waits for a slot behind ~2 s of decode-delayed generation.
+const MB_EVENT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Pump one open chat stream until its first non-empty content piece
+/// (proves the request was ADMITTED and is decoding, not queued).
+fn pump_until_piece(rx: &std::sync::mpsc::Receiver<String>, watch: &mut StreamWatch) -> Result<()> {
+    while watch.pieces.is_empty() {
+        match rx.recv_timeout(MB_EVENT_TIMEOUT) {
+            Ok(payload) => {
+                if watch.observe(&payload) == StreamAction::Finished {
+                    bail!(
+                        "stream ended before any content piece (errors: {:?})",
+                        watch.errors
+                    );
+                }
+            }
+            Err(e) => bail!("no SSE event while waiting for the first piece: {e}"),
+        }
+    }
+    Ok(())
+}
+
+/// Pump one open chat stream to `[DONE]` / stream end.
+fn drain_stream(rx: &std::sync::mpsc::Receiver<String>, watch: &mut StreamWatch) -> Result<()> {
+    loop {
+        match rx.recv_timeout(MB_EVENT_TIMEOUT) {
+            Ok(payload) => {
+                if watch.observe(&payload) == StreamAction::Finished {
+                    return Ok(());
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => bail!(
+                "no SSE event within {MB_EVENT_TIMEOUT:?} while draining ({} pieces so far)",
+                watch.pieces.len()
+            ),
+        }
+    }
+}
+
+/// M7 step 21: micro-batched decode (docs/perf.md §6 DoD) — two
+/// concurrent streams complete byte-identical to their alone-runs, a third
+/// queues and completes, and a fourth is refused with the typed 429.
+fn perf_microbatch_step(env: &ChaosEnv) -> Result<()> {
+    let (mesh_a, _mesh_b, _mesh_c) = env.mesh;
+    step(
+        "m7 micro-batch: restart A — [perf] max_concurrent 2 / queue_depth 1, decode delay",
+        || {
+            restart_with(
+                env.a,
+                mesh_a,
+                false,
+                SimKnobs {
+                    max_concurrent: Some(2),
+                    queue_depth: Some(1),
+                    // Cold prefills everywhere: byte-identity here must be
+                    // §6's concurrency proof, not §4's reuse guarantee.
+                    kv_reuse: Some(false),
+                    decode_delay_ms: Some(MB_DECODE_DELAY_MS),
+                    ..SimKnobs::default()
+                },
+            )?;
+            let plan = load_model(env.a, &json!({ "model": env.model_arg }))?;
+            assert_solo(&plan)
+        },
+    )?;
+    let model = model_name(env.a)?;
+    let (x_alone, y_alone) = step(
+        "m7 micro-batch: alone-run controls for both prompts",
+        || {
+            let (x, _, _) = chat_full(env.a, &model, PROMPT, MB_MAX_TOKENS)?;
+            let (y, _, _) = chat_full(env.a, &model, MB_PROMPT_Y, MB_MAX_TOKENS)?;
+            if x.is_empty() || y.is_empty() {
+                bail!("an alone-run returned empty text (X {x:?}, Y {y:?})");
+            }
+            Ok((x, y))
+        },
+    )?;
+    step(
+        "m7 micro-batch: 2 running + 1 queued stream byte-identical; 4th request gets the typed 429",
+        || {
+            // Open X and Y and wait for a content piece from each: both are
+            // ADMITTED and decoding concurrently (the §6 micro-batch).
+            let rx1 = open_chat_stream(env.a, &model, PROMPT, MB_MAX_TOKENS)?;
+            let mut w1 = StreamWatch::new(usize::MAX);
+            pump_until_piece(&rx1, &mut w1)?;
+            let rx2 = open_chat_stream(env.a, &model, MB_PROMPT_Y, MB_MAX_TOKENS)?;
+            let mut w2 = StreamWatch::new(usize::MAX);
+            pump_until_piece(&rx2, &mut w2)?;
+            // The third fills the queue. Its 200 header only arrives after
+            // admission counted it, so once this returns the daemon holds
+            // max_concurrent + queue_depth = 3 jobs.
+            let rx3 = open_chat_stream(env.a, &model, PROMPT, MB_MAX_TOKENS)?;
+            let mut w3 = StreamWatch::new(usize::MAX);
+            // The running pair still has ~1.5 s of decode-delayed
+            // generation left; probe the overflow inside that window.
+            std::thread::sleep(Duration::from_millis(250));
+            let body = json!({
+                "model": model,
+                "messages": [{ "role": "user", "content": PROMPT }],
+                "stream": false,
+                "temperature": 0,
+                "max_tokens": MB_MAX_TOKENS,
+            });
+            let (code, text) =
+                env.a
+                    .http("POST", "/v1/chat/completions", Some(&body), GEN_TIMEOUT)?;
+            if code != 429 {
+                bail!("the overflow request answered HTTP {code}, expected 429: {text}");
+            }
+            if !text.contains("rate_limit_error") {
+                bail!("the 429 body lacks the rate_limit_error envelope: {text}");
+            }
+            if !text.contains("max_concurrent_requests") {
+                bail!("the 429 remedy does not name the [perf] knobs: {text}");
+            }
+            drain_stream(&rx1, &mut w1)?;
+            drain_stream(&rx2, &mut w2)?;
+            drain_stream(&rx3, &mut w3)?;
+            for (label, watch, want) in [
+                ("X", &w1, &x_alone),
+                ("Y", &w2, &y_alone),
+                ("queued X", &w3, &x_alone),
+            ] {
+                if !watch.errors.is_empty() {
+                    bail!("stream {label} carried error events: {:?}", watch.errors);
+                }
+                if !watch.done {
+                    bail!("stream {label} never reached [DONE]");
+                }
+                let got = watch.text();
+                if &got != want {
+                    bail!(
+                        "stream {label} differs from its alone-run (§6 byte-identity):\n  \
+                         concurrent: {got:?}\n  alone:      {want:?}"
+                    );
+                }
+            }
+            println!(
+                "       X, Y, and the queued X all byte-identical to their alone-runs; the \
+                 overflow request was refused 429 with the config remedy"
+            );
+            Ok(())
+        },
+    )
+}
+
+/// Registry id of the microbench model (onebraind's `BENCH_MODEL_ID`),
+/// pre-pulled on B so its mesh BenchSource answers with real figures
+/// instead of the cannot-bench-now marker.
+const BENCH_MODEL_ID: &str = "tinystories-260k";
+
+/// M7 step 22: `onebrain bench --cluster` smoke (docs/perf.md §10 DoD) —
+/// the CLI report against the live 2-node cluster parses with the
+/// contract's exact tables and no failed rows.
+fn perf_bench_step(env: &ChaosEnv) -> Result<()> {
+    let (mesh_a, _mesh_b, _mesh_c) = env.mesh;
+    step(
+        "m7 bench: restart A default; solo reload; B pre-pulls the bench model",
+        || {
+            restart_with(env.a, mesh_a, false, SimKnobs::default())?;
+            wait_connected(
+                env.a,
+                env.b,
+                env.peer_a,
+                env.peer_b,
+                "after the m7 bench restart",
+            )?;
+            // A loaded model makes the e2e section measure IT (the loaded
+            // reference rides on /api/internal/status) instead of pulling
+            // the fallback bench model for the timed runs.
+            let plan = load_model(env.a, &json!({ "model": env.model_arg }))?;
+            assert_solo(&plan)?;
+            // B needs the bench model fully cached (manifest + exact size)
+            // or its BenchSource honestly answers UNAVAILABLE. Nobody has
+            // it yet, so this is a real ~1.2 MB WAN fetch — the same file
+            // `cargo xtask smoke` downloads; A's local microbench inside
+            // `bench --cluster` then fetches it LAN-first from B.
+            api_pull(env.b, BENCH_MODEL_ID)
+        },
+    )?;
+    step(
+        "m7 bench: `onebrain bench --cluster` renders the parseable markdown report",
+        || {
+            let out = env.a.onebrain(&["bench", "--cluster"])?;
+            if !out.status.success() {
+                bail!(
+                    "`onebrain bench --cluster` failed (exit {:?}):\n{}",
+                    out.status.code(),
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+            }
+            let report = String::from_utf8_lossy(&out.stdout);
+            check_cluster_bench_markdown(&report, env.a.name, env.b.name)?;
+            println!(
+                "       report parses: Nodes/Links/End-to-end present, peer '{}' measured, \
+                 all three e2e runs succeeded",
+                env.b.name
+            );
+            Ok(())
+        },
+    )?;
+    Ok(())
+}
+
+/// The `bench --cluster` markdown contract (the bench notes' exact column
+/// sets and run labels), plus strict health: no failed e2e runs, no
+/// unanswered peers, no cannot-bench-now marker (B was pre-seeded), and a
+/// measured link table. Pure over the report text so a fixture pins it.
+fn check_cluster_bench_markdown(report: &str, local_node: &str, peer_node: &str) -> Result<()> {
+    for needle in [
+        "# OneBrain cluster bench",
+        "## Nodes",
+        "| node | memory | prefill tok/s | decode tok/s | disk MB/s | measured |",
+        "## Links",
+        "| peer | RTT ms | bandwidth Mbps | loss % |",
+        "## End-to-end generation",
+        "| run | prefill_overlap | kv_reuse | plan | prefill tok | prefill ms | \
+         prefill tok/s | decode tok | decode ms | decode tok/s | total ms |",
+        "| as configured |",
+        "| M3 baseline |",
+        "| solo local |",
+        "comparisons, not promises.",
+    ] {
+        if !report.contains(needle) {
+            bail!("bench --cluster report lacks {needle:?}:\n{report}");
+        }
+    }
+    let local_row = format!("| {local_node} (local) |");
+    if !report.contains(&local_row) {
+        bail!("bench --cluster report lacks the local row {local_row:?}:\n{report}");
+    }
+    let peer_row = format!("| {peer_node} |");
+    if !report.contains(&peer_row) {
+        bail!("bench --cluster report lacks the peer row {peer_row:?}:\n{report}");
+    }
+    for forbidden in [
+        "' failed:",
+        "did not answer",
+        "cannot bench now",
+        "no links measured",
+    ] {
+        if report.contains(forbidden) {
+            bail!("bench --cluster report carries {forbidden:?}:\n{report}");
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Chaos support: SSE stream watching, kill-window logic, error shape checks
 // ---------------------------------------------------------------------------
 
@@ -1889,17 +2907,22 @@ impl StreamWatch {
     }
 }
 
-/// Open a streaming OpenAI chat completion (temperature 0, fixed prompt,
-/// [`CHAOS_MAX_TOKENS`]) and read its SSE events on a collector thread:
-/// each `data:` payload arrives on the returned channel; the thread ends
-/// with the stream. Non-netem only (the chaos section guards this).
-fn open_chat_stream(node: &Node, model: &str) -> Result<std::sync::mpsc::Receiver<String>> {
+/// Open a streaming OpenAI chat completion (temperature 0) and read its
+/// SSE events on a collector thread: each `data:` payload arrives on the
+/// returned channel; the thread ends with the stream. Non-netem only (the
+/// chaos and M7 sections that call this run on shared loopback).
+fn open_chat_stream(
+    node: &Node,
+    model: &str,
+    prompt: &str,
+    max_tokens: u32,
+) -> Result<std::sync::mpsc::Receiver<String>> {
     let body = json!({
         "model": model,
-        "messages": [{ "role": "user", "content": PROMPT }],
+        "messages": [{ "role": "user", "content": prompt }],
         "stream": true,
         "temperature": 0,
-        "max_tokens": CHAOS_MAX_TOKENS,
+        "max_tokens": max_tokens,
     });
     let resp = node
         .client
@@ -1950,7 +2973,7 @@ fn run_chaos_stream(
     model: &str,
     kill: impl FnOnce() -> Result<()>,
 ) -> Result<StreamWatch> {
-    let rx = open_chat_stream(node, model)?;
+    let rx = open_chat_stream(node, model, PROMPT, CHAOS_MAX_TOKENS)?;
     let mut watch = StreamWatch::new(CHAOS_KILL_AFTER_CHUNKS);
     let mut kill = Some(kill);
     loop {
@@ -1978,15 +3001,17 @@ fn run_chaos_stream(
 }
 
 /// One non-streaming greedy chat completion with `max_tokens`; returns
-/// (text, usage.completion_tokens, finish_reason) — the chaos control run.
+/// (text, usage.completion_tokens, finish_reason) — the chaos control run
+/// and the M7 micro-batch alone-runs.
 fn chat_full(
     node: &Node,
     model: &str,
+    prompt: &str,
     max_tokens: u32,
 ) -> Result<(String, Option<u64>, Option<String>)> {
     let body = json!({
         "model": model,
-        "messages": [{ "role": "user", "content": PROMPT }],
+        "messages": [{ "role": "user", "content": prompt }],
         "stream": false,
         "temperature": 0,
         "max_tokens": max_tokens,
@@ -2602,6 +3627,17 @@ struct SimKnobs {
     /// emitted token (docs/resilience.md sim hooks — keeps a tiny model's
     /// stream open long enough to kill a worker mid-generation).
     decode_delay_ms: Option<u64>,
+    /// `[perf] n_ubatch` (docs/perf.md §3): the physical micro-batch fed
+    /// to the engine session — the M7 overlap step shrinks it so one
+    /// `n_batch` chunk carries a deep ubatch train to pipeline.
+    n_ubatch: Option<u32>,
+    /// `[perf] max_concurrent_requests` (docs/perf.md §6).
+    max_concurrent: Option<u32>,
+    /// `[perf] queue_depth` (docs/perf.md §6).
+    queue_depth: Option<u32>,
+    /// `[perf] kv_reuse` (docs/perf.md §4): `false` = reset-per-request,
+    /// which the timed/concurrent M7 steps need for cold prefills.
+    kv_reuse: Option<bool>,
 }
 
 impl SimKnobs {
@@ -2644,6 +3680,27 @@ fn render_sim_config(
          enable_relays = false\n\
          bind_addr = \"{mesh_host}:{mesh_port}\"\n"
     ));
+    // The [perf] table (docs/perf.md; onebraind::config::PerfSection —
+    // deny_unknown_fields, so these key names are contract-exact). Only
+    // rendered when an M7 step asks: every other phase runs the defaults.
+    let perf_lines: Vec<String> = [
+        knobs
+            .max_concurrent
+            .map(|m| format!("max_concurrent_requests = {m}")),
+        knobs.queue_depth.map(|q| format!("queue_depth = {q}")),
+        knobs.n_ubatch.map(|u| format!("n_ubatch = {u}")),
+        knobs.kv_reuse.map(|k| format!("kv_reuse = {k}")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if !perf_lines.is_empty() {
+        cfg.push_str("\n[perf]\n");
+        for line in &perf_lines {
+            cfg.push_str(line);
+            cfg.push('\n');
+        }
+    }
     if knobs.cap_bytes.is_some()
         || knobs.decode_tps_override.is_some()
         || knobs.decode_delay_ms.is_some()
@@ -4087,5 +5144,224 @@ onebrain 4242 user   11u  IPv4 0xdeadbeef      0t0  TCP 10.0.0.5:52001->1.2.3.4:
             parse_present_line("rpc-cache: pre-seeded 3 tensors (1 bytes) for epoch 2"),
             None
         );
+    }
+
+    // ---- M7 performance section ------------------------------------------
+
+    #[test]
+    fn m7_perf_model_is_a_parseable_gguf_with_the_pinned_shape() {
+        let bytes = build_perf_model();
+        let dims = parse_gguf_dims(&bytes, bytes.len() as u64).unwrap();
+        assert_eq!(dims.n_layers, u64::from(PERF_N_LAYERS));
+        // The MIRROR parser knows nothing of `attention.key_length`, so it
+        // reports the conservative n_head_kv × (n_embd / n_head) = 8192
+        // KV width (kv_rate 4×8192). The REAL per-layer KV is 16-wide and
+        // tiny — harmless either way, because no sim cap math ever touches
+        // this model: the overlap step loads it uncapped with --nodes 2.
+        assert_eq!(dims.kv_rate, 32_768);
+        // token_embd/output 2 × 8,486,912 B + 2 layers × 5,308,416 B +
+        // output_norm 32,768 B.
+        assert_eq!(dims.total_weight_bytes, 27_623_424);
+        // Small enough to push over loopback quickly, big enough to matter.
+        assert!(bytes.len() < 40 << 20, "{}", bytes.len());
+        // All-zero data section: the boundary traffic is real, the math is
+        // degenerate-but-deterministic (argmax ties resolve to token 0).
+        let data_start = bytes.len() as u64 - dims.total_weight_bytes;
+        assert!(bytes[data_start as usize..].iter().all(|b| *b == 0));
+    }
+
+    #[test]
+    fn m7_perf_model_sizing_meets_the_overlap_contract() {
+        // The ≥ 40% sizing rule (docs/perf.md "DoD hooks"), pinned with the
+        // exact arithmetic from the PERF_ constant block.
+        let w_layer =
+            u64::from(PERF_N_EMBD) * (4 * u64::from(PERF_HEAD_DIM) + 3 * u64::from(PERF_N_FF) + 2);
+        assert_eq!(w_layer, 1_327_104);
+        let transfer_bytes = 4 * u64::from(PERF_N_EMBD) * u64::from(PERF_N_UBATCH);
+        assert_eq!(transfer_bytes, 2_097_152);
+        // 1 Gbit = 125,000,000 B/s.
+        let transfer_ms = transfer_bytes as f64 * 1000.0 / 125_000_000.0;
+        assert!((transfer_ms - 16.777).abs() < 0.01, "{transfer_ms}");
+        // 2 flops per parameter per token, at the conservative 20 GFLOP/s
+        // effective-f32 floor from the constant block's comment.
+        let stage_ms = 2.0 * f64::from(PERF_N_UBATCH) * w_layer as f64 / 20e9 * 1000.0;
+        let wall_ms = 2.0 * stage_ms + transfer_ms + 1.0; // + ~1 ms shaped RTT
+        assert!(
+            transfer_ms >= 0.40 * wall_ms,
+            "boundary copy {transfer_ms:.1} ms must be >= 40% of per-ubatch wall \
+             {wall_ms:.1} ms"
+        );
+        // The long prompt: ~3.4k byte-fallback tokens (a space is 3 tokens
+        // — see perf_prompt — so one 62-char sentence is exactly 76), and
+        // prompt + decode budget stays inside the 4096 context with slack.
+        let prompt = perf_prompt();
+        assert!(prompt.is_ascii());
+        assert_eq!(prompt.len(), 45 * 62);
+        let sentence_tokens: u32 = 55 + 3 * 7; // non-space bytes + 3-byte spaces
+        let prompt_tokens: u32 = 45 * sentence_tokens + 8; // + BOS/lead-in slack
+        assert!(prompt_tokens >= 3_000);
+        assert!(prompt_tokens + PERF_DECODE_TOKENS < 4_096);
+    }
+
+    #[test]
+    fn m7_perf_line_parser_reads_the_daemon_format() {
+        // The §1 line as onebraind::engine_host emits it (tracing prefix
+        // included), with the §5 counters.
+        let line = "2026-08-30T00:00:00.000000Z  INFO onebraind::engine_host: \
+                    perf: prefill 3411tok 1874ms decode 64tok 187ms ttft 1902ms \
+                    drafted 24 accepted 21";
+        assert_eq!(
+            parse_perf_line(line),
+            Some(PerfLine {
+                prefill_tok: 3411,
+                prefill_ms: 1874,
+                decode_tok: 64,
+                decode_ms: 187,
+                ttft_ms: 1902,
+                drafted: 24,
+                accepted: 21,
+            })
+        );
+        // Prefix-tolerant (the d2 handoff): a line without the drafted
+        // tail parses with 0/0 counters...
+        let bare = parse_perf_line("perf: prefill 1tok 0ms decode 24tok 40ms ttft 1ms").unwrap();
+        assert_eq!((bare.prefill_tok, bare.drafted, bare.accepted), (1, 0, 0));
+        // ...and trailing text after the accepted count is ignored.
+        let extended = parse_perf_line(
+            "perf: prefill 6tok 2ms decode 8tok 9ms ttft 3ms drafted 8 \
+                             accepted 8 reused 0",
+        )
+        .unwrap();
+        assert_eq!((extended.drafted, extended.accepted), (8, 8));
+        assert_eq!(parse_perf_line("logistics: fetched 1 bytes p2p"), None);
+        assert_eq!(parse_perf_line("perf: prefill garbage"), None);
+    }
+
+    #[test]
+    fn sim_config_renders_the_m7_perf_knobs() {
+        let cfg = render_sim_config(
+            "sim-a",
+            1,
+            2,
+            false,
+            SimKnobs {
+                n_ubatch: Some(64),
+                kv_reuse: Some(false),
+                ..SimKnobs::default()
+            },
+        );
+        assert!(cfg.contains("\n[perf]\nn_ubatch = 64\nkv_reuse = false\n"));
+        assert!(!cfg.contains("max_concurrent_requests"));
+        assert!(!cfg.contains("queue_depth"));
+        assert!(cfg.find("[mesh]").unwrap() < cfg.find("[perf]").unwrap());
+
+        // The micro-batch shape: [perf] sits between [mesh] and [debug].
+        let cfg = render_sim_config(
+            "sim-a",
+            1,
+            2,
+            false,
+            SimKnobs {
+                max_concurrent: Some(2),
+                queue_depth: Some(1),
+                kv_reuse: Some(false),
+                decode_delay_ms: Some(80),
+                ..SimKnobs::default()
+            },
+        );
+        assert!(cfg.contains("max_concurrent_requests = 2\n"));
+        assert!(cfg.contains("queue_depth = 1\n"));
+        assert!(cfg.contains("kv_reuse = false\n"));
+        assert!(!cfg.contains("n_ubatch"));
+        assert!(cfg.find("[mesh]").unwrap() < cfg.find("[perf]").unwrap());
+        assert!(cfg.find("[perf]").unwrap() < cfg.find("[debug]").unwrap());
+
+        // Every pre-M7 phase renders no [perf] table at all.
+        assert!(!render_sim_config("sim-a", 1, 2, false, SimKnobs::default()).contains("[perf]"));
+        assert!(
+            !render_sim_config("sim-a", 1, 2, false, SimKnobs::capped(1_000_000))
+                .contains("[perf]")
+        );
+    }
+
+    #[test]
+    fn m7_medians_and_decode_throughput() {
+        assert_eq!(median_u64(&[5, 1, 9]), 5);
+        assert_eq!(median_u64(&[7]), 7);
+        assert!((median_f64(&[8.0, 2.0, 4.0]) - 4.0).abs() < f64::EPSILON);
+        let line = PerfLine {
+            prefill_tok: 3411,
+            prefill_ms: 1874,
+            decode_tok: 64,
+            decode_ms: 200,
+            ttft_ms: 0,
+            drafted: 0,
+            accepted: 0,
+        };
+        assert!((decode_tps(&line) - 320.0).abs() < 1e-9);
+        // A 0 ms decode (sub-ms truncation) never divides by zero.
+        let fast = PerfLine {
+            decode_ms: 0,
+            ..line
+        };
+        assert!((decode_tps(&fast) - 64_000.0).abs() < 1e-9);
+    }
+
+    /// A minimal report in exactly the CLI's `--cluster` markdown shape
+    /// (crates/onebrain-cli/src/commands/bench.rs `render_cluster_report`).
+    fn cluster_bench_fixture() -> String {
+        "# OneBrain cluster bench\n\n\
+         node sim-a\n\n\
+         ## Nodes\n\n\
+         | node | memory | prefill tok/s | decode tok/s | disk MB/s | measured |\n\
+         |---|---|---|---|---|---|\n\
+         | sim-a (local) | 31.9 GB | 812.5 | 41.3 | 1732.0 | 2m ago |\n\
+         | sim-b | - | 700.1 | 39.9 | 1500.0 | just now |\n\n\
+         ## Links\n\n\
+         | peer | RTT ms | bandwidth Mbps | loss % |\n\
+         |---|---|---|---|\n\
+         | sim-b | 0.9 | 940 | 0.0 |\n\n\
+         ## End-to-end generation\n\n\
+         model `local:stories260K` · prompt 1218 chars · max 64 new tokens · greedy \
+         (temperature 0)\n\n\
+         | run | prefill_overlap | kv_reuse | plan | prefill tok | prefill ms | \
+         prefill tok/s | decode tok | decode ms | decode tok/s | total ms |\n\
+         |---|---|---|---|---|---|---|---|---|---|---|\n\
+         | as configured | true | true | Solo (epoch 3) | 300 | 12.0 | 25000.0 | 64 | 40.0 \
+         | 1600.0 | 52.0 |\n\
+         | M3 baseline | false | false | Solo (epoch 4) | 300 | 12.0 | 25000.0 | 64 | 40.0 \
+         | 1600.0 | 52.0 |\n\
+         | solo local | true | true | Solo (epoch 5) | 300 | 12.0 | 25000.0 | 64 | 40.0 \
+         | 1600.0 | 52.0 |\n\n\
+         Measured values on this hardware, model, plan, and config — comparisons, not \
+         promises.\n"
+            .to_string()
+    }
+
+    #[test]
+    fn m7_cluster_bench_markdown_check_pins_the_contract_shape() {
+        let good = cluster_bench_fixture();
+        check_cluster_bench_markdown(&good, "sim-a", "sim-b").unwrap();
+
+        // Wrong peer name: the pre-seeded worker's row must exist.
+        assert!(check_cluster_bench_markdown(&good, "sim-a", "sim-c").is_err());
+        // A missing footer (truncated report) fails.
+        let truncated = good.replace("comparisons, not promises.", "");
+        assert!(check_cluster_bench_markdown(&truncated, "sim-a", "sim-b").is_err());
+        // The cannot-bench-now marker on the pre-seeded peer fails.
+        let unavailable = good.replace(
+            "| 700.1 | 39.9 | 1500.0 | just now |",
+            "| - | - | - | cannot bench now |",
+        );
+        assert!(check_cluster_bench_markdown(&unavailable, "sim-a", "sim-b").is_err());
+        // A failed e2e run's trailer fails.
+        let failed = format!("{good}\n- run 'M3 baseline' failed: load failed\n");
+        assert!(check_cluster_bench_markdown(&failed, "sim-a", "sim-b").is_err());
+        // An empty link table fails (the pair is connected and measured).
+        let no_links = good.replace(
+            "| peer | RTT ms | bandwidth Mbps | loss % |",
+            "no links measured (pair another device with `onebrain pair`)",
+        );
+        assert!(check_cluster_bench_markdown(&no_links, "sim-a", "sim-b").is_err());
     }
 }
