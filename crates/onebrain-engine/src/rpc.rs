@@ -273,9 +273,7 @@ impl RpcSession {
 
     /// Whether the serve thread has ended.
     pub fn is_finished(&self) -> bool {
-        self.serve
-            .as_ref()
-            .map_or(true, RpcServeSession::is_finished)
+        self.serve.as_ref().is_none_or(RpcServeSession::is_finished)
     }
 
     /// Close the bridge end (if still held) and wait up to `timeout` for
