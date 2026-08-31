@@ -21,15 +21,15 @@
 //!   latbench dist <model> [prompt] [gen]      loopback 2-device decode + RPC counts
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::io::Read;
+use std::net::{Shutdown, TcpListener};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use onebrain_engine::rpc::{RemoteServer, RpcServeSession, SocketPair};
+use onebrain_engine::rpc::{Duplex, RemoteServer, RpcServeSession, SocketPair};
 use onebrain_engine::{
     devices, Batch, DeviceKind, FlashAttnType, KvCacheType, Model, ModelParams, Sampler,
     SamplerParams, Session, SessionParams, Token,
@@ -905,7 +905,13 @@ fn read_exact_or_eof(s: &mut impl Read, buf: &mut [u8]) -> std::io::Result<bool>
 
 /// Relay client->server traffic, parsing the RPC framing
 /// (| cmd 1B | size 8B | payload |) to count commands.
-fn counting_relay_c2s(mut from: TcpStream, mut to: TcpStream, ctr: Arc<RpcCounters>) {
+///
+/// Generic over [`Duplex`] because the two legs have different concrete
+/// types: the accepted loopback socket is a `TcpStream` everywhere, but
+/// the [`SocketPair`] bridge end is a `UnixStream` on Unix (`TcpStream`
+/// only on Windows) — the same portability shape as the timeline test's
+/// relay.
+fn counting_relay_c2s(mut from: impl Duplex, mut to: impl Duplex, ctr: Arc<RpcCounters>) {
     let mut hdr = [0u8; 9];
     let mut payload = Vec::new();
     while let Ok(true) = read_exact_or_eof(&mut from, &mut hdr) {
@@ -930,11 +936,13 @@ fn counting_relay_c2s(mut from: TcpStream, mut to: TcpStream, ctr: Arc<RpcCounte
         }
         let _ = to.flush();
     }
-    let _ = to.shutdown(std::net::Shutdown::Write);
+    let _ = to.shutdown_duplex(Shutdown::Write);
 }
 
 /// Relay server->client traffic, parsing | size 8B | payload | responses.
-fn counting_relay_s2c(mut from: TcpStream, mut to: TcpStream, ctr: Arc<RpcCounters>) {
+/// Generic over [`Duplex`] for the same platform reason as
+/// [`counting_relay_c2s`].
+fn counting_relay_s2c(mut from: impl Duplex, mut to: impl Duplex, ctr: Arc<RpcCounters>) {
     let mut hdr = [0u8; 8];
     let mut payload = Vec::new();
     while let Ok(true) = read_exact_or_eof(&mut from, &mut hdr) {
@@ -956,7 +964,7 @@ fn counting_relay_s2c(mut from: TcpStream, mut to: TcpStream, ctr: Arc<RpcCounte
         }
         let _ = to.flush();
     }
-    let _ = to.shutdown(std::net::Shutdown::Write);
+    let _ = to.shutdown_duplex(Shutdown::Write);
 }
 
 struct CountingBridge {

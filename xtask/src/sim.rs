@@ -145,10 +145,10 @@
 //! and the CLI directly).
 //!
 //! 18. **perf overlap** — a synthetic transfer-heavy model ([`build_perf_model`]:
-//!     n_embd 8192 with thin 16-wide attention heads and a 32-wide FFN, 2
-//!     layers, all-zero f32 weights — SIZED so the per-ubatch boundary
-//!     activation copy at 1 Gbit is ≥ 40% of per-ubatch wall time; the
-//!     arithmetic lives at the constants) loads forced 2-node with
+//!     n_embd 8192 with thin 16-wide attention heads and a 64-wide FFN, 2
+//!     layers, all-zero f32 weights — SIZED so the per-ubatch wall carries
+//!     BOTH a meaningful 1 Gbit transfer share AND a meaningful compute
+//!     share; the arithmetic lives at the constants) loads forced 2-node with
 //!     `[perf] n_ubatch = 64`; a ~3.4k-token prefill + 64-token decode is
 //!     timed 3× with `prefill_overlap=false` (the constructed M3 baseline,
 //!     asserted NOT to log llama.cpp's `pipeline parallelism enabled`
@@ -2115,34 +2115,61 @@ fn logistics_section(env: &ChaosEnv) -> Result<()> {
 // M7 performance section (docs/perf.md "DoD hooks"; module docs steps 18–22)
 // ---------------------------------------------------------------------------
 
-// The overlap step's synthetic model, SIZED so the per-ubatch boundary
-// activation copy at the netem leg's 1 Gbit is a substantial (≥ 40%)
-// fraction of per-ubatch wall time — the contract's precondition for the
-// `overlap ≤ 0.75 × sequential` assert. The arithmetic (pinned by the
+// The overlap step's synthetic model, SIZED so the per-ubatch wall has
+// BOTH a meaningful transfer share AND a meaningful compute share — the
+// contract's real precondition for the `overlap ≤ 0.75 × sequential`
+// assert (docs/perf.md "DoD hooks": overlap can only save what it can
+// hide, so it needs wire time ≈ compute time; the original ≥40%-transfer
+// rule predates knowing the QUIC tunnel's per-byte CPU tax and is
+// superseded there). The arithmetic (pinned by the
 // `perf_model_sizing_meets_the_overlap_contract` unit test):
 //
-//   transfer/ubatch  = 4 B · n_embd · n_ubatch = 4·8192·64 = 2,097,152 B
-//                    → 16.8 ms at 1 Gbit (125 MB/s) + 0.5 ms netem delay.
-//   weights/layer    = n_embd·(4·head_dim + 3·n_ff + 2 norms)
-//                    = 8192·162 = 1,327,104 params (5.3 MB f32) — THIN
-//                      16-wide attention heads (`attention.key_length`)
-//                      and a 32-wide FFN keep per-token compute LINEAR in
-//                      n_embd while the boundary copy grows with n_embd,
-//                      which is the whole trick: a fat 8192-wide hidden
-//                      state to ship, almost nothing to multiply it by.
-//   compute/stage    = 2 flops/param/token · 64 tok · 1.33M ≈ 170 MFLOP
-//                    → ≈ 8.5 ms per node per ubatch at a conservative
-//                      20 GFLOP/s effective f32 (llama.cpp's sgemm
-//                      sustains 2-3× that on any AVX2 4-core runner).
-//   per-ubatch wall  ≈ 2·8.5 + 16.8 + ~1 (RTT) ≈ 34.8 ms sequential
-//                    → the boundary copy is ≈ 48% of it.  ✓ (≥ 40%)
+//   PLACEMENT (verified against the vendored llama-model.cpp): under the
+//   forced 2-node plan's [0.5, 0.5] split, llama assigns layer il by
+//   comparing il/(n_layer+1) against the cumulative fractions — with 2
+//   layers, 0/3 and 1/3 both land BELOW 0.5, so BOTH layers run on the
+//   worker and the head keeps only the output layer, which gathers 0
+//   rows for every non-output prefill ubatch. That emptiness is what
+//   lets the pipelined prefill run as a pure fire-and-forget train (a
+//   real head-side layer would reintroduce a blocking per-ubatch
+//   activation GET on the scheduler thread and serialize the pipeline —
+//   which is why the rebalance below fattens the FFN instead of adding
+//   layers).
 //
-// Assert robustness: both daemons share ONE host CPU, so the overlapped
-// steady state is ≈ max(2·compute, transfer) per ubatch while sequential
-// pays their SUM plus the un-batched round trips; the 0.75 ratio holds for
-// effective throughput anywhere in ≈ [7, 90] GFLOP/s — machines outside
-// that band do not exist in CI.
-/// Transformer layers: one per node under the forced 2-node plan.
+//   transfer/ubatch  = 4 B · n_embd · n_ubatch = 4·8192·64 = 2,097,152 B
+//                      (the embd input push INTO the worker)
+//                    → 16.8 ms at 1 Gbit (125 MB/s) + ~2 ms of attention
+//                      mask (F16, grows with n_kv) + 0.5 ms netem delay.
+//   weights/layer    = n_embd·(4·head_dim + 3·n_ff + 2 norms)
+//                    = 8192·258 = 2,113,536 params (8.5 MB f32) — THIN
+//                      16-wide attention heads (`attention.key_length`)
+//                      and a 64-wide FFN keep per-token compute LINEAR in
+//                      n_embd while the boundary copy grows with n_embd:
+//                      a fat 8192-wide hidden state to ship, with just
+//                      enough to multiply it by. The FFN width is the
+//                      REBALANCE knob: at 32 the CI 2-core leg measured
+//                      worker compute ≈ 15 ms < wire ≈ 19 ms and the
+//                      overlap had too little to hide (ratio 0.78); the
+//                      ratio is minimized when compute ≈ wire.
+//   worker compute   = 2 layers · 2 flops/param/token · 64 tok · 2.11M
+//                    ≈ 541 MFLOP → ≈ 27 ms per ubatch at a conservative
+//                      20 GFLOP/s effective single-thread f32 (the serve
+//                      session reserves one core for the transport, so
+//                      compute is single-threaded on 2-core runners).
+//   per-ubatch wall  ≈ 19 (wire) + 27 (compute) + ~5 (QUIC tunnel CPU +
+//                      shaped RTTs) ≈ 51 ms sequential → transfer ≈ 33%,
+//                      compute ≈ 53% — both meaningful. Overlapped
+//                      steady state ≈ max(wire, compute) + overhead
+//                      ≈ 31 ms → predicted ratio ≈ 0.6.
+//
+// Assert robustness: the 0.75 assert holds while compute lands anywhere
+// in ≈ [0.6×, 2×] of the wire time, i.e. effective single-thread
+// throughput ≈ [10, 45] GFLOP/s — the AVX2 range of every hosted runner;
+// faster many-core dev boxes drift wire-bound, where the measured ratio
+// is ~0.6 as well (the WSL gauntlet).
+/// Transformer layers: BOTH on the worker under the forced 2-node plan's
+/// [0.5, 0.5] split (see the placement note above) — the head keeps only
+/// the 0-row output gather during prefill.
 const PERF_N_LAYERS: u32 = 2;
 /// The fat hidden state the boundary copy ships (4 B · 8192 per token).
 const PERF_N_EMBD: u32 = 8192;
@@ -2153,7 +2180,9 @@ const PERF_N_HEAD_KV: u32 = 1;
 /// `n_embd_head_k/v`, default n_embd/n_head; the llama arch demands
 /// `rope.dimension_count == n_embd_head_k`).
 const PERF_HEAD_DIM: u32 = 16;
-const PERF_N_FF: u32 = 32;
+/// The compute-rebalance knob (arithmetic above): 64 puts worker compute
+/// ≈ wire time on CI-class cores, the regime where overlap pays most.
+const PERF_N_FF: u32 = 64;
 /// On-disk name inside A's sandbox home; the load references the path, so
 /// the model surfaces as `local:perf-overlap`.
 const PERF_MODEL_FILE: &str = "perf-overlap.gguf";
@@ -2454,7 +2483,8 @@ fn perf_overlap_step(env: &ChaosEnv, netem: bool) -> Result<()> {
             let bytes = build_perf_model();
             println!(
                 "       {} ({} bytes; {} B boundary copy per {}-token ubatch = 16.8 ms at \
-                 1 Gbit, sized >= 40% of per-ubatch wall — arithmetic at the PERF_ consts)",
+                 1 Gbit, sized so transfer AND compute are both meaningful shares of \
+                 per-ubatch wall — arithmetic at the PERF_ consts)",
                 model_path.display(),
                 bytes.len(),
                 4 * u64::from(PERF_N_EMBD) * u64::from(PERF_N_UBATCH),
@@ -6191,9 +6221,9 @@ onebrain 4242 user   11u  IPv4 0xdeadbeef      0t0  TCP 10.0.0.5:52001->1.2.3.4:
         // tiny — harmless either way, because no sim cap math ever touches
         // this model: the overlap step loads it uncapped with --nodes 2.
         assert_eq!(dims.kv_rate, 32_768);
-        // token_embd/output 2 × 8,486,912 B + 2 layers × 5,308,416 B +
+        // token_embd/output 2 × 8,486,912 B + 2 layers × 8,454,144 B +
         // output_norm 32,768 B.
-        assert_eq!(dims.total_weight_bytes, 27_623_424);
+        assert_eq!(dims.total_weight_bytes, 33_914_880);
         // Small enough to push over loopback quickly, big enough to matter.
         assert!(bytes.len() < 40 << 20, "{}", bytes.len());
         // All-zero data section: the boundary traffic is real, the math is
@@ -6204,24 +6234,38 @@ onebrain 4242 user   11u  IPv4 0xdeadbeef      0t0  TCP 10.0.0.5:52001->1.2.3.4:
 
     #[test]
     fn m7_perf_model_sizing_meets_the_overlap_contract() {
-        // The ≥ 40% sizing rule (docs/perf.md "DoD hooks"), pinned with the
+        // The both-meaningful sizing rule (docs/perf.md "DoD hooks":
+        // transfer AND compute each a substantial share of per-ubatch
+        // wall — overlap can only save what it can hide), pinned with the
         // exact arithmetic from the PERF_ constant block.
         let w_layer =
             u64::from(PERF_N_EMBD) * (4 * u64::from(PERF_HEAD_DIM) + 3 * u64::from(PERF_N_FF) + 2);
-        assert_eq!(w_layer, 1_327_104);
+        assert_eq!(w_layer, 2_113_536);
         let transfer_bytes = 4 * u64::from(PERF_N_EMBD) * u64::from(PERF_N_UBATCH);
         assert_eq!(transfer_bytes, 2_097_152);
         // 1 Gbit = 125,000,000 B/s.
         let transfer_ms = transfer_bytes as f64 * 1000.0 / 125_000_000.0;
         assert!((transfer_ms - 16.777).abs() < 0.01, "{transfer_ms}");
-        // 2 flops per parameter per token, at the conservative 20 GFLOP/s
-        // effective-f32 floor from the constant block's comment.
-        let stage_ms = 2.0 * f64::from(PERF_N_UBATCH) * w_layer as f64 / 20e9 * 1000.0;
-        let wall_ms = 2.0 * stage_ms + transfer_ms + 1.0; // + ~1 ms shaped RTT
+        // BOTH layers compute on the worker (the [0.5,0.5] placement note
+        // at the constants): 2 flops per parameter per token at the
+        // conservative 20 GFLOP/s effective single-thread f32 floor from
+        // the constant block's comment.
+        let compute_ms = f64::from(PERF_N_LAYERS) * 2.0 * f64::from(PERF_N_UBATCH) * w_layer as f64
+            / 20e9
+            * 1000.0;
+        // Wire adds ~2 ms of F16 attention mask; the QUIC tunnel and the
+        // shaped RTTs add ~5 ms of per-ubatch overhead in both modes.
+        let wall_ms = transfer_ms + 2.0 + compute_ms + 5.0;
         assert!(
-            transfer_ms >= 0.40 * wall_ms,
-            "boundary copy {transfer_ms:.1} ms must be >= 40% of per-ubatch wall \
-             {wall_ms:.1} ms"
+            transfer_ms >= 0.25 * wall_ms,
+            "boundary copy {transfer_ms:.1} ms must stay a meaningful share (>= 25%) of \
+             per-ubatch wall {wall_ms:.1} ms"
+        );
+        assert!(
+            compute_ms >= 0.25 * wall_ms,
+            "worker compute {compute_ms:.1} ms must stay a meaningful share (>= 25%) of \
+             per-ubatch wall {wall_ms:.1} ms — without it overlap has nothing to hide \
+             (the CI 2-core leg measured 0.78 at n_ff=32 for exactly this reason)"
         );
         // The long prompt: ~3.4k byte-fallback tokens (a space is 3 tokens
         // — see perf_prompt — so one 62-char sentence is exactly 76), and

@@ -44,7 +44,10 @@ const PERF_N_EMBD: u32 = 8192;
 const PERF_N_HEAD: u32 = 1;
 const PERF_N_HEAD_KV: u32 = 1;
 const PERF_HEAD_DIM: u32 = 16;
-const PERF_N_FF: u32 = 32;
+/// Mirrors the sim's compute-rebalanced perf model (n_ff 32 → 64: worker
+/// compute ≈ wire time on CI-class cores, the regime where overlap pays
+/// most — the sizing arithmetic lives at the sim's PERF_ constants).
+const PERF_N_FF: u32 = 64;
 const PERF_VOCAB: u32 = 259;
 
 const N_BATCH: u32 = 512;
