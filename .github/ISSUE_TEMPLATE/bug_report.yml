@@ -1,0 +1,69 @@
+name: Bug report
+description: Something broke, misbehaved, or lied to you
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Two notes before you start:
+
+        - **Security issues do not belong here** — please use
+          [private vulnerability reporting](https://github.com/VantaBluee/onebrain/security/advisories/new)
+          instead (see SECURITY.md).
+        - `onebrain doctor --json` output is the single most useful thing you
+          can attach: it carries versions, engine build, devices, config
+          findings, and firewall/driver posture. Redact anything you consider
+          private before pasting.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, what OneBrain did, and how they differ from what you expected.
+      placeholder: |
+        Ran `onebrain run qwen3-32b` on a paired pair of machines; the plan
+        distributed, but the stream ended with ...
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Exact commands, in order, from a known state. Say which machine each command ran on if more than one is involved.
+      placeholder: |
+        1. machine A: `onebrain up`
+        2. machine A: `onebrain pair` / machine B: `onebrain pair <code>`
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: "`onebrain doctor --json` output"
+      description: From the machine where the problem showed. For multi-node problems, add the other nodes' output too (one block per node).
+      render: json
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Daemon log excerpt (optional)
+      description: "The tail of `<data_dir>/logs/daemon.log` around the failure (`onebrain doctor` prints your data dir). Warnings and errors usually carry the remedy."
+      render: text
+    validations:
+      required: false
+  - type: input
+    id: model
+    attributes:
+      label: Model reference (if model-related)
+      description: Registry id, `hf:` reference, or "local GGUF" — plus quantization if you know it.
+      placeholder: qwen3-32b
+    validations:
+      required: false
+  - type: input
+    id: topology
+    attributes:
+      label: Topology
+      description: How many nodes, which OSes, and the network between them.
+      placeholder: "2 nodes: Windows 11 + macOS 15, same Wi-Fi LAN"
+    validations:
+      required: false

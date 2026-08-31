@@ -1,0 +1,42 @@
+name: Feature request
+description: Something OneBrain should do that it doesn't
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        A note on scope: OneBrain's promise is **capacity** — running models
+        that don't fit any single machine you own, honestly and securely.
+        Requests that fit that promise land best. Requests for an insecure
+        mode will be declined; there is none and none will be added.
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to do that you can't today? Concrete scenarios beat abstract capabilities.
+      placeholder: |
+        I have three machines and want to ..., but today OneBrain ...
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: What should happen instead? If you have a CLI/API surface in mind, sketch it.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
+      description: Workarounds you tried, other tools that do this, or why the existing knobs (config, flags) don't cover it.
+    validations:
+      required: false
+  - type: textarea
+    id: doctor
+    attributes:
+      label: "`onebrain doctor --json` output (optional)"
+      description: Helpful when the request is hardware- or topology-shaped (e.g. scheduler and placement ideas).
+      render: json
+    validations:
+      required: false
