@@ -122,6 +122,20 @@ pub enum TokenEvent {
     Error(String),
 }
 
+/// Which public API surface a generation arrived through. Recorded by the
+/// daemon's in-memory request log at generation completion (M8 metrics,
+/// docs/product.md §1) — the gateway handler is the only place the dialect
+/// is known, the daemon backend the only place every generation funnels
+/// through, so the job carries it between them. Never used for routing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ApiDialect {
+    /// `/v1/chat/completions` and `/v1/completions`.
+    Openai,
+    /// `/api/generate` and `/api/chat`.
+    Ollama,
+}
+
 /// One queued generation.
 #[derive(Debug)]
 pub struct GenerateJob {
@@ -130,6 +144,8 @@ pub struct GenerateJob {
     pub model: String,
     pub prompt: PromptInput,
     pub params: GenParams,
+    /// Which dialect surface the request came in on (metrics request log).
+    pub dialect: ApiDialect,
     /// The backend must always terminate the stream with `Done` or `Error`.
     pub tx: mpsc::Sender<TokenEvent>,
 }

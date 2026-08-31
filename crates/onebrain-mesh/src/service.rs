@@ -1141,6 +1141,11 @@ impl Service {
                 prefill_tps: entry.prefill_tps,
                 decode_tps: entry.decode_tps,
                 disk_mbps: entry.disk_mbps,
+                // Hello data comes from the STORE, not the live map: it is
+                // persisted at hello time and must survive the session (M8
+                // version-skew reporting, docs/product.md §1).
+                product_version: record.product_version,
+                engine_build: record.engine_build,
                 draining: entry.draining,
             });
         }
@@ -1815,6 +1820,21 @@ async fn run_session(ctx: &SessionCtx) -> SessionEnd {
             return SessionEnd::NeverEstablished;
         }
     };
+    // Retain the peer's introduced version + engine build BEFORE judging
+    // compatibility: an incompatible peer is precisely the one whose skew
+    // the metrics advisor and doctor must be able to name later (M8,
+    // docs/product.md §1). `update_hello` no-ops for unpaired ids, so a
+    // racing unpair cannot resurrect the peer.
+    if let Err(err) = ctx.store.update_hello(
+        &ctx.peer.to_string(),
+        theirs.product_version.clone(),
+        theirs.engine_build.0.clone(),
+    ) {
+        warn!(
+            peer = %ctx.peer.fmt_short(),
+            "could not persist peer hello data: {err}"
+        );
+    }
     match judge(&ctx.hello, &theirs) {
         HandshakeVerdict::Compatible => {}
         HandshakeVerdict::ProtoMismatch { ours, theirs: t } => {

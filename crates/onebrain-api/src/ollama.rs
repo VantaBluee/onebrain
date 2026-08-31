@@ -19,7 +19,8 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
 use crate::backend::{
-    DoneStats, FinishKind, GenParams, GenerateJob, ModelSummary, PromptInput, PullEvent, TokenEvent,
+    ApiDialect, DoneStats, FinishKind, GenParams, GenerateJob, ModelSummary, PromptInput,
+    PullEvent, TokenEvent,
 };
 use crate::types::ChatMessage;
 use crate::{ApiError, ApiState};
@@ -124,6 +125,7 @@ async fn generate(
         model: req.model.clone(),
         prompt: PromptInput::Raw(req.prompt),
         params: gen_params(req.options),
+        dialect: ApiDialect::Ollama,
         tx,
     })?;
     if req.stream.unwrap_or(true) {
@@ -142,6 +144,7 @@ async fn chat(
         model: req.model.clone(),
         prompt: PromptInput::Chat(req.messages),
         params: gen_params(req.options),
+        dialect: ApiDialect::Ollama,
         tx,
     })?;
     if req.stream.unwrap_or(true) {

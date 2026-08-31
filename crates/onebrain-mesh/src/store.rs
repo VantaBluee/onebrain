@@ -43,6 +43,18 @@ pub struct PeerRecord {
     /// store unreadable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay_url: Option<String>,
+    /// The peer's OneBrain version from its last mesh `Hello`, refreshed on
+    /// every hello exchange (M8: the metrics endpoint and doctor compute
+    /// version skew from STORED hello data, so it must survive the
+    /// handshake — and the daemon restart). Absent for stores written
+    /// before this field existed or peers not heard from since.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub product_version: Option<String>,
+    /// The peer's engine build id (llama.cpp commit + backend flags + proto
+    /// version) from its last `Hello`. Recorded even when the handshake is
+    /// judged incompatible — that is exactly when skew advice matters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_build: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -130,6 +142,8 @@ impl PeerStore {
                 added_unix,
                 direct_addrs: Vec::new(),
                 relay_url: None,
+                product_version: None,
+                engine_build: None,
             },
         );
         self.save(&peers)?;
@@ -170,6 +184,35 @@ impl PeerStore {
             self.save(&peers)?;
         }
         Ok(changed)
+    }
+
+    /// Record what a peer's `Hello` introduced it as — product version and
+    /// engine build — and persist (M8 metrics/doctor: version skew is
+    /// computed from stored hello data, docs/product.md §1). Same shape as
+    /// [`PeerStore::update_addrs`]: an unknown id is a no-op returning
+    /// `false` (an unpair racing the session must never resurrect the
+    /// peer), and an unchanged pair skips the write. Returns whether the
+    /// file changed.
+    pub fn update_hello(
+        &self,
+        endpoint_id: &str,
+        product_version: String,
+        engine_build: String,
+    ) -> Result<bool, MeshError> {
+        let _guard = self.write_lock.lock().expect("peer store lock poisoned");
+        let mut peers = self.load()?;
+        let Some(record) = peers.get_mut(endpoint_id) else {
+            return Ok(false);
+        };
+        if record.product_version.as_deref() == Some(product_version.as_str())
+            && record.engine_build.as_deref() == Some(engine_build.as_str())
+        {
+            return Ok(false);
+        }
+        record.product_version = Some(product_version);
+        record.engine_build = Some(engine_build);
+        self.save(&peers)?;
+        Ok(true)
     }
 
     /// Remove a peer by name and persist. Returns the removed endpoint id.
@@ -400,6 +443,46 @@ mod tests {
         }
         writer.join().unwrap();
         assert!(s.load().unwrap().contains_key("aaaa"));
+    }
+
+    /// M8: hello data (product version + engine build) persists per peer,
+    /// refreshes in place, skips no-op rewrites, and never resurrects an
+    /// unpaired id — the metrics/doctor version-skew rules read it back
+    /// from the store, so this roundtrip is their whole data path.
+    #[test]
+    fn hello_data_roundtrips_and_unknown_ids_are_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(&dir);
+        s.add("aaaa", "laptop").unwrap();
+        // Absent until a hello lands (legacy stores load the same way).
+        assert!(s.load().unwrap()["aaaa"].product_version.is_none());
+        assert!(s.load().unwrap()["aaaa"].engine_build.is_none());
+
+        assert!(s
+            .update_hello("aaaa", "0.1.0".into(), "llama.cpp-abc/cpu".into())
+            .unwrap());
+        let peers = s.load().unwrap();
+        assert_eq!(peers["aaaa"].product_version.as_deref(), Some("0.1.0"));
+        assert_eq!(
+            peers["aaaa"].engine_build.as_deref(),
+            Some("llama.cpp-abc/cpu")
+        );
+        // Identical data skips the write; changed data replaces in place.
+        assert!(!s
+            .update_hello("aaaa", "0.1.0".into(), "llama.cpp-abc/cpu".into())
+            .unwrap());
+        assert!(s
+            .update_hello("aaaa", "0.2.0".into(), "llama.cpp-abc/cpu".into())
+            .unwrap());
+        assert_eq!(
+            s.load().unwrap()["aaaa"].product_version.as_deref(),
+            Some("0.2.0")
+        );
+        // Unknown ids never resurrect an unpaired peer.
+        assert!(!s
+            .update_hello("bbbb", "0.1.0".into(), "build".into())
+            .unwrap());
+        assert!(!s.load().unwrap().contains_key("bbbb"));
     }
 
     #[test]

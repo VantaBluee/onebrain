@@ -367,6 +367,9 @@ async fn serve(
         source,
     })?;
 
+    // M8 metrics request ring (docs/product.md §1): the backend's relay
+    // writes finished generations, the metrics endpoint reads them.
+    let requests = crate::metrics::RequestLog::new();
     let api_state = ApiState {
         backend: Arc::new(DaemonBackend::new(
             host.clone(),
@@ -378,6 +381,7 @@ async fn serve(
             // max_concurrent_requests running + queue_depth waiting.
             config.perf.max_concurrent_requests,
             config.perf.queue_depth,
+            requests.clone(),
         )),
         auth: Arc::new(AuthConfig {
             token: token.clone(),
@@ -393,6 +397,10 @@ async fn serve(
             token,
             localhost_exempt: false,
         },
+        // `run_blocking` resolved (and persisted) the name before serving;
+        // the fallback only covers embedders that skip that step.
+        node_name: config.node_name.clone().unwrap_or_else(default_node_name),
+        requests,
         cache_root: cache_root.to_path_buf(),
         ctx_len: config.ctx_len,
         n_ubatch: config.perf.n_ubatch,
@@ -448,7 +456,15 @@ async fn serve(
             }
         });
     }
-    let app = onebrain_api::router(api_state).merge(internal_router(internal_state));
+    // Dashboard v1 (M8, docs/product.md §2): the daemon serves the embedded
+    // shell at `/` and its assets under `/dash/*` on the SAME listener as
+    // the API. The dash router is deliberately outside both auth layers —
+    // the HTML shell is Bearer-exempt (it holds no data; it asks the user
+    // for the token and calls the still-auth'd /api/internal/metrics with
+    // it). Loopback exemption rules for internal routes are unchanged.
+    let app = onebrain_api::router(api_state)
+        .merge(internal_router(internal_state))
+        .merge(onebrain_dash::router());
 
     // daemon.json only after the listener is bound (contract): its port is
     // real, and a kill -9 leftover gets overwritten right here on restart.

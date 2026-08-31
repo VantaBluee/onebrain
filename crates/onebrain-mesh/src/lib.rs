@@ -530,6 +530,18 @@ pub struct PeerStatus {
     /// Sequential disk read rate (MB/s) from the peer's last `NodeStatus`
     /// (page-cache upper bound; relative ordering only).
     pub disk_mbps: Option<f64>,
+    /// The peer's OneBrain version from its last mesh `Hello`, retained in
+    /// the peer store across sessions and restarts (M8: the metrics
+    /// endpoint and doctor compute version skew from it). `None` until a
+    /// hello has been exchanged with this peer at least once.
+    #[serde(default)]
+    pub product_version: Option<String>,
+    /// The peer's engine build id (llama.cpp commit + backend flags +
+    /// proto version) from its last `Hello`; retained like
+    /// `product_version`, including from handshakes judged incompatible —
+    /// exactly the case skew advice must name.
+    #[serde(default)]
+    pub engine_build: Option<String>,
     /// `true` when the peer's last `NodeStatus` advertised battery drain
     /// (M5, docs/resilience.md): the scheduler excludes it from new plans
     /// unless a plan is infeasible without it. Overwritten whole by every

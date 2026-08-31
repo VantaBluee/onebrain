@@ -6,11 +6,13 @@
 //! runtime that wires them to the public HTTP gateway. M2 adds the mesh
 //! service (device identity, pairing, peers) and its internal endpoints.
 
+pub mod advisor;
 pub mod cluster;
 pub mod config;
 pub mod engine_host;
 pub mod lock;
 pub mod logistics;
+pub mod metrics;
 pub mod paths;
 pub mod power;
 pub mod runtime;

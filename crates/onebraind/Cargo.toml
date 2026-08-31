@@ -12,6 +12,7 @@ onebrain-proto = { workspace = true }
 onebrain-engine = { workspace = true }
 onebrain-mesh = { workspace = true }
 onebrain-api = { workspace = true }
+onebrain-dash = { workspace = true }
 onebrain-models = { workspace = true }
 onebrain-scheduler = { workspace = true }
 axum = { workspace = true }

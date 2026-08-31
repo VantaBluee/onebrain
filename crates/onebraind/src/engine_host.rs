@@ -2756,9 +2756,16 @@ pub struct DaemonBackend {
     max_concurrent: u32,
     /// `[perf] queue_depth` (admission bound + error wording).
     queue_depth: u32,
+    /// M8 metrics request log (docs/product.md §1): every admitted
+    /// generation's terminal `Done` is recorded here via the relay
+    /// [`crate::metrics::RequestLog::observe`] wraps around the job —
+    /// `generate` below is the single choke point both dialects funnel
+    /// through, so one wrap covers the whole public API.
+    requests: std::sync::Arc<crate::metrics::RequestLog>,
 }
 
 impl DaemonBackend {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         host: EngineHost,
         cache_root: PathBuf,
@@ -2767,6 +2774,7 @@ impl DaemonBackend {
         cache_max_bytes: u64,
         max_concurrent: u32,
         queue_depth: u32,
+        requests: std::sync::Arc<crate::metrics::RequestLog>,
     ) -> DaemonBackend {
         DaemonBackend {
             host,
@@ -2776,6 +2784,7 @@ impl DaemonBackend {
             cache_max_bytes,
             max_concurrent: max_concurrent.max(1),
             queue_depth,
+            requests,
         }
     }
 }
@@ -2837,6 +2846,10 @@ impl EngineBackend for DaemonBackend {
                 queue_depth: self.queue_depth,
             });
         }
+        // M8 metrics: relay the admitted job's event stream so the terminal
+        // DoneStats lands in the request ring buffer (privacy enforced by
+        // construction — the log can only record counts and timings).
+        let job = self.requests.observe(job);
         if self.supervisor.send(SupervisorMsg::Generate(job)).is_err() {
             self.host.job_finished();
             return Err(ApiError::ShuttingDown);
@@ -2979,6 +2992,7 @@ mod tests {
                 temperature: 0.0,
                 ..Default::default()
             },
+            dialect: onebrain_api::backend::ApiDialect::Openai,
             tx,
         }
     }
@@ -3502,6 +3516,7 @@ mod tests {
                 model: "anything".into(),
                 prompt: PromptInput::Raw("hi".into()),
                 params: Default::default(),
+                dialect: onebrain_api::backend::ApiDialect::Openai,
                 tx,
             },
             resume: None,
@@ -3605,6 +3620,7 @@ mod tests {
             0,
             /* max_concurrent */ 1,
             /* queue_depth */ 1,
+            crate::metrics::RequestLog::new(),
         );
         let make_job = || {
             let (tx, rx) = mpsc::channel(4);
@@ -3613,6 +3629,7 @@ mod tests {
                     model: "m".into(),
                     prompt: PromptInput::Raw("hi".into()),
                     params: Default::default(),
+                    dialect: onebrain_api::backend::ApiDialect::Openai,
                     tx,
                 },
                 rx,
@@ -3765,6 +3782,7 @@ mod tests {
                     seed: Some(42),
                     ..Default::default()
                 },
+                dialect: onebrain_api::backend::ApiDialect::Openai,
                 tx,
             },
             resume: None,

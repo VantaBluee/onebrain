@@ -191,6 +191,7 @@ fn run(host: &EngineHost, model: &str, prompt: &str, max_tokens: u32) -> (String
                 temperature: 0.0,
                 ..Default::default()
             },
+            dialect: onebrain_api::backend::ApiDialect::Openai,
             tx,
         },
         resume: None,

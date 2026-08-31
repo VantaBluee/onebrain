@@ -714,6 +714,8 @@ mod tests {
             prefill_tps: None,
             decode_tps: None,
             disk_mbps: None,
+            product_version: None,
+            engine_build: None,
             draining,
         }
     }

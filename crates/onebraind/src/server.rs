@@ -51,6 +51,12 @@ pub struct InternalState {
     pub host: EngineHost,
     /// Token check only; `localhost_exempt` is forced off for these routes.
     pub auth: AuthConfig,
+    /// This node's human-readable name (the one peers see), surfaced by
+    /// the metrics endpoint's `node` section (M8, docs/product.md §1).
+    pub node_name: String,
+    /// M8 metrics request ring (docs/product.md §1): written by the daemon
+    /// backend's generation relay, read by `GET /api/internal/metrics`.
+    pub requests: Arc<crate::metrics::RequestLog>,
     pub cache_root: PathBuf,
     pub ctx_len: u32,
     /// `[perf] n_ubatch` (docs/perf.md §3/§7): the effective microbatch,
@@ -103,6 +109,7 @@ pub struct InternalState {
 pub fn internal_router(state: Arc<InternalState>) -> Router {
     Router::new()
         .route("/api/internal/status", get(status))
+        .route("/api/internal/metrics", get(metrics))
         .route("/api/internal/load", post(load))
         .route("/api/internal/bench", post(bench))
         .route("/api/internal/bench/peers", post(bench_peers))
@@ -184,6 +191,145 @@ async fn status(State(state): State<Arc<InternalState>>) -> Json<serde_json::Val
         // docs/distributed.md: the active plan (epoch, strategy,
         // assignments) or null when nothing distributed is active.
         "plan": state.cluster.active(),
+    }))
+}
+
+/// `GET /api/internal/metrics` (M8, docs/product.md §1): ONE JSON document
+/// feeding the dashboard, additive-stable — fields are only ever added:
+///
+/// - `node`: name, platform, version, engine build, measured memory,
+///   devices, the persisted bench profile (null until benched), battery
+///   verdict, and whether the sleep inhibitor is held.
+/// - `peers[]`: name, id-prefix, state, measured link figures, last
+///   NodeStatus memory/profile, and version + engine build from STORED
+///   Hello data — skew is computable client- and server-side.
+/// - `plan`: the [`ActivePlanView`] or null.
+/// - `requests[]`: the in-memory ring of the last 50 finished generations
+///   (head only, never any prompt text — see `crate::metrics`).
+/// - `advisor[]`: `{severity, text}` findings from the pure rules in
+///   `crate::advisor`, each backed by a measurement.
+async fn metrics(State(state): State<Arc<InternalState>>) -> Json<serde_json::Value> {
+    // Local device probes are blocking reads; ride the blocking pool like
+    // every other caller of `local_node_status`.
+    let override_bytes = state.usable_memory_override;
+    let (usable_memory_bytes, devices) =
+        tokio::task::spawn_blocking(move || crate::cluster::local_node_status(override_bytes))
+            .await
+            .unwrap_or((0, Vec::new()));
+    let total_bytes = devices
+        .iter()
+        .find(|d| d.kind == "cpu")
+        .map(|d| d.total_bytes)
+        .unwrap_or(0);
+    let battery =
+        crate::power::battery_status(state.battery_probe.as_ref(), state.battery_threshold);
+    // The persisted bench profile; the test-only decode override wins
+    // wherever decode is reported (same rule as NodeStatus and status).
+    let stored = *state.profile.lock().expect("profile state poisoned");
+    let profile_json = stored.map(|p| {
+        serde_json::json!({
+            "prefill_tps": p.prefill_tps,
+            "decode_tps": state.decode_tps_override.unwrap_or(p.decode_tps),
+            "disk_mbps": p.disk_mbps,
+            "measured_unix": p.measured_unix,
+        })
+    });
+    let peers = state.mesh.peers().await.unwrap_or_else(|err| {
+        tracing::warn!(error = %err, "metrics could not read peers; reporting none");
+        Vec::new()
+    });
+    let plan = state.cluster.active();
+    let loaded = state.cluster.loaded_source();
+    // Sleep-inhibited is REPORTED through the same pure predicate the
+    // runtime's inhibitor watcher applies every 2 s, over the same inputs —
+    // the report can never disagree with the policy.
+    let serving_shard = state.cluster.worker_shard().is_some();
+    let model_loaded = loaded.is_some() || serving_shard;
+    let in_flight = !state.host.is_idle();
+    let sleep_inhibited =
+        crate::power::should_hold_sleep(model_loaded, in_flight || serving_shard, plan.is_some());
+
+    let engine_build = onebrain_engine::engine_build_hash().0;
+    let own_id = state.mesh.endpoint_id().to_string();
+    let advisor = crate::advisor::advise(&crate::advisor::AdvisorInput {
+        node_name: &state.node_name,
+        own_id: &own_id,
+        product_version: state.product_version,
+        engine_build: &engine_build,
+        usable_memory_bytes,
+        draining: battery.draining,
+        peers: &peers,
+        plan: plan.as_ref(),
+        loaded_size_bytes: loaded.as_ref().map(|s| s.size_bytes),
+    });
+
+    let peers_json: Vec<serde_json::Value> = peers
+        .iter()
+        .map(|p| {
+            // A peer that has benched reports at least one profile figure;
+            // one that never did gets an honest null, not zeros.
+            let profile = (p.prefill_tps.is_some()
+                || p.decode_tps.is_some()
+                || p.disk_mbps.is_some())
+            .then(|| {
+                serde_json::json!({
+                    "prefill_tps": p.prefill_tps,
+                    "decode_tps": p.decode_tps,
+                    "disk_mbps": p.disk_mbps,
+                })
+            });
+            let mut peer = serde_json::json!({
+                "name": p.name,
+                // Prefix only: enough to correlate with plan assignments and
+                // logs without dumping full endpoint keys into the page.
+                "id_prefix": p.id.chars().take(8).collect::<String>(),
+                "state": p.state,
+                "rtt_ms": p.rtt_ms,
+                "bandwidth_mbps": p.bandwidth_mbps,
+                "loss": p.loss,
+                "last_seen_unix": p.last_seen_unix,
+                "usable_memory_bytes": p.usable_memory_bytes,
+                "profile": profile,
+                "draining": p.draining,
+            });
+            // Hello-derived fields are OMITTED (not null) until a hello has
+            // been exchanged: absent = never introduced, and tolerant
+            // consumers default a missing string where a null would not
+            // parse.
+            if let Some(version) = &p.product_version {
+                peer["version"] = serde_json::json!(version);
+            }
+            if let Some(build) = &p.engine_build {
+                peer["engine_build"] = serde_json::json!(build);
+            }
+            peer
+        })
+        .collect();
+
+    Json(serde_json::json!({
+        "node": {
+            "name": state.node_name,
+            "platform": format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+            "version": state.product_version,
+            "engine_build": engine_build,
+            // The plan-share id peers see this node as (assignments use it).
+            "id_prefix": own_id.chars().take(8).collect::<String>(),
+            "memory": {
+                "usable_bytes": usable_memory_bytes,
+                "total_bytes": total_bytes,
+            },
+            "devices": devices,
+            "profile": profile_json,
+            "battery": {
+                "level_percent": battery.level,
+                "draining": battery.draining,
+            },
+            "sleep_inhibited": sleep_inhibited,
+        },
+        "peers": peers_json,
+        "plan": plan,
+        "requests": state.requests.snapshot(),
+        "advisor": advisor,
     }))
 }
 
@@ -1706,6 +1852,22 @@ mod tests {
         std::thread::JoinHandle<()>,
         tempfile::TempDir,
     ) {
+        let (base, notify, host, thread, dir, _state) = serve_internal_with_state(token).await;
+        (base, notify, host, thread, dir)
+    }
+
+    /// [`serve_internal`] that also hands back the shared state, for tests
+    /// that seed it directly (the metrics request-log tests).
+    async fn serve_internal_with_state(
+        token: &str,
+    ) -> (
+        String,
+        Arc<Notify>,
+        EngineHost,
+        std::thread::JoinHandle<()>,
+        tempfile::TempDir,
+        Arc<InternalState>,
+    ) {
         let dir = tempfile::tempdir().unwrap();
         let (host, host_thread) = EngineHost::spawn(None, crate::engine_host::HostPerf::default());
         let shutdown = Arc::new(Notify::new());
@@ -1716,6 +1878,8 @@ mod tests {
                 token: token.to_string(),
                 localhost_exempt: false,
             },
+            node_name: "test-node".to_string(),
+            requests: crate::metrics::RequestLog::new(),
             cache_root: dir.path().join("models"),
             ctx_len: 4096,
             n_ubatch: 512,
@@ -1740,13 +1904,20 @@ mod tests {
             draft_model: None,
             retry: tokio::sync::Mutex::new(crate::supervisor::RetryLedger::default()),
         });
-        let app = internal_router(state);
+        let app = internal_router(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
-        (format!("http://{addr}"), shutdown, host, host_thread, dir)
+        (
+            format!("http://{addr}"),
+            shutdown,
+            host,
+            host_thread,
+            dir,
+            state,
+        )
     }
 
     fn teardown(host: EngineHost, host_thread: std::thread::JoinHandle<()>) {
@@ -1795,6 +1966,122 @@ mod tests {
         assert_eq!(body["peers_summary"]["connected"], 0);
         // docs/distributed.md: status reports the active plan (null here).
         assert!(body["plan"].is_null());
+        teardown(host, host_thread);
+    }
+
+    /// docs/product.md §1: the metrics endpoint is an internal route —
+    /// token always required, no loopback exemption.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn metrics_requires_the_token() {
+        let (base, _notify, host, host_thread, _dir) = serve_internal("sekrit").await;
+        let resp = reqwest::Client::new()
+            .get(format!("{base}/api/internal/metrics"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+        teardown(host, host_thread);
+    }
+
+    /// The §1 document shape on a bare daemon: every section present, the
+    /// unmeasured parts honestly null/empty rather than zero-faked.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn metrics_reports_the_contract_shape_on_a_bare_daemon() {
+        let (base, _notify, host, host_thread, _dir) = serve_internal("sekrit").await;
+        let resp = reqwest::Client::new()
+            .get(format!("{base}/api/internal/metrics"))
+            .bearer_auth("sekrit")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let node = &body["node"];
+        assert_eq!(node["name"], "test-node");
+        assert_eq!(node["version"], "test");
+        assert!(node["engine_build"].as_str().unwrap().contains("llama.cpp"));
+        assert!(node["platform"].as_str().unwrap().contains('-'));
+        assert!(node["memory"]["usable_bytes"].is_u64());
+        assert!(
+            node["memory"]["total_bytes"].as_u64().unwrap() > 0,
+            "total memory must be measured: {body}"
+        );
+        assert!(node["devices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["kind"] == "cpu"));
+        assert!(node["profile"].is_null(), "never benched ⇒ null profile");
+        assert_eq!(node["battery"]["draining"], false, "mock probe is on AC");
+        assert_eq!(node["sleep_inhibited"], false, "idle, nothing loaded");
+        assert_eq!(body["peers"], serde_json::json!([]));
+        assert!(body["plan"].is_null());
+        assert_eq!(body["requests"], serde_json::json!([]));
+        assert_eq!(body["advisor"], serde_json::json!([]));
+        teardown(host, host_thread);
+    }
+
+    /// A finished generation lands in `requests[]` with its DoneStats —
+    /// and the document NEVER carries the prompt text (docs/product.md §1
+    /// privacy line, asserted end to end through the observe relay).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn metrics_reports_finished_requests_without_prompt_text() {
+        const SENTINEL: &str = "EXTREMELY-PRIVATE-PROMPT";
+        let (base, _notify, host, host_thread, _dir, state) =
+            serve_internal_with_state("sekrit").await;
+        // Drive the same relay `DaemonBackend::generate` wraps jobs with.
+        let (client_tx, mut client_rx) = mpsc::channel(8);
+        let wrapped = state.requests.observe(onebrain_api::backend::GenerateJob {
+            model: "tinystories-260k".into(),
+            prompt: onebrain_api::backend::PromptInput::Raw(SENTINEL.into()),
+            params: onebrain_api::backend::GenParams::default(),
+            dialect: onebrain_api::backend::ApiDialect::Ollama,
+            tx: client_tx,
+        });
+        wrapped
+            .tx
+            .send(onebrain_api::backend::TokenEvent::Done(
+                onebrain_api::backend::DoneStats {
+                    prompt_tokens: 5,
+                    completion_tokens: 11,
+                    finish: onebrain_api::backend::FinishKind::Length,
+                    prefill_ms: 21,
+                    decode_ms: 34,
+                    ttft_ms: 8,
+                    drafted: 0,
+                    accepted: 0,
+                },
+            ))
+            .await
+            .unwrap();
+        // Wait for the relay to forward (recording happens before this).
+        assert!(client_rx.recv().await.is_some());
+
+        let resp = reqwest::Client::new()
+            .get(format!("{base}/api/internal/metrics"))
+            .bearer_auth("sekrit")
+            .send()
+            .await
+            .unwrap();
+        let text = resp.text().await.unwrap();
+        assert!(
+            !text.contains(SENTINEL),
+            "prompt text must never appear in metrics: {text}"
+        );
+        let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let requests = body["requests"].as_array().unwrap();
+        assert_eq!(requests.len(), 1);
+        let entry = &requests[0];
+        assert_eq!(entry["model"], "tinystories-260k");
+        assert_eq!(entry["dialect"], "ollama");
+        assert_eq!(entry["prompt_tokens"], 5);
+        assert_eq!(entry["completion_tokens"], 11);
+        assert_eq!(entry["prefill_ms"], 21);
+        assert_eq!(entry["decode_ms"], 34);
+        assert_eq!(entry["ttft_ms"], 8);
+        assert_eq!(entry["finish"], "length");
+        assert!(entry["timestamp_unix"].as_u64().unwrap() > 0);
+        assert!(entry["id"].as_str().unwrap().starts_with("req-"));
         teardown(host, host_thread);
     }
 
@@ -2149,6 +2436,7 @@ mod tests {
             0,
             4,
             8,
+            crate::metrics::RequestLog::new(),
         );
         let models = tokio::task::spawn_blocking(move || {
             onebrain_api::backend::EngineBackend::models(&backend)
