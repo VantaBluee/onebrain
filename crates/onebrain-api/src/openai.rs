@@ -1,10 +1,10 @@
 //! OpenAI-compatible dialect (`/v1/*`).
 //!
 //! Implements `POST /v1/chat/completions`, `POST /v1/completions`,
-//! `GET /v1/models`, and a 501 placeholder for `POST /v1/embeddings`,
-//! per the M1 contract in `docs/internal-api.md`: SSE (`data: {json}\n\n`
-//! terminated by `data: [DONE]\n\n`) when `"stream": true`, plain JSON
-//! otherwise, `usage` filled from [`DoneStats`].
+//! `GET /v1/models`, and `POST /v1/embeddings`, per the M1 contract in
+//! `docs/internal-api.md`: SSE (`data: {json}\n\n` terminated by
+//! `data: [DONE]\n\n`) when `"stream": true`, plain JSON otherwise,
+//! `usage` filled from [`DoneStats`].
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -16,13 +16,13 @@ use axum::{Json, Router};
 use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::backend::{
-    ApiDialect, DoneStats, FinishKind, GenParams, GenerateJob, PromptInput, TokenEvent,
+    ApiDialect, DoneStats, EmbedJob, FinishKind, GenParams, GenerateJob, PromptInput, TokenEvent,
 };
-use crate::types::ChatMessage;
+use crate::types::{embed_input_texts, ChatMessage};
 use crate::{ApiError, ApiState};
 
 /// Channel capacity between the backend and the HTTP layer for one job.
@@ -77,6 +77,16 @@ struct ChatCompletionRequest {
     top_p: Option<f32>,
     stop: Option<StopSpec>,
     seed: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EmbeddingsRequest {
+    model: String,
+    /// String or array of strings; parsed by [`embed_input_texts`] so
+    /// token-array inputs get a clear 400 instead of a serde failure.
+    input: Value,
+    /// "float" (default) or "base64".
+    encoding_format: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -214,8 +224,65 @@ async fn models(State(state): State<ApiState>) -> Json<Value> {
     Json(json!({ "object": "list", "data": data }))
 }
 
-async fn embeddings() -> ApiError {
-    ApiError::NotImplemented("embeddings arrive later in M1")
+async fn embeddings(
+    State(state): State<ApiState>,
+    Json(body): Json<Value>,
+) -> Result<Response, ApiError> {
+    let req: EmbeddingsRequest = parse_body(body)?;
+    let texts = embed_input_texts(&req.input)?;
+    let base64_out = match req.encoding_format.as_deref() {
+        None | Some("float") => false,
+        Some("base64") => true,
+        Some(other) => {
+            return Err(ApiError::BadRequest(format!(
+                "`encoding_format` must be \"float\" or \"base64\", got {other:?}"
+            )));
+        }
+    };
+    let (resp_tx, resp_rx) = oneshot::channel();
+    state.backend.embed(EmbedJob {
+        model: req.model.clone(),
+        texts,
+        resp: resp_tx,
+    })?;
+    let result = resp_rx.await.map_err(|_| {
+        ApiError::Internal("the embeddings request ended without a result; retry it".into())
+    })??;
+    let data: Vec<Value> = result
+        .embeddings
+        .iter()
+        .enumerate()
+        .map(|(index, embedding)| {
+            let value = if base64_out {
+                json!(base64_f32(embedding))
+            } else {
+                json!(embedding)
+            };
+            json!({ "object": "embedding", "index": index, "embedding": value })
+        })
+        .collect();
+    Ok(Json(json!({
+        "object": "list",
+        "data": data,
+        "model": req.model,
+        "usage": {
+            "prompt_tokens": result.prompt_tokens,
+            "total_tokens": result.prompt_tokens,
+        },
+    }))
+    .into_response())
+}
+
+/// OpenAI's `encoding_format: "base64"` for embeddings: the vector's f32
+/// values as little-endian bytes, standard-alphabet base64 with padding —
+/// byte-exact with what their SDKs decode back into float arrays.
+fn base64_f32(values: &[f32]) -> String {
+    use base64::Engine as _;
+    let mut bytes = Vec::with_capacity(values.len() * 4);
+    for v in values {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
 // ---------------------------------------------------------------------------

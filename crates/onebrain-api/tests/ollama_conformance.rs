@@ -312,6 +312,50 @@ async fn num_predict_limits_generation_with_length_reason() {
 }
 
 #[tokio::test]
+async fn embed_returns_vector_lists_for_string_and_array_input() {
+    let base = spawn_server().await;
+    let client = reqwest::Client::new();
+    // A single string still answers with a LIST of vectors (real Ollama).
+    let single: Value = client
+        .post(format!("{base}/api/embed"))
+        .json(&json!({ "model": "fake-model", "input": "hello world" }))
+        .send()
+        .await
+        .expect("request")
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(single["model"], "fake-model");
+    let vectors = single["embeddings"].as_array().expect("embeddings list");
+    assert_eq!(vectors.len(), 1);
+    assert_eq!(vectors[0].as_array().expect("vector").len(), 8);
+    assert_eq!(single["prompt_eval_count"], 2, "two whitespace words");
+
+    let many: Value = client
+        .post(format!("{base}/api/embed"))
+        .json(&json!({ "model": "fake-model", "input": ["a", "b"] }))
+        .send()
+        .await
+        .expect("request")
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(many["embeddings"].as_array().expect("list").len(), 2);
+
+    // Unknown model: error envelope with the Ollama-readable top-level
+    // error string.
+    let resp = client
+        .post(format!("{base}/api/embed"))
+        .json(&json!({ "model": "missing", "input": "hi" }))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(resp.status().as_u16(), 404);
+    let body: Value = resp.json().await.expect("json");
+    assert!(body["error_message"].as_str().unwrap().contains("missing"));
+}
+
+#[tokio::test]
 async fn version_reports_product_version() {
     let base = spawn_server().await;
     let body: Value = reqwest::get(format!("{base}/api/version"))

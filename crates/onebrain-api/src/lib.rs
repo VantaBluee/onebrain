@@ -40,10 +40,18 @@ pub enum ApiError {
         max_concurrent: u32,
         queue_depth: u32,
     },
+    /// Embeddings against a model split across nodes (M1 `/v1/embeddings`).
+    /// The embeddings context would issue its own RPC command stream
+    /// interleaved with the generation context's pipelined one, which the
+    /// overlap patches assume is single-context — unverified, so OneBrain
+    /// refuses rather than risk silently wrong vectors. Maps to HTTP 501.
+    #[error(
+        "embeddings are not supported while {0:?} is loaded across multiple nodes; \
+         load the model solo (`onebrain run {0}` on a single node) and retry"
+    )]
+    EmbeddingsDistributed(String),
     #[error("request validation failed: {0}")]
     BadRequest(String),
-    #[error("this endpoint is not implemented yet: {0}")]
-    NotImplemented(&'static str),
     #[error("internal error: {0}")]
     Internal(String),
 }

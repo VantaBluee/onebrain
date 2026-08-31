@@ -29,6 +29,7 @@ pub fn routes() -> Router<ApiState> {
     Router::new()
         .route("/api/generate", post(generate))
         .route("/api/chat", post(chat))
+        .route("/api/embed", post(embed))
         .route("/api/tags", get(tags))
         .route("/api/show", post(show))
         .route("/api/ps", get(ps))
@@ -68,6 +69,13 @@ struct ChatRequest {
     messages: Vec<ChatMessage>,
     stream: Option<bool>,
     options: Option<Options>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EmbedRequest {
+    model: String,
+    /// String or array of strings (`crate::types::embed_input_texts`).
+    input: Value,
 }
 
 #[derive(Debug, Deserialize)]
@@ -152,6 +160,38 @@ async fn chat(
     } else {
         collect(rx, req.model, Kind::Chat).await
     }
+}
+
+/// Ollama `POST /api/embed`: same backend method as `/v1/embeddings`, the
+/// dialect differs only in wire shape (`embeddings` is always a list of
+/// vectors, even for a single string input — real Ollama's behavior).
+/// `options`/`truncate`/`keep_alive` are ignored like the other handlers
+/// ignore unknown options.
+async fn embed(
+    State(state): State<ApiState>,
+    Json(req): Json<EmbedRequest>,
+) -> Result<Response, ApiError> {
+    let texts = crate::types::embed_input_texts(&req.input)?;
+    let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+    state.backend.embed(crate::backend::EmbedJob {
+        model: req.model.clone(),
+        texts,
+        resp: resp_tx,
+    })?;
+    let result = resp_rx.await.map_err(|_| {
+        ApiError::Internal("the embeddings request ended without a result; retry it".into())
+    })??;
+    Ok(Json(json!({
+        "model": req.model,
+        "embeddings": result.embeddings,
+        // Field-shape parity with real Ollama; embedding wall-clock is not
+        // attributed per request (honest zeros, same posture as
+        // load_duration in done_json).
+        "total_duration": 0u64,
+        "load_duration": 0u64,
+        "prompt_eval_count": result.prompt_tokens,
+    }))
+    .into_response())
 }
 
 async fn tags(State(state): State<ApiState>) -> Json<Value> {

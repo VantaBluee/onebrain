@@ -150,6 +150,34 @@ pub struct GenerateJob {
     pub tx: mpsc::Sender<TokenEvent>,
 }
 
+/// One embeddings request (`/v1/embeddings`, `/api/embed`): every text
+/// embeds independently against the same loaded model, results in input
+/// order.
+#[derive(Debug)]
+pub struct EmbedJob {
+    /// Client-requested model name; backends reject mismatches with
+    /// [`ApiError::ModelNotLoaded`].
+    pub model: String,
+    /// Texts to embed. The HTTP layer validates non-empty (list and
+    /// entries) before building the job.
+    pub texts: Vec<String>,
+    /// Where the result lands. The backend must always answer — `Ok` or
+    /// the typed `ApiError` — unless it is shutting down (a dropped sender
+    /// surfaces as an internal error upstream).
+    pub resp: tokio::sync::oneshot::Sender<Result<EmbedResult, ApiError>>,
+}
+
+/// The computed embeddings for one [`EmbedJob`].
+#[derive(Debug, Clone)]
+pub struct EmbedResult {
+    /// One vector per input text, in input order; every vector is the
+    /// model's embedding width (`n_embd`). The daemon backend returns
+    /// unit-L2-norm vectors (OpenAI parity); test doubles may not.
+    pub embeddings: Vec<Vec<f32>>,
+    /// Total tokens across all inputs (OpenAI `usage.prompt_tokens`).
+    pub prompt_tokens: u32,
+}
+
 /// Summary of a model known to the backend.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelSummary {
@@ -176,6 +204,9 @@ pub trait EngineBackend: Send + Sync + 'static {
     fn models(&self) -> Vec<ModelSummary>;
     /// Enqueue a generation. Must return quickly; events flow via `job.tx`.
     fn generate(&self, job: GenerateJob) -> Result<(), ApiError>;
+    /// Enqueue an embeddings request. Must return quickly; the result (or
+    /// its typed error) arrives on `job.resp`.
+    fn embed(&self, job: EmbedJob) -> Result<(), ApiError>;
     /// Download a model into the cache (no load). Must return quickly;
     /// progress flows via `tx`, always terminated by `Done` or `Error`.
     fn pull(&self, model: String, tx: mpsc::Sender<PullEvent>) -> Result<(), ApiError>;
@@ -256,6 +287,37 @@ pub mod testing {
                     .await;
                 let _ = tx.send(PullEvent::Done).await;
             });
+            Ok(())
+        }
+
+        fn embed(&self, job: EmbedJob) -> Result<(), ApiError> {
+            if !self.model_names.contains(&job.model) {
+                return Err(ApiError::ModelNotLoaded(job.model));
+            }
+            // Deterministic 8-wide vectors derived from each text's bytes,
+            // with non-trivial fractional bit patterns so base64 roundtrip
+            // tests exercise real float encodings; distinct texts get
+            // distinct vectors, and "tokens" are whitespace words.
+            let embeddings: Vec<Vec<f32>> = job
+                .texts
+                .iter()
+                .enumerate()
+                .map(|(i, text)| {
+                    let sum: u32 = text.bytes().map(u32::from).sum();
+                    (0..8)
+                        .map(|d| (sum % 97) as f32 * 0.03125 + i as f32 - d as f32 * 0.25)
+                        .collect()
+                })
+                .collect();
+            let prompt_tokens = job
+                .texts
+                .iter()
+                .map(|t| t.split_whitespace().count() as u32)
+                .sum();
+            let _ = job.resp.send(Ok(EmbedResult {
+                embeddings,
+                prompt_tokens,
+            }));
             Ok(())
         }
 

@@ -327,8 +327,30 @@ async fn text_completion_streaming() {
     assert_eq!(finish.as_deref(), Some("stop"));
 }
 
+/// Decode standard base64 (with padding) into bytes, then little-endian
+/// f32s — the exact inverse of the server's `encoding_format: "base64"`.
+fn base64_to_f32(encoded: &str) -> Vec<f32> {
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .expect("server must emit valid standard base64");
+    let (chunks, rest) = bytes.as_chunks::<4>();
+    assert!(rest.is_empty(), "payload must be whole f32s");
+    chunks.iter().map(|c| f32::from_le_bytes(*c)).collect()
+}
+
+/// The float `embedding` array of one data entry, as f32.
+fn embedding_f32(entry: &Value) -> Vec<f32> {
+    entry["embedding"]
+        .as_array()
+        .expect("embedding must be an array")
+        .iter()
+        .map(|v| v.as_f64().expect("embedding entries are numbers") as f32)
+        .collect()
+}
+
 #[tokio::test]
-async fn embeddings_returns_501_envelope() {
+async fn embeddings_single_string_has_openai_shape() {
     let base = start_server(true).await;
     let resp = reqwest::Client::new()
         .post(format!("{base}/v1/embeddings"))
@@ -336,12 +358,156 @@ async fn embeddings_returns_501_envelope() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 501);
+    assert_eq!(resp.status(), 200);
     let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["object"], "list");
+    assert_eq!(body["model"], "fake-model");
+    let data = body["data"].as_array().unwrap();
+    assert_eq!(data.len(), 1);
+    assert_eq!(data[0]["object"], "embedding");
+    assert_eq!(data[0]["index"], 0);
+    let embedding = embedding_f32(&data[0]);
+    assert_eq!(embedding.len(), 8, "FakeBackend emits 8-wide vectors");
+    assert!(embedding.iter().all(|v| v.is_finite()));
+    // usage counts tokens, and total == prompt (nothing is generated).
+    assert_eq!(body["usage"]["prompt_tokens"], 1);
+    assert_eq!(body["usage"]["total_tokens"], 1);
+}
+
+#[tokio::test]
+async fn embeddings_list_input_keeps_order_and_indexes() {
+    let base = start_server(true).await;
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/embeddings"))
+        .json(&json!({ "model": "fake-model", "input": ["alpha beta", "gamma"] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    let data = body["data"].as_array().unwrap();
+    assert_eq!(data.len(), 2);
+    assert_eq!(data[0]["index"], 0);
+    assert_eq!(data[1]["index"], 1);
+    assert_ne!(
+        embedding_f32(&data[0]),
+        embedding_f32(&data[1]),
+        "different inputs must embed differently"
+    );
+    // 2 + 1 whitespace words (the fake's token rule).
+    assert_eq!(body["usage"]["prompt_tokens"], 3);
+}
+
+#[tokio::test]
+async fn embeddings_base64_roundtrips_to_the_same_floats() {
+    let base = start_server(true).await;
+    let client = reqwest::Client::new();
+    let float_body: Value = client
+        .post(format!("{base}/v1/embeddings"))
+        .json(&json!({ "model": "fake-model", "input": ["hi", "there"] }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let b64_body: Value = client
+        .post(format!("{base}/v1/embeddings"))
+        .json(&json!({
+            "model": "fake-model",
+            "input": ["hi", "there"],
+            "encoding_format": "base64",
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    for i in 0..2 {
+        let floats = embedding_f32(&float_body["data"][i]);
+        let encoded = b64_body["data"][i]["embedding"]
+            .as_str()
+            .expect("base64 embedding must be a string");
+        assert_eq!(
+            base64_to_f32(encoded),
+            floats,
+            "base64 must decode to bit-identical floats (entry {i})"
+        );
+    }
+}
+
+#[tokio::test]
+async fn embeddings_reject_token_arrays_and_bad_formats() {
+    let base = start_server(true).await;
+    let client = reqwest::Client::new();
+    // Pre-tokenized input: 400 with a remedy, not a silent mis-decode.
+    let resp = client
+        .post(format!("{base}/v1/embeddings"))
+        .json(&json!({ "model": "fake-model", "input": [1, 2, 3] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "invalid_request_error");
     assert!(body["error"]["message"]
         .as_str()
         .unwrap()
-        .contains("embeddings"));
+        .contains("token-array"));
+    // Unknown encoding_format and empty input are 400 too.
+    for bad in [
+        json!({ "model": "fake-model", "input": "hi", "encoding_format": "hex" }),
+        json!({ "model": "fake-model", "input": [] }),
+        json!({ "model": "fake-model", "input": "" }),
+    ] {
+        let resp = client
+            .post(format!("{base}/v1/embeddings"))
+            .json(&bad)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400, "expected 400 for {bad}");
+    }
+}
+
+#[tokio::test]
+async fn embeddings_unknown_model_is_404_envelope() {
+    let base = start_server(true).await;
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/embeddings"))
+        .json(&json!({ "model": "missing-model", "input": "hi" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "not_found_error");
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("missing-model"));
+}
+
+#[tokio::test]
+async fn embeddings_require_auth_when_localhost_not_exempt() {
+    let base = start_server(false).await;
+    let client = reqwest::Client::new();
+    let no_token = client
+        .post(format!("{base}/v1/embeddings"))
+        .json(&json!({ "model": "fake-model", "input": "hi" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(no_token.status(), 401);
+    let with_token = client
+        .post(format!("{base}/v1/embeddings"))
+        .json(&json!({ "model": "fake-model", "input": "hi" }))
+        .header("Authorization", format!("Bearer {TOKEN}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(with_token.status(), 200);
 }
 
 #[tokio::test]
