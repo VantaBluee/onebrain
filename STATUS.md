@@ -263,8 +263,59 @@ fmt, clippy, tests, CPU smoke inference with a tiny GGUF on all three OSes;
   records why); per-seq sampler chains for interleaved non-greedy
   (documented divergence class, engine follow-up)
 
+## M8 — Product polish (implementation landed; release gate in progress)
+
+- [x] Contract: docs/product.md
+- [x] Metrics endpoint (/api/internal/metrics, token-auth'd): node,
+      peers (Hello-retained version+engine_build, persisted in the
+      peer store), plan view, 50-entry request log (NO prompt text —
+      structurally impossible + sentinel-tested at module/HTTP/sim
+      level), server-side advisor findings (6 rules, each pure and
+      fire/hold unit-tested, none without a measurement behind it)
+- [x] Dashboard v1 (ADR 0005: no framework/build step/CDN): embedded
+      SPA — topology SVG, plan visualization, node cards, request log,
+      advisor on top; token-once + 401 re-prompt + unreachable states;
+      shell serves tokenless on the existing listener, internal routes
+      stay auth'd
+- [x] doctor v2 (firewall posture per OS, driver/backend hints,
+      version skew via metrics) + self-update (SHA256SUMS + optional
+      cosign verify, atomic swap incl. Windows, offline-tested against
+      a fixture releases server)
+- [x] Installers + release pipeline: install.sh (shellcheck-clean),
+      WiX .msi, .deb/.rpm, Homebrew formula; release.yml signs ONE
+      merged SHA256SUMS keylessly (cosign/GitHub OIDC) and publishes
+      with verification one-liners; ci.yml release-dry-run job builds
+      installers on 3 OSes every PR/main push
+- [x] Docs pack: README (90-second two-laptop demo, every claim maps
+      to a test), ARCHITECTURE.md, SECURITY.md (threat model; private
+      vulnerability reporting ENABLED on the repo), CONTRIBUTING.md,
+      issue/PR templates
+- [x] Sim DoD steps 23-26 green locally (dashboard tokenless +
+      metrics 401, topology/plan mirroring, request-log
+      prompt-absence, advisor; slow-link assert rides the netem leg)
+- [x] Full local gate green: fmt, clippy -Dwarnings, workspace tests,
+      e2e, pair-sim, sim 60 steps; sweeps (no new listeners, no prompt
+      leak, auth boundaries, YAML/shell validation, README command
+      spot-check)
+- [ ] M7 overlap DoD gap being closed first (see below), then: push,
+      CI green incl. netem, tag v0.1.0-rc.1 (proves signed-release
+      CI), then v0.1.0
+- [ ] Manual (user): fresh-machine README walkthrough per OS;
+      Homebrew tap repo creation (RELEASING.md)
+
+## Known open item — M7 overlap DoD on CPU-only runners
+
+CI measured the truth: with clean baselines the netem overlap ratio is
+~0.86x (14% saving), not the contracted <=0.75x; the earlier pass rode
+a noise-inflated sequential baseline. Decode overlap works (2.4x). A
+deep-dive into the prefill pipeline (sched-thread serialization around
+the 2 MiB boundary GET with a synchronous-CPU final stage) is in
+flight: either a capture fix within patch 0003's no-wire-change
+envelope, or an evidence-backed structural-ceiling writeup + honest
+DoD amendment.
+
 ## Upcoming
-- M8 product polish. Details in the spec.
+- v0.1.0-rc.1 → v0.1.0 release. All eight milestones implemented.
 
 ## Dev environment notes (this machine: Windows 11)
 

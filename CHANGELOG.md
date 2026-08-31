@@ -10,6 +10,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 M0 (skeleton & CI) complete locally; M1 (excellent single-node) implemented,
 cross-OS CI proof in flight.
 
+### Added — M8
+
+- Dashboard v1 at the head's `/`: live topology with measured
+  RTT/bandwidth/loss per link, the active plan drawn as layer ranges
+  per node in stage order, per-node memory/throughput cards, a request
+  log (timings only — prompt text never leaves the API path, asserted
+  in the sim against the raw response body), and a bottleneck advisor
+  whose every one-liner is backed by a measurement (slow link,
+  memory-starved node, draining node in the plan, version skew,
+  battery). Zero dependencies: a hand-written SPA embedded in the
+  binary — no framework, no build step, no CDN (ADR 0005).
+- `onebrain doctor` v2: firewall posture per OS (with paste-ready
+  remedies), driver/backend hints (a GPU the build can't use gets
+  named), and version skew across paired machines.
+- `onebrain self-update`: fetches the right release asset, verifies
+  SHA256SUMS (and the cosign signature when cosign is installed), and
+  swaps the executable atomically — including on Windows.
+- Install paths: `curl | bash` installer, Windows `.msi`, Debian/RPM
+  packages, a Homebrew formula — all fed by a release pipeline that
+  signs artifacts keylessly (Sigstore/GitHub OIDC) so users can verify
+  without us managing a signing key.
+- Release-grade docs: README with a 90-second two-laptop demo,
+  ARCHITECTURE.md, SECURITY.md (the threat model, including what a
+  stolen pairing ticket can and cannot do), CONTRIBUTING.md.
+
 ### Added — M7
 
 - Distributed prefill overlaps: an additive vendor patch teaches the
