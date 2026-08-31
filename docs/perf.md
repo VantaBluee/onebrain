@@ -230,6 +230,26 @@ does not exist yet.
   (`--json` for machines); values are measurements, labeled with model
   + plan + config, never promises (§1.6 honest-UX rule).
 
+## §0/§3 correction (recorded at the overlap-gap fix)
+
+The audit's transfer model needed correcting once measured: in the
+2-layer perf sim model with tensor_split [0.5,0.5], llama's placement
+puts BOTH transformer layers on the remote worker (the head holds only
+output_norm+output, computing on zero rows for non-final ubatches), so
+the per-ubatch transfer is the embd INPUT SET (fire-and-forget), not a
+boundary GET each way. The overlap opportunity is streaming ubatch
+k+1's inputs while the worker computes ubatch k. Four serializers
+prevented that and were fixed in patch 0003's final form: a zero-byte
+split-input copy taking the sched's synchronizing fallback (now
+skipped), llama's graph-reuse path never rotating pipeline copies and
+force-syncing per ubatch (reuse now disabled for pipelined multi-token
+ubatches only), fences draining the whole queue (now FIFO ack tickets:
+the fence request is sent at event_record, its response popped at
+wait), and ~20 GET_ALLOC_SIZE round trips per ubatch (now a client-side
+cache; note this also speeds up the M3 BASELINE, which the DoD ratio is
+measured against). The engine additionally requests logits only on the
+final decode chunk (nothing ever read intermediate-chunk logits).
+
 ## DoD hooks
 
 - Sim (netem leg, 1 Gbit / 0.5 ms — the "1Gbps sim profile"): a perf

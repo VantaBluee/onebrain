@@ -2365,6 +2365,12 @@ fn perf_overlap_step(env: &ChaosEnv, netem: bool) -> Result<()> {
 
     // The comparison. Numbers print in BOTH modes (the contract wants them
     // diffable in CI logs); only the netem leg asserts.
+    //
+    // Expect loopback (non-netem) ratios around 0.9-1.2: with ~zero wire
+    // time there is nothing for the pipeline to hide, and pipelined
+    // multi-token ubatches skip llama's graph-reuse fast path (patch 0003's
+    // final form), so the per-ubatch alloc cost is exposed. The win the DoD
+    // measures only exists where transfer time is real — the netem leg.
     let seq_prefill = median_u64(&sequential.iter().map(|l| l.prefill_ms).collect::<Vec<_>>());
     let ov_prefill = median_u64(&overlapped.iter().map(|l| l.prefill_ms).collect::<Vec<_>>());
     let seq_tps = median_f64(&sequential.iter().map(decode_tps).collect::<Vec<_>>());
