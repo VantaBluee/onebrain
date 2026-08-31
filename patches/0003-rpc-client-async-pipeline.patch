@@ -2,8 +2,18 @@ onebrain vendor patch 0003: RPC client-side async pipelining
 (docs/perf.md §3 — overlapped chunked prefill)
 
 Applies on top of 0001 + 0002. Client paths of ggml-rpc.cpp (plus one
-additive declaration in ggml-rpc.h) only; the server side and the wire
-format are untouched.
+additive declaration in ggml-rpc.h) and one hunk in llama-context.cpp;
+the server side and the wire format are untouched.
+
+The llama-context.cpp hunk resolves upstream's own TODO at the
+pipeline_parallel gate ("should we ignore ACCEL types too?"): ACCEL
+devices (BLAS/Accelerate - linked into our macOS CPU builds) advertise
+no async/events and vetoed pipelining for the whole context, so overlap
+engaged on Linux/Windows but never on macOS. ggml_backend_sched already
+null-checks per-backend events and falls back to a blocking
+ggml_backend_synchronize at every wait/record site, so an eventless
+ACCEL backend simply runs its own boundaries synchronously while the
+capable backends still overlap. Strong upstreaming candidate.
 
 Correctness argument (also at the ob_rpc_pending block in the file): the
 RPC server executes commands serially, in order, per connection, and
@@ -26,7 +36,7 @@ Failures compose with 0002: a failed fence marks the socket dead and the
 error surfaces on whichever status-returning call drains or runs next.
 
 diff --git a/ggml/include/ggml-rpc.h b/ggml/include/ggml-rpc.h
-index 1d1646d..3ae4ff9 100644
+index 1d1646d84..3ae4ff9a0 100644
 --- a/ggml/include/ggml-rpc.h
 +++ b/ggml/include/ggml-rpc.h
 @@ -36,6 +36,13 @@ GGML_BACKEND_API void ggml_backend_rpc_start_server(const char * endpoint, const
@@ -44,7 +54,7 @@ index 1d1646d..3ae4ff9 100644
  GGML_BACKEND_API ggml_backend_reg_t ggml_backend_rpc_add_server(const char * endpoint);
  
 diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
-index 815e9ad..a95324a 100644
+index 815e9ad88..a95324a63 100644
 --- a/ggml/src/ggml-rpc/ggml-rpc.cpp
 +++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
 @@ -34,6 +34,13 @@ namespace fs = std::filesystem;
@@ -475,3 +485,26 @@ index 815e9ad..a95324a 100644
  };
  
  // backend reg interface
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 0402044da..a08c953b2 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -436,9 +436,16 @@ llama_context::llama_context(
+         if (pipeline_parallel) {
+             for (auto & backend : backends) {
+                 auto dev_type = ggml_backend_dev_type(ggml_backend_get_device(backend.get()));
+-                if (dev_type == GGML_BACKEND_DEVICE_TYPE_CPU) {
++                if (dev_type == GGML_BACKEND_DEVICE_TYPE_CPU || dev_type == GGML_BACKEND_DEVICE_TYPE_ACCEL) {
+                     // ignore CPU backend
+-                    // TODO: should we ignore ACCEL types too?
++                    // ob-patch-0003: also ignore ACCEL backends (resolves the TODO
++                    // that used to sit here). ACCEL devices (e.g. BLAS/Accelerate)
++                    // advertise no async/events, which vetoed pipeline parallelism
++                    // for the whole context; but ggml_backend_sched already
++                    // null-checks per-backend events and falls back to a blocking
++                    // ggml_backend_synchronize at every wait/record site, so an
++                    // eventless ACCEL backend simply runs its own boundaries
++                    // synchronously while the capable backends still overlap.
+                     continue;
+                 }
+                 auto * dev = ggml_backend_get_device(backend.get());
