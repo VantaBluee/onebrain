@@ -35,12 +35,35 @@ pub fn load_or_create(paths: &AppPaths) -> Result<String, DaemonError> {
     let mut bytes = [0u8; TOKEN_BYTES];
     getrandom::fill(&mut bytes).map_err(|e| DaemonError::Entropy(e.to_string()))?;
     let token = hex::encode(bytes); // hex::encode is lowercase
-    std::fs::write(&path, &token).map_err(|source| DaemonError::TokenWrite {
-        path: display.clone(),
-        source,
-    })?;
-    restrict_permissions(&path);
-    Ok(token)
+    match write_new_token_file(&path, &token) {
+        Ok(()) => Ok(token),
+        // Concurrent-create race: another daemon start won the exclusive
+        // create between our `exists()` check and here — adopt its token.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => load_or_create(paths),
+        Err(source) => Err(DaemonError::TokenWrite {
+            path: display,
+            source,
+        }),
+    }
+}
+
+/// Create the token file exclusively (never truncating an existing one)
+/// with mode 0600 on Unix, so the secret is never readable by other local
+/// users — not even for a window (mirrors the mesh device key's
+/// `write_new_key_file`). Windows config dirs are already per-user
+/// (`%APPDATA%`).
+fn write_new_token_file(path: &std::path::Path, token: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(token.as_bytes())?;
+    file.sync_all()
 }
 
 /// 64 lowercase hex characters, nothing else.
@@ -50,17 +73,6 @@ fn is_valid_token(token: &str) -> bool {
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
-
-/// Best-effort owner-only mode on Unix; Windows config dirs are already
-/// per-user (`%APPDATA%`).
-#[cfg(unix)]
-fn restrict_permissions(path: &std::path::Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-}
-
-#[cfg(not(unix))]
-fn restrict_permissions(_path: &std::path::Path) {}
 
 #[cfg(test)]
 mod tests {
@@ -99,6 +111,20 @@ mod tests {
         let token = load_or_create(&paths).unwrap();
         std::fs::write(paths.config_dir.join("api-token"), format!("{token}\n")).unwrap();
         assert_eq!(load_or_create(&paths).unwrap(), token);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn token_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = temp_paths(dir.path());
+        load_or_create(&paths).unwrap();
+        let mode = std::fs::metadata(paths.config_dir.join("api-token"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 
     #[test]

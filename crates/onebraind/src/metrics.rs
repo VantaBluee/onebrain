@@ -89,7 +89,23 @@ impl RequestLog {
         let log = Arc::clone(self);
         let logged_model = model.clone();
         tokio::spawn(async move {
-            while let Some(event) = relay_rx.recv().await {
+            loop {
+                let event = tokio::select! {
+                    // Biased recv-first: a Done already buffered when the
+                    // client vanishes is still recorded below before the
+                    // closed-channel arm can win the race.
+                    biased;
+                    e = relay_rx.recv() => match e {
+                        Some(e) => e,
+                        None => return,
+                    },
+                    // Client gone while the engine is silent (queued, or
+                    // mid-prefill): dropping relay_rx here flips the
+                    // engine-side sender's `is_closed()` immediately, so
+                    // the disconnect sweep reaps the sequence at the next
+                    // step boundary instead of after the next event.
+                    _ = client_tx.closed() => return,
+                };
                 // Record BEFORE forwarding: the entry exists by the time
                 // the client sees its `done`, and a client that vanishes
                 // between finish and delivery still leaves the completed
@@ -258,6 +274,29 @@ mod tests {
         // The relay notices the dead client and drops its receiver; the
         // engine-side sender then observes `closed` like before.
         wrapped.tx.closed().await;
+        assert!(log.snapshot().is_empty(), "no Done, no entry");
+    }
+
+    /// A client that disconnects while the engine is still silent (queued,
+    /// or mid-prefill — no event forwarded yet) must flip the engine-side
+    /// sender to closed WITHOUT waiting for the next event, or the
+    /// disconnect sweep can never reap the sequence at the next step
+    /// boundary (docs/perf.md §6).
+    #[tokio::test]
+    async fn relay_closes_on_disconnect_before_any_event() {
+        let log = RequestLog::new();
+        let (client_tx, client_rx) = tokio::sync::mpsc::channel(1);
+        let wrapped = log.observe(GenerateJob {
+            model: "m".into(),
+            prompt: PromptInput::Raw("hi".into()),
+            params: GenParams::default(),
+            dialect: ApiDialect::Openai,
+            tx: client_tx,
+        });
+        drop(client_rx); // client gone; the engine has emitted NOTHING
+        tokio::time::timeout(std::time::Duration::from_secs(5), wrapped.tx.closed())
+            .await
+            .expect("relay must observe the disconnect without an event to forward");
         assert!(log.snapshot().is_empty(), "no Done, no entry");
     }
 }

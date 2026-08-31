@@ -7,8 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-M0 (skeleton & CI) complete locally; M1 (excellent single-node) implemented,
-cross-OS CI proof in flight.
+M0–M8 implemented; M0–M6 cross-OS CI proofs met (2026-08). The M7 CI gate
+(including the netem overlap DoD) and the M8 release gate are in progress,
+plus a post-M8 release-hardening pass.
 
 ### Added — release hardening (post-M8 finishing pass)
 
@@ -24,9 +25,16 @@ cross-OS CI proof in flight.
   same way normal finishes do — a stalled client can no longer lose the
   last tokens of a failing stream.
 - Prefill overlap survived contact with a real network: client-side
-  flow control caps in-flight pipelining at ~2 microbatches (CI's
-  1 Gbit netem leg collapsed 2.5x under unbounded bursts before the
-  cap; with it the ≥25% overlap saving holds). A torn connection during
+  flow control caps in-flight pipelining at ~4 microbatches — the
+  scheduler's own rotation depth (adaptive: 4.5× the burst's largest
+  command + 1 MiB, floor 4 MiB; depth 2 measurably left ~15% of the
+  overlap win on the table). The CI netem leg's 2.5x collapse was
+  root-caused to receiver-side kernel UDP buffer overflow (stock
+  `rmem_max` silently capping iroh's ~7 MB QUIC buffers — invisible
+  `RcvbufErrors`, zero qdisc drops), which the sim harness now
+  provisions away at the source (rmem/wmem_max 8 MB, standard QUIC
+  guidance). Local netem runs land 0.60–0.67x sequential; the ≥25%
+  CI DoD confirmation rides the next push. A torn connection during
   session creation is now a typed error instead of a llama.cpp abort.
 
 ### Added — M8

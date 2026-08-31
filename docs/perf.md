@@ -47,8 +47,9 @@ ships with the instrument that proves it.
   as real Ollama does); OpenAI `usage` stays counts-only per the
   OpenAI schema.
 - The daemon logs one stable line per completed generation:
-  `perf: prefill {n}tok {ms}ms decode {n}tok {ms}ms ttft {ms}ms` —
-  sim-greppable.
+  `perf: prefill {n}tok {ms}ms decode {n}tok {ms}ms ttft {ms}ms drafted
+  {n} accepted {n}` — sim-greppable (the drafted/accepted counters are 0
+  until §5 speculative decoding is in play).
 
 ## 2. Engine session/batch substrate (shim-only)
 

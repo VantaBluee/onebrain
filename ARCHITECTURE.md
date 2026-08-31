@@ -171,8 +171,13 @@ never re-sent. No feasible re-plan ⇒ a typed error naming the lost node and
 both MB figures. A returning peer triggers a lazy re-plan at idle. Workers
 drain politely on `onebrain stop` (a `Draining` notice + 3 s grace).
 
-The engine loop is confirm-before-send: a token is streamed only after its
-own decode succeeded, so a dying node can never leak a corrupted token.
+The engine loop is confirm-before-send for DISTRIBUTED models: a token's
+piece is streamed only after its own decode succeeded, so a dying node can
+never leak a corrupted token. Solo models are exempt and emit each piece
+at sample time, one decode step earlier (~23% of TTFT on a small model) —
+no transport exists solo that can corrupt logits behind a successful
+decode, and a solo decode failure is terminal (docs/resilience.md,
+"Confirm-before-send and the solo exemption").
 Power realities live in `crates/onebraind/src/power.rs`: a per-OS sleep
 inhibitor held while serving, and a battery probe that flags a node
 `draining` below the configured threshold so new plans avoid it.
@@ -226,8 +231,9 @@ The dashboard itself (`crates/onebrain-dash`) is a hand-written static page
 — semantic HTML + vanilla JS + CSS, embedded via rust-embed, no framework,
 no build step, no CDN, no external fonts (ADR
 [0005](docs/decisions/0005-dashboard-no-framework.md)). The daemon serves
-it at `/`; the shell is the only Bearer-exempt page (it contains no data)
-and asks for the API token once.
+it at `/`; the shell and its static assets under `/dash/*` are the only
+Bearer-exempt routes (they contain no data) and the shell asks for the API
+token once.
 
 `onebrain doctor` adds per-OS firewall posture, GPU-backend hints, and
 cross-node version-skew findings (remedy: `onebrain self-update`);

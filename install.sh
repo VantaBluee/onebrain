@@ -47,7 +47,7 @@ case "$os" in
   Linux)
     case "$arch" in
       x86_64 | amd64) target="x86_64-unknown-linux-gnu" ;;
-      *) die "no prebuilt binary for Linux/$arch yet — build from source: https://github.com/${REPO}#quickstart-build-from-source" ;;
+      *) die "no prebuilt binary for Linux/$arch yet — build from source: https://github.com/${REPO}#install" ;;
     esac
     ;;
   MINGW* | MSYS* | CYGWIN*)

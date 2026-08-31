@@ -18,7 +18,10 @@ impl Capabilities {
     pub const BLOB_SHARING: u64 = 1 << 1;
     /// Tensor-parallel islands on sub-millisecond links (M7, engine-gated).
     pub const TENSOR_PARALLEL: u64 = 1 << 2;
-    /// Speculative decoding participation (M7).
+    /// Wire-level speculative-decoding participation by peers. M7 shipped
+    /// head-solo drafting (docs/perf.md §5 "draft placement v1") with no
+    /// proto change — no peer-facing feature exists yet, so the bit stays
+    /// dark deliberately until one does.
     pub const SPECULATIVE: u64 = 1 << 3;
     /// int8 activation compression on slow links (M7, flagged).
     pub const ACT_COMPRESSION: u64 = 1 << 4;
@@ -34,7 +37,11 @@ impl Capabilities {
         // plus the mesh blobs provider, docs/logistics.md). M7: on-demand
         // cluster benchmarking (`BenchRequest`/`BenchReport`, docs/perf.md
         // §10) — every build with the bit answers the request, at minimum
-        // with the cannot-bench-now marker.
+        // with the cannot-bench-now marker. SPECULATIVE, TENSOR_PARALLEL,
+        // and ACT_COMPRESSION stay dark deliberately post-M7: they gate
+        // wire-level peer features M7 chose not to ship (drafting is
+        // head-solo, tensor-parallel is engine-gated, act-compression
+        // flagged) — see the bit docs above.
         Capabilities(Self::PIPELINE_PARALLEL | Self::BLOB_SHARING | Self::CLUSTER_BENCH)
     }
 
@@ -68,7 +75,11 @@ mod tests {
         assert!(caps.supports(Capabilities::PIPELINE_PARALLEL), "M3");
         assert!(caps.supports(Capabilities::BLOB_SHARING), "M6");
         assert!(caps.supports(Capabilities::CLUSTER_BENCH), "M7 bench");
-        // Unlanded M7 features stay dark until their milestones ship.
+        // Deliberately dark post-M7: these bits gate wire-level features
+        // M7 chose not to ship — speculative drafting is head-solo
+        // (docs/perf.md §5), tensor-parallel is engine-gated,
+        // act-compression flagged. They light only when a proto-level peer
+        // feature exists to gate.
         assert!(!caps.supports(Capabilities::TENSOR_PARALLEL));
         assert!(!caps.supports(Capabilities::SPECULATIVE));
         assert!(!caps.supports(Capabilities::ACT_COMPRESSION));

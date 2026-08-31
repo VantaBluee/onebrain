@@ -35,9 +35,10 @@ one JSON document, additive-stable schema:
 ## 2. Dashboard v1 (spec §7)
 
 - Served by the daemon at `/` (and `/dash/*` assets) — same listener,
-  Bearer-exempt for the HTML shell ONLY; the shell asks for the token
-  (paste once, kept in localStorage) and calls `/api/internal/metrics`
-  with it. Loopback exemption applies as configured (§M1 rules).
+  Bearer-exempt for the HTML shell and its `/dash/*` static assets ONLY
+  (none of which carry data); the shell asks for the token (paste once,
+  kept in localStorage) and calls `/api/internal/metrics` with it.
+  Loopback exemption applies as configured (§M1 rules).
 - ADR (record as docs/decisions/000N): NO framework, NO build step, NO
   CDN — one hand-written static page (semantic HTML + vanilla JS + CSS,
   a few small files) embedded via rust-embed in onebrain-dash. The spec

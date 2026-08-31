@@ -50,14 +50,18 @@ all times, including during distributed sessions.
 ### The API is authenticated
 
 Every HTTP request requires `Authorization: Bearer <token>` (a 64-hex-char
-random token created at first start, printed by `onebrain status`). One
+random token created at first start — `<config_dir>/api-token`, exclusive
+create with file mode 0600 on Unix like the device key — printed by
+`onebrain status`). One
 deliberate exception exists: **localhost clients** may call the *public*
 dialects (`/v1/*`, `/api/*`) without the token, and that exemption is
 configurable off (`localhost_auth_exempt = false`). The exemption **never**
 applies to `/api/internal/*` — status, load, pairing, metrics, and every
 other control endpoint require the token even from loopback. The dashboard
-HTML shell at `/` is the one Bearer-exempt page; it contains no data and
-asks you for the token, which it then sends on every metrics poll.
+HTML shell at `/` and its static assets under `/dash/*` (app.css, app.js,
+render.js) are the only Bearer-exempt routes; they contain no data, and
+the shell asks you for the token, which it then sends on every metrics
+poll.
 
 ### Content stays on your machines
 
@@ -149,8 +153,11 @@ which removes upstream RPC's silent cross-version failure mode.
   during an active epoch. Same-machine processes running as you are outside
   the threat model (they could equally read your model files).
 - On Windows, the worker's socket pair is emulated with a loopback
-  listener bound to `127.0.0.1:0` that accepts exactly once and closes —
-  a single intra-process accept race, same class as above.
+  listener bound to `127.0.0.1:0` that accepts exactly once, verifies the
+  accepted peer is its own connecting socket, and closes — a foreign local
+  connection is rejected and session setup fails closed, so a same-machine
+  racer can at most cause a retriable setup error, never enter the RPC
+  path.
 - A paired device is trusted (see the pairing section). Unpair devices you
   no longer control.
 

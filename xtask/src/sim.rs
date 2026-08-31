@@ -91,9 +91,21 @@
 //!     decode_tps_override 100 so the score ranks it first) and the head
 //!     must reach a NEW epoch including it within 45 s with no client
 //!     activity beyond status polling.
-//! 12. **chaos-4 (drain)** — `onebrain stop` on the now-idle other worker:
-//!     it must leave `connected` in the head's peers, and the next plan
-//!     (trigger: a reload) must exclude it while keeping the live worker.
+//! 12. **chaos-4 (drain)** — `onebrain stop` on the IN-EPOCH worker while
+//!     its epoch is idle (docs/resilience.md hook 4 "mid-idle-epoch";
+//!     only a worker with an active shard sends the `Draining` notice):
+//!     the head must LOG the polite drain (`peer announced a polite
+//!     drain`, naming the stopped worker — distinguishing it from plain
+//!     death detection), the worker leaves `connected` in the head's
+//!     peers, and the next plan (trigger: a reload) must exclude it
+//!     while keeping the other live worker. Then **chaos-5 (speculative retry)** — the
+//!     drained worker restarts, a capped `--speculative` load distributes
+//!     (draft solo on the head), and the in-epoch worker is killed
+//!     mid-stream: the SAME stream completes (finish_reason length), the
+//!     retried generation's perf line still reports drafted/accepted > 0
+//!     (the reloaded epoch kept the draft — docs/perf.md §5 "the retry
+//!     re-prefills and continues speculating"), and the text equals a
+//!     control run on the recovered topology.
 //!
 //! After the chaos section, the **M6 logistics** proofs run
 //! (docs/logistics.md "DoD hooks"). A counting fake-WAN HTTP server on
@@ -151,12 +163,17 @@
 //! 20. **prefix reuse** — request B sharing request A's ≥ 64-token prefix
 //!     prefills exactly the suffix (`len(B) − len(A)` tokens), an
 //!     identical re-request prefills exactly 1, and both outputs are
-//!     byte-identical to cold-cache controls.
+//!     byte-identical to cold-cache controls — against BOTH a solo and a
+//!     forced-2-node distributed target, with the distributed outputs
+//!     byte-identical to the solo ones (§9 across the warm-reuse path).
 //! 21. **micro-batch** — `[perf] max_concurrent_requests = 2` +
 //!     `queue_depth = 1`: two concurrent streams complete byte-identical
 //!     to their alone-runs while a third queues and completes too, and a
 //!     fourth in-flight request is refused with the typed 429
-//!     (`rate_limit_error` envelope + the config-knob remedy).
+//!     (`rate_limit_error` envelope + the config-knob remedy); then a
+//!     forced-2-node reload under the same knobs re-proves two concurrent
+//!     streams byte-identical to their distributed alone-runs AND to the
+//!     solo alone-runs (§9 on the multi-sequence batch shape).
 //! 22. **bench smoke** — `onebrain bench --cluster` against the live pair
 //!     renders the parseable markdown report (Nodes/Links/End-to-end
 //!     tables; the peer row carries real figures via the mesh
@@ -1184,29 +1201,40 @@ fn chaos_section(env: &ChaosEnv, dims: &SimModelDims) -> Result<()> {
     )?;
 
     // ---- chaos-4: polite drain via `onebrain stop` ----------------------
+    // docs/resilience.md sim hook 4 ("a worker mid-idle-epoch"): only a
+    // worker WITH an active shard sends the proto `Draining` notice, so
+    // the stop lands on the IN-EPOCH worker — the chaos-3 rejoiner — while
+    // its epoch is idle (no request in flight).
     step(
-        "chaos-4: `onebrain stop` on the idle worker; it leaves connected on the head",
+        "chaos-4: `onebrain stop` on the in-epoch worker; the head logs the polite drain",
         || {
-            let out = survivor.node.onebrain(&["stop"])?;
+            let out = victim.node.onebrain(&["stop"])?;
             if !out.status.success() {
                 bail!(
                     "`onebrain stop` on {} failed: {}",
-                    survivor.node.label,
+                    victim.node.label,
                     String::from_utf8_lossy(&out.stderr).trim()
                 );
             }
             let deadline = Instant::now() + STOP_TIMEOUT;
-            while survivor.node.try_status().is_ok() {
+            while victim.node.try_status().is_ok() {
                 if Instant::now() >= deadline {
                     bail!(
                         "{} still answering {STOP_TIMEOUT:?} after `onebrain stop`",
-                        survivor.node.label
+                        victim.node.label
                     );
                 }
                 std::thread::sleep(POLL_INTERVAL);
             }
+            // The head must LOG the polite drain — this is what
+            // distinguishes a polite `onebrain stop` from plain death
+            // detection (which also leaves `connected`).
+            let line = wait_log_line(env.a, "peer announced a polite drain", PEER_LOSS_TIMEOUT)?;
+            if !line.contains(&victim_id) {
+                bail!("the polite-drain line does not name the stopped worker {victim_id}: {line}");
+            }
             env.a.wait_peer(
-                &survivor.peer.id,
+                &victim_id,
                 PEER_LOSS_TIMEOUT,
                 "the stopped worker leaving connected",
                 |p| p["state"] != "connected",
@@ -1221,18 +1249,153 @@ fn chaos_section(env: &ChaosEnv, dims: &SimModelDims) -> Result<()> {
             let plan = load_model(env.a, &json!({ "model": env.model_arg, "explain": true }))?;
             assert_distributed(&plan)?;
             let ids = assignment_node_ids(&plan);
-            if ids.iter().any(|id| id == &survivor.peer.id) {
+            if ids.iter().any(|id| id == &victim_id) {
                 bail!(
                     "the new plan still includes the stopped worker {}: {plan}",
-                    survivor.node.label
-                );
-            }
-            if !ids.iter().any(|id| id == &victim_id) {
-                bail!(
-                    "the new plan does not include the remaining live worker {}: {plan}",
                     victim.node.label
                 );
             }
+            if !ids.iter().any(|id| id == &survivor.peer.id) {
+                bail!(
+                    "the new plan does not include the remaining live worker {}: {plan}",
+                    survivor.node.label
+                );
+            }
+            Ok(())
+        },
+    )?;
+
+    // ---- chaos-5: the transparent retry CONTINUES speculating -----------
+    // docs/perf.md §5 ("the retry re-prefills and continues speculating"):
+    // the M5 kill-retry rehearsal with `--speculative` on, pinning that
+    // the reloaded epoch still carries the draft (the accepted counter
+    // moves on the post-retry perf line) and §9 equality holds under
+    // failure on the speculative path.
+    step(
+        "chaos-5 setup: restart the drained worker; three capped nodes again",
+        || {
+            start_with(victim.node, victim.mesh_port, false, SimKnobs::capped(cap))?;
+            wait_connected(
+                env.a,
+                victim.node,
+                env.peer_a,
+                victim.peer,
+                "after reviving the drained worker for chaos-5",
+            )
+        },
+    )?;
+    let plan5 = step(
+        "chaos-5: capped SPECULATIVE load distributes (draft solo on the head)",
+        || {
+            // Forced 2 nodes: the chaos-1 epoch shape (head + ONE worker,
+            // the other worker standing by for the retry re-plan). An
+            // unforced load here may plan head + BOTH workers, and a kill
+            // inside a 3-device pipeline can tear the surviving worker's
+            // bridge in the same cascade, leaving the re-plan infeasible —
+            // a different scenario than the §5 retry this step pins.
+            let plan = load_model(
+                env.a,
+                &json!({
+                    "model": env.model_arg, "nodes": 2,
+                    "speculative": true, "draft": env.model_arg,
+                }),
+            )?;
+            assert_distributed(&plan)?;
+            Ok(plan)
+        },
+    )?;
+    let epoch5 = plan_epoch(&plan5)?;
+    let in_epoch5 = epoch_worker_ids(&plan5, &[victim_id.as_str(), survivor.peer.id.as_str()])?;
+    let victim5 = if in_epoch5[0] == victim_id {
+        &victim
+    } else {
+        &survivor
+    };
+    let prior_perf = perf_line_count(env.a);
+    let watch5 = step(
+        "chaos-5: kill the in-epoch worker mid-stream; the SAME stream completes (length)",
+        || {
+            let pid = daemon_pid(victim5.node)?;
+            let watch = run_chaos_stream(env.a, &model, || {
+                kill_hard(pid)?;
+                println!(
+                    "       killed {} (pid {pid}) after {CHAOS_KILL_AFTER_CHUNKS} content chunks",
+                    victim5.node.label
+                );
+                Ok(())
+            })?;
+            if watch.kill_at != Some(CHAOS_KILL_AFTER_CHUNKS) {
+                bail!(
+                    "the kill never fired: only {} content chunks arrived before the stream \
+                     ended (errors: {:?})",
+                    watch.pieces.len(),
+                    watch.errors
+                );
+            }
+            if !watch.errors.is_empty() {
+                bail!(
+                    "the retry must be transparent, but the stream carried error events: {:?}",
+                    watch.errors
+                );
+            }
+            if !watch.done {
+                bail!("the stream ended without `data: [DONE]`");
+            }
+            if !watch.finish.iter().any(|f| f == "length") {
+                bail!(
+                    "no chunk carried finish_reason \"length\" (saw {:?}) — the stream did \
+                     not run to max_tokens",
+                    watch.finish
+                );
+            }
+            if watch.pieces_after_kill() == 0 {
+                bail!("no content chunks arrived after the kill — the retry never resumed");
+            }
+            Ok(watch)
+        },
+    )?;
+    step(
+        "chaos-5: the retry kept speculating (accepted > 0) and matches a control run",
+        || {
+            let plan = wait_for_plan(
+                env.a,
+                Duration::from_secs(10),
+                "a new epoch excluding the dead worker",
+                |p| {
+                    plan_epoch(p).ok() != Some(epoch5)
+                        && !assignment_node_ids(p)
+                            .iter()
+                            .any(|id| id == &victim5.peer.id)
+                },
+            )?;
+            assert_distributed(&plan)?;
+            // The retried generation's own perf line: the reloaded epoch
+            // must still carry the draft (this is the assert that would
+            // catch the supervisor dropping the draft on the reload).
+            let line = wait_perf_line(env.a, prior_perf, Duration::from_secs(10))?;
+            if line.drafted == 0 || line.accepted == 0 {
+                bail!(
+                    "the retried generation logged drafted {} accepted {} — the reloaded \
+                     epoch must CONTINUE speculating (docs/perf.md §5): {line:?}",
+                    line.drafted,
+                    line.accepted
+                );
+            }
+            let (text, _tokens, finish) = chat_full(env.a, &model, PROMPT, CHAOS_MAX_TOKENS)?;
+            if finish.as_deref() != Some("length") {
+                bail!("control run finished with {finish:?}, expected \"length\"");
+            }
+            let streamed = watch5.text();
+            if text != streamed {
+                bail!(
+                    "retried speculative stream and control run differ:\n  stream:  \
+                     {streamed:?}\n  control: {text:?}"
+                );
+            }
+            println!(
+                "       retry drafted {} accepted {}; stream byte-identical to the control",
+                line.drafted, line.accepted
+            );
             Ok(())
         },
     )?;
@@ -2558,17 +2721,61 @@ const REUSE_MAX_TOKENS: u32 = 24;
 
 /// M7 step 20: prefix/KV reuse (docs/perf.md §4 DoD) — warm requests
 /// decode exactly the divergent suffix (1 token for an identical
-/// re-request) and stay byte-identical to cold-cache controls.
+/// re-request) and stay byte-identical to cold-cache controls. Asserted
+/// against BOTH a solo and a forced-2-node distributed target (kv_reuse is
+/// active on distributed models too, and warm chat turns are a common
+/// production path there), then cross-checked: the distributed outputs
+/// must equal the solo ones (§9 extended to warm suffix-only prefills).
 fn perf_reuse_step(env: &ChaosEnv) -> Result<()> {
+    let (a_solo, b_solo) = perf_reuse_leg(env, false)?;
+    let (a_dist, b_dist) = perf_reuse_leg(env, true)?;
+    step(
+        "m7 reuse: distributed outputs byte-identical to solo (§9 across the reuse path)",
+        || {
+            if a_dist != a_solo {
+                bail!(
+                    "distributed and solo outputs for prompt A differ:\n  distributed: \
+                     {a_dist:?}\n  solo:        {a_solo:?}"
+                );
+            }
+            if b_dist != b_solo {
+                bail!(
+                    "distributed and solo outputs for prompt B differ:\n  distributed: \
+                     {b_dist:?}\n  solo:        {b_solo:?}"
+                );
+            }
+            Ok(())
+        },
+    )
+}
+
+/// One §4 reuse proof against a solo (`dist == false`) or forced-2-node
+/// distributed (`dist == true`) target. Returns the (cold == warm,
+/// asserted) outputs for prompts A and B so the caller can cross-check the
+/// two targets.
+fn perf_reuse_leg(env: &ChaosEnv, dist: bool) -> Result<(String, String)> {
+    let target = if dist { "distributed" } else { "solo" };
+    let load_body = if dist {
+        json!({ "model": env.model_arg, "nodes": 2 })
+    } else {
+        json!({ "model": env.model_arg })
+    };
+    let assert_target = |plan: &Value| -> Result<()> {
+        if dist {
+            assert_pipeline(plan)
+        } else {
+            assert_solo(plan)
+        }
+    };
     let prompt_b = format!("{REUSE_PROMPT_A}{REUSE_SUFFIX}");
     let (b_cold_text, b_cold) = step(
-        "m7 reuse: cold-cache control for the suffixed prompt",
+        &format!("m7 reuse ({target}): cold-cache control for the suffixed prompt"),
         || {
             // Every load is a fresh phase: the engine host rebuilds the
             // session at the barrier, dropping retained slots (§4 resets),
             // so this B run is cold by construction.
-            let plan = load_model(env.a, &json!({ "model": env.model_arg }))?;
-            assert_solo(&plan)?;
+            let plan = load_model(env.a, &load_body)?;
+            assert_target(&plan)?;
             let name = model_name(env.a)?;
             let (text, line) = generate_raw(env.a, &name, &prompt_b, REUSE_MAX_TOKENS)?;
             if text.is_empty() {
@@ -2578,10 +2785,13 @@ fn perf_reuse_step(env: &ChaosEnv) -> Result<()> {
         },
     )?;
     step(
-        "m7 reuse: warm prefill == suffix length; identical re-request == 1; bytes match cold",
+        &format!(
+            "m7 reuse ({target}): warm prefill == suffix length; identical re-request == 1; \
+             bytes match cold"
+        ),
         || {
-            let plan = load_model(env.a, &json!({ "model": env.model_arg }))?;
-            assert_solo(&plan)?;
+            let plan = load_model(env.a, &load_body)?;
+            assert_target(&plan)?;
             let name = model_name(env.a)?;
             let (a_text, a_cold) = generate_raw(env.a, &name, REUSE_PROMPT_A, REUSE_MAX_TOKENS)?;
             if a_cold.prefill_tok < 64 {
@@ -2631,9 +2841,10 @@ fn perf_reuse_step(env: &ChaosEnv) -> Result<()> {
                  {}tok warm (the suffix)",
                 a_cold.prefill_tok, b_cold.prefill_tok, b_warm.prefill_tok
             );
-            Ok(())
+            Ok(a_text)
         },
     )
+    .map(|a_text| (a_text, b_cold_text))
 }
 
 const MB_PROMPT_Y: &str = "The three friends walked into the forest";
@@ -2687,9 +2898,9 @@ fn drain_stream(rx: &std::sync::mpsc::Receiver<String>, watch: &mut StreamWatch)
 /// concurrent streams complete byte-identical to their alone-runs, a third
 /// queues and completes, and a fourth is refused with the typed 429.
 fn perf_microbatch_step(env: &ChaosEnv) -> Result<()> {
-    let (mesh_a, _mesh_b, _mesh_c) = env.mesh;
+    let (mesh_a, mesh_b, _mesh_c) = env.mesh;
     step(
-        "m7 micro-batch: restart A — [perf] max_concurrent 2 / queue_depth 1, decode delay",
+        "m7 micro-batch: restart A+B — [perf] max_concurrent 2 / queue_depth 1, decode delay",
         || {
             restart_with(
                 env.a,
@@ -2704,6 +2915,17 @@ fn perf_microbatch_step(env: &ChaosEnv) -> Result<()> {
                     decode_delay_ms: Some(MB_DECODE_DELAY_MS),
                     ..SimKnobs::default()
                 },
+            )?;
+            // B restarts too (default knobs — the worker side): a restarted
+            // head resets its epoch counter, and the distributed leg below
+            // would otherwise propose an epoch B's fencing rejects as stale.
+            restart_with(env.b, mesh_b, false, SimKnobs::default())?;
+            wait_connected(
+                env.a,
+                env.b,
+                env.peer_a,
+                env.peer_b,
+                "after the m7 micro-batch restart",
             )?;
             let plan = load_model(env.a, &json!({ "model": env.model_arg }))?;
             assert_solo(&plan)
@@ -2784,6 +3006,81 @@ fn perf_microbatch_step(env: &ChaosEnv) -> Result<()> {
             println!(
                 "       X, Y, and the queued X all byte-identical to their alone-runs; the \
                  overflow request was refused 429 with the config remedy"
+            );
+            Ok(())
+        },
+    )?;
+    // Distributed leg (§6 × §9): the default config admits concurrent
+    // generations on DISTRIBUTED models too (unified-KV multi-sequence
+    // session over the pipelined RPC path), so the byte-equality proof
+    // must cover that shape as well — mirroring how the speculative step
+    // runs both targets.
+    step(
+        "m7 micro-batch (distributed): forced 2-node reload under the same [perf] knobs",
+        || {
+            wait_connected(
+                env.a,
+                env.b,
+                env.peer_a,
+                env.peer_b,
+                "before the distributed micro-batch leg",
+            )?;
+            let plan = load_model(env.a, &json!({ "model": env.model_arg, "nodes": 2 }))?;
+            assert_pipeline(&plan)
+        },
+    )?;
+    let (x_alone_dist, y_alone_dist) = step(
+        "m7 micro-batch (distributed): alone-run controls for both prompts",
+        || {
+            let (x, _, _) = chat_full(env.a, &model, PROMPT, MB_MAX_TOKENS)?;
+            let (y, _, _) = chat_full(env.a, &model, MB_PROMPT_Y, MB_MAX_TOKENS)?;
+            if x.is_empty() || y.is_empty() {
+                bail!("a distributed alone-run returned empty text (X {x:?}, Y {y:?})");
+            }
+            Ok((x, y))
+        },
+    )?;
+    step(
+        "m7 micro-batch (distributed): 2 concurrent streams byte-identical to alone-runs AND solo",
+        || {
+            // Both admitted and decoding at once — the multi-sequence batch
+            // shape over the RPC path.
+            let rx1 = open_chat_stream(env.a, &model, PROMPT, MB_MAX_TOKENS)?;
+            let mut w1 = StreamWatch::new(usize::MAX);
+            pump_until_piece(&rx1, &mut w1)?;
+            let rx2 = open_chat_stream(env.a, &model, MB_PROMPT_Y, MB_MAX_TOKENS)?;
+            let mut w2 = StreamWatch::new(usize::MAX);
+            pump_until_piece(&rx2, &mut w2)?;
+            drain_stream(&rx1, &mut w1)?;
+            drain_stream(&rx2, &mut w2)?;
+            for (label, watch, alone, solo) in [
+                ("X", &w1, &x_alone_dist, &x_alone),
+                ("Y", &w2, &y_alone_dist, &y_alone),
+            ] {
+                if !watch.errors.is_empty() {
+                    bail!("stream {label} carried error events: {:?}", watch.errors);
+                }
+                if !watch.done {
+                    bail!("stream {label} never reached [DONE]");
+                }
+                let got = watch.text();
+                if &got != alone {
+                    bail!(
+                        "distributed stream {label} differs from its distributed alone-run \
+                         (§6 byte-identity):\n  concurrent: {got:?}\n  alone:      {alone:?}"
+                    );
+                }
+                if &got != solo {
+                    bail!(
+                        "distributed stream {label} differs from the solo alone-run (§9 on \
+                         the multi-sequence batch shape):\n  distributed: {got:?}\n  solo:  \
+                              {solo:?}"
+                    );
+                }
+            }
+            println!(
+                "       distributed X and Y byte-identical to their distributed alone-runs \
+                 and to the solo alone-runs"
             );
             Ok(())
         },

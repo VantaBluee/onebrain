@@ -1,6 +1,6 @@
 # 0004 — RPC-over-mesh transport and M3 weight flow
 
-Date: 2026-08-26 · Status: accepted
+Date: 2026-08-26 · Status: accepted, amended 2026-08-27
 
 ## Context
 
@@ -31,7 +31,9 @@ the bridge workaround and strictly safer. Upstreaming note in
 The head-side client keeps the unpatched path: it *connects out* to a
 loopback socket our own process created and accepted exactly once —
 client-side exposure is one intra-process accept race on the trusting
-party's machine (documented residual, threat model).
+party's machine (documented residual, threat model). (Superseded — the
+accept-once half of this paragraph did not survive contact with the RPC
+client; see the Amendment below.)
 
 ## Decision 2: M3 ships head-push weight flow; shard-only fetch moves to M6
 
@@ -60,3 +62,22 @@ M6 wires the reaper and pre-seeding.
 - A torn mesh stream during distributed inference is fatal to the plan
   (structured error + teardown in M3; transparent retry arrives in M5).
 - Worker disk stays empty in M3 (no shard caches to GC until M6).
+
+## Amendment (2026-08-27): head bridge accept-once → accept-loop
+
+Accept-once failed empirically (52636ec): the vendored RPC client dials
+the registered endpoint string repeatedly, not once — a registration
+probe that closes instantly, per-device property/memory queries during
+load, then the long-lived buffer/compute connection; ~6 sequential
+connections were observed per load. The head bridge therefore **keeps
+accepting for the epoch's lifetime**, opening one fresh mesh `rpc`
+stream per accepted connection (`head_bridge` in
+`crates/onebraind/src/cluster.rs`).
+
+Residual-exposure change: from "one intra-process accept race" to a
+loopback-only listener that lives exactly as long as its epoch —
+teardown aborts all in-flight pumps, and the sim's socket-scan test
+permits the listener only while a distributed session is active. The
+same-machine-processes-as-you trust posture is unchanged (threat model,
+SECURITY.md residual risks). docs/distributed.md "Transport shape"
+carries the operative wording.

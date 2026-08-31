@@ -277,6 +277,12 @@ pub struct InterruptedGen {
     /// Stop-string scan state, carried so a stop match straddling the
     /// failure point is still caught.
     pub scan: StopScan,
+    /// A finish the interrupted attempt had ALREADY decided (EOG or stop
+    /// sampled; only held-piece delivery was pending). The resume must
+    /// deliver the backlog and apply exactly this finish — never re-prefill
+    /// or re-sample past a decided stop point (a temperature>0 resume could
+    /// otherwise emit extra tokens the first attempt had ruled out).
+    pub finish: Option<FinishKind>,
     /// The engine error that interrupted the attempt (user-facing string).
     pub error: String,
 }
@@ -292,6 +298,7 @@ impl InterruptedGen {
                 generated_tokens: self.generated_tokens,
                 pieces_sent: self.pieces_sent,
                 scan: self.scan,
+                finish: self.finish,
             },
         )
     }
@@ -305,6 +312,10 @@ pub struct ResumeState {
     pub generated_tokens: Vec<Token>,
     pub pieces_sent: usize,
     pub scan: StopScan,
+    /// A finish the interrupted attempt already decided (see
+    /// [`InterruptedGen::finish`]); the resume delivers it instead of
+    /// generating anything new.
+    pub finish: Option<FinishKind>,
 }
 
 /// Messages into the engine-host thread.
@@ -1231,6 +1242,13 @@ const REUSE_FLOOR: usize = 64;
 /// capacity.
 const SPEC_K: usize = 8;
 
+/// Barrier-scoped stall grace: once a model-replacing message is pending,
+/// an active sequence whose client has stayed connected but stopped
+/// reading (delivery stalled on a full channel) for this long is reaped
+/// like a disconnect, so a swap/unload barrier can never be held
+/// indefinitely by one stalled client.
+const SWAP_STALL_GRACE: Duration = Duration::from_secs(10);
+
 /// A validated generation waiting for a sequence slot + KV headroom.
 struct PreparedGen {
     job: GenerateJob,
@@ -1256,6 +1274,12 @@ struct PreparedGen {
     /// text (docs/resilience.md step 4: the retry keeps streaming into the
     /// SAME response; only already-SENT pieces are never re-sent).
     unsent: Vec<String>,
+    /// Resume only: a finish the interrupted attempt already decided (see
+    /// [`InterruptedGen::finish`]). Queued only with a non-empty `unsent`
+    /// backlog (otherwise prepare applies it immediately); admission
+    /// defers it behind the backlog so the sweep delivers every piece
+    /// before the original terminal — never re-prefilling or re-sampling.
+    finish: Option<FinishKind>,
     /// When the host received the job — the TTFT origin.
     arrived: Instant,
 }
@@ -1343,7 +1367,9 @@ struct ActiveGen {
     /// overtakes a confirmed piece. The wait is bounded by client
     /// liveness — a client that disconnects is reaped by the disconnect
     /// sweep with the backlog undelivered (Aborted semantics: nobody is
-    /// listening).
+    /// listening) — and, once a model-replacing message is pending, by
+    /// [`SWAP_STALL_GRACE`]: a stalled-but-connected client is reaped the
+    /// same way so it cannot hold the swap barrier forever.
     terminal_after_drain: Option<DeferredTerminal>,
     remaining: usize,
     budget: usize,
@@ -1364,6 +1390,17 @@ struct ActiveGen {
     prefill_finished: Option<Instant>,
     /// TTFT, stamped when the first piece is DELIVERED to the channel.
     ttft_ms: Option<u64>,
+    /// This sequence's KV lived through a failed solo decode (the loop
+    /// declared all KV suspect and cleared `retained`): a draining zombie
+    /// carrying this mark must never re-enter `retained` when its deferred
+    /// finish applies — a later prefix-reuse hit would trust suspect KV.
+    kv_suspect: bool,
+    /// When delivery to this client's channel last returned Full with
+    /// nothing delivered since — `None` while deliveries flow. Bounds the
+    /// model-swap barrier: once a model-replacing message is pending, a
+    /// stalled-but-connected client is reaped after
+    /// [`SWAP_STALL_GRACE`] instead of holding the barrier forever.
+    stalled_since: Option<Instant>,
     /// Finished/cancelled this iteration; reaped by the retain sweep.
     done: bool,
 }
@@ -1506,12 +1543,16 @@ fn serve_model(
                 match g.job.tx.try_send(TokenEvent::Token(piece)) {
                     Ok(()) => {
                         g.pieces_sent += 1;
+                        g.stalled_since = None;
                         if g.ttft_ms.is_none() {
                             g.ttft_ms = Some(duration_ms(g.arrived.elapsed()));
                         }
                     }
                     Err(TrySendError::Full(TokenEvent::Token(piece))) => {
                         g.held.push_front(piece);
+                        // Stall clock (SWAP_STALL_GRACE): starts at the
+                        // first undelivered retry, cleared by any delivery.
+                        g.stalled_since.get_or_insert_with(Instant::now);
                         break;
                     }
                     Err(_) => break, // closed: the disconnect sweep reaps it
@@ -1523,7 +1564,10 @@ fn serve_model(
                         // §4 retention requires the slot's KV to mirror
                         // prefix + attempt exactly; a spent-budget resume
                         // finishes here without ever prefilling, so its
-                        // empty KV must be released, never retained.
+                        // empty KV must be released, never retained. A
+                        // `kv_suspect` zombie (its KV lived through a
+                        // failed solo decode) is likewise released — the
+                        // failure's invalidation posture must hold.
                         let kv_complete = g.prefill_done >= g.prefix.len();
                         finish_seq(
                             session,
@@ -1531,7 +1575,8 @@ fn serve_model(
                             &mut outbox,
                             g,
                             finish,
-                            (perf.kv_reuse && kv_complete).then_some(&mut retained),
+                            (perf.kv_reuse && kv_complete && !g.kv_suspect)
+                                .then_some(&mut retained),
                         );
                     }
                     Some(DeferredTerminal::Error(message)) => {
@@ -1610,6 +1655,36 @@ fn serve_model(
             }
             true
         });
+
+        // 4b. Barrier-scoped stall grace (SWAP_STALL_GRACE): once a
+        // model-replacing message is pending, a client that stays
+        // connected but has stopped reading must not hold the barrier
+        // forever — its sequence (and any queued job blocked on that
+        // sequence's budget) would park the swap until the TCP connection
+        // happens to die. Reap it like a disconnect: Aborted semantics
+        // (undelivered backlog and terminal dropped, outcome reported
+        // Finished), budget freed so the barrier drains.
+        if ctrl.is_some() {
+            let mut reaped = false;
+            for g in active.iter_mut() {
+                if !g.done
+                    && g.stalled_since
+                        .is_some_and(|t| t.elapsed() >= SWAP_STALL_GRACE)
+                {
+                    tracing::warn!(
+                        seq = g.seq,
+                        "client stalled through a pending model swap; freeing the sequence"
+                    );
+                    let tx = g.job.tx.clone();
+                    cancel_seq(session, &mut free, g);
+                    outbox.retain(|p| !p.tx.same_channel(&tx));
+                    reaped = true;
+                }
+            }
+            if reaped {
+                active.retain(|g| !g.done);
+            }
+        }
 
         // 5. Admission (docs/perf.md §6): FCFS, one sequence slot and
         // enough unified-KV headroom (prompt + max_tokens) required. The
@@ -1963,6 +2038,16 @@ fn serve_model(
                 for mut g in active.drain(..) {
                     let mut generated_tokens = std::mem::take(&mut g.prior_generated);
                     generated_tokens.extend(g.attempt_tokens.iter().copied());
+                    // A finish-deferred zombie's generation was already
+                    // COMPLETE (EOG/stop decided; only delivery pending):
+                    // carry the decided finish so the resume delivers the
+                    // backlog and applies it instead of re-sampling past
+                    // the decided stop point. A deferred Error is dropped —
+                    // the interrupt's own error supersedes it.
+                    let finish = match g.terminal_after_drain.take() {
+                        Some(DeferredTerminal::Finish(k)) => Some(k),
+                        _ => None,
+                    };
                     if let Some(outcome) = g.outcome.take() {
                         let _ = outcome.send(GenOutcome::Interrupted(Box::new(InterruptedGen {
                             job: g.job,
@@ -1970,6 +2055,7 @@ fn serve_model(
                             generated_tokens,
                             pieces_sent: g.pieces_sent,
                             scan: g.scan,
+                            finish,
                             error: e.to_string(),
                         })));
                     }
@@ -1983,6 +2069,11 @@ fn serve_model(
                 // reaped by the held sweep or the disconnect sweep.
                 tracing::warn!(error = %e, "solo decode failed; erroring the active sequences");
                 for g in active.iter_mut() {
+                    // Every sequence's KV lived through the failed decode:
+                    // mark it suspect so a finish-deferred zombie that
+                    // survives fail_seq (draining a held backlog) can never
+                    // re-enter `retained` when its deferred finish applies.
+                    g.kv_suspect = true;
                     fail_seq(session, &mut free, &mut outbox, g, e.to_string());
                 }
                 active.retain(|g| !g.done);
@@ -2060,6 +2151,7 @@ fn serve_model(
                     match g.job.tx.try_send(TokenEvent::Token(piece)) {
                         Ok(()) => {
                             g.pieces_sent += 1;
+                            g.stalled_since = None;
                             emitted = true;
                             if g.ttft_ms.is_none() {
                                 g.ttft_ms = Some(duration_ms(g.arrived.elapsed()));
@@ -2070,6 +2162,7 @@ fn serve_model(
                             // and pause this sequence; the others keep
                             // stepping.
                             g.held.push_back(piece);
+                            g.stalled_since.get_or_insert_with(Instant::now);
                         }
                         Err(_) => {
                             cancel_seq(session, &mut free, g);
@@ -2446,7 +2539,8 @@ fn prepare_generation(
 
     let max_tokens = job.params.max_tokens as usize;
     let resumed = resume.is_some();
-    let (prompt_tokens, prior_generated, prior_pieces, scan, unsent) = match resume {
+    let (prompt_tokens, prior_generated, prior_pieces, scan, unsent, carried_finish) = match resume
+    {
         Some(state) => {
             // Confirm-before-send across attempts: every carried token is
             // CONFIRMED, but the interrupted attempt may have died with
@@ -2477,6 +2571,7 @@ fn prepare_generation(
                 state.pieces_sent,
                 state.scan,
                 unsent,
+                state.finish,
             )
         }
         None => {
@@ -2494,6 +2589,20 @@ fn prepare_generation(
                     return None;
                 }
             };
+            // A 0-token prompt (e.g. `""` against a tokenizer that adds no
+            // BOS) must be rejected HERE — the single choke point covering
+            // both dialects — or it is admitted into a sequence slot the
+            // step loop can neither advance nor terminate, permanently
+            // wedging one of the max_concurrent slots. A resume necessarily
+            // carried tokens, so only the fresh path can hit this.
+            if prompt_tokens.is_empty() {
+                let message = ApiError::BadRequest(
+                    "`prompt` produced no tokens; provide non-empty input".into(),
+                )
+                .to_string();
+                finish_error(&job, outcome, message);
+                return None;
+            }
             if prompt_tokens.len() + max_tokens > info.n_ctx as usize {
                 let message = ApiError::BadRequest(format!(
                     "the prompt is {} tokens and max_tokens is {}, which together exceed \
@@ -2513,6 +2622,7 @@ fn prepare_generation(
                 0,
                 StopScan::new(job.params.stop.clone()),
                 Vec::new(),
+                None,
             )
         }
     };
@@ -2520,7 +2630,25 @@ fn prepare_generation(
     // max_tokens against n_ctx, and prefix + remaining equals exactly that
     // sum, so no re-check is needed on resume.
     let remaining = max_tokens.saturating_sub(prior_generated.len());
-    if remaining == 0 && unsent.is_empty() {
+    if let Some(kind) = carried_finish {
+        if unsent.is_empty() {
+            // The interrupted attempt had already decided this finish and
+            // every piece was delivered: apply it without touching the
+            // engine — re-prefilling and re-sampling past a decided stop
+            // point could emit extra tokens (client-visible divergence).
+            // With undelivered pieces the job is queued instead: admission
+            // seeds them into `held` with the carried finish deferred, so
+            // the sweep delivers the backlog before the terminal event.
+            let _ = job.tx.try_send(TokenEvent::Done(DoneStats {
+                prompt_tokens: prompt_tokens.len() as u32,
+                completion_tokens: prior_generated.len() as u32,
+                finish: kind,
+                ..DoneStats::default()
+            }));
+            let _ = outcome.send(GenOutcome::Finished);
+            return None;
+        }
+    } else if remaining == 0 && unsent.is_empty() {
         // Interrupted on the very last token's decode with every piece
         // already delivered: finish as Length without touching the engine.
         // With undelivered pieces (`unsent`), the job is queued instead:
@@ -2547,6 +2675,7 @@ fn prepare_generation(
         budget,
         resumed,
         unsent,
+        finish: carried_finish,
         arrived: Instant::now(),
     })
 }
@@ -2592,11 +2721,15 @@ fn admit(
         // order, before any new piece); non-empty `held` also pauses the
         // sequence's stepping until the backlog drains.
         held: VecDeque::from(p.unsent),
-        // A resume whose budget is already spent has nothing to decode:
-        // deliver the backlog, then finish as Length (the sweep applies
-        // this once `held` drains; the batch builder never steps it).
-        terminal_after_drain: (p.remaining == 0)
-            .then_some(DeferredTerminal::Finish(FinishKind::Length)),
+        // A resume that carried an already-decided finish, or whose budget
+        // is already spent, has nothing to decode: deliver the backlog,
+        // then apply the carried finish (or Length for the spent budget) —
+        // the sweep applies it once `held` drains; the batch builder never
+        // steps a sequence with a deferred terminal.
+        terminal_after_drain: p
+            .finish
+            .map(DeferredTerminal::Finish)
+            .or_else(|| (p.remaining == 0).then_some(DeferredTerminal::Finish(FinishKind::Length))),
         remaining: p.remaining,
         budget: p.budget,
         pieces_sent: p.prior_pieces,
@@ -2608,6 +2741,8 @@ fn admit(
         admitted: Instant::now(),
         prefill_finished: None,
         ttft_ms: None,
+        kv_suspect: false,
+        stalled_since: None,
         done: false,
     }
 }
@@ -2959,12 +3094,16 @@ fn deliver_piece(g: &mut ActiveGen, piece: String, emitted: &mut bool) {
     match g.job.tx.try_send(TokenEvent::Token(piece)) {
         Ok(()) => {
             g.pieces_sent += 1;
+            g.stalled_since = None;
             *emitted = true;
             if g.ttft_ms.is_none() {
                 g.ttft_ms = Some(duration_ms(g.arrived.elapsed()));
             }
         }
-        Err(TrySendError::Full(TokenEvent::Token(piece))) => g.held.push_back(piece),
+        Err(TrySendError::Full(TokenEvent::Token(piece))) => {
+            g.held.push_back(piece);
+            g.stalled_since.get_or_insert_with(Instant::now);
+        }
         Err(_) => {}
     }
 }
@@ -3063,12 +3202,13 @@ fn finish_seq(
 /// like a finish would — the sequence stays active as a draining zombie
 /// (never stepped again; the batch builder skips any set
 /// `terminal_after_drain`) and the held-retry sweep applies the terminal
-/// once the backlog empties. The wait's boundary is client liveness: a
+/// once the backlog empties. The wait's boundary is client liveness — a
 /// client that DISCONNECTS is reaped by the disconnect sweep with the
-/// backlog undelivered — Aborted semantics, nobody is listening — and a
-/// terminal already decided (a finish waiting behind the same backlog)
-/// wins over a later error: that generation was complete before the
-/// failure.
+/// backlog undelivered (Aborted semantics, nobody is listening) — plus,
+/// once a model swap is pending, [`SWAP_STALL_GRACE`] for a
+/// stalled-but-connected client. A terminal already decided (a finish
+/// waiting behind the same backlog) wins over a later error: that
+/// generation was complete before the failure.
 fn fail_seq(
     session: &mut Session<'_>,
     free: &mut Vec<SeqId>,
@@ -3795,6 +3935,160 @@ mod tests {
         handle.join().unwrap();
     }
 
+    /// A stalled-but-CONNECTED client must not hold a model-swap barrier
+    /// forever: once a model-replacing message is pending, its sequence is
+    /// reaped after [`SWAP_STALL_GRACE`] (Aborted semantics), so `onebrain
+    /// run <other-model>`, epoch teardown, and daemon swaps always drain.
+    #[test]
+    fn stalled_client_cannot_hold_the_swap_barrier() {
+        let Some((host, handle, smoke)) = spawn_with_smoke_model(None, HostPerf::default()) else {
+            return;
+        };
+        // Capacity-1 channel that is NEVER read: the first piece fills it,
+        // every later delivery parks on `held`, and the stall clock starts.
+        let (tx, rx) = mpsc::channel(1);
+        let (otx, orx) = oneshot::channel();
+        host.send(HostMsg::Generate(SupervisedGenerate {
+            job: greedy_job(smoke.clone(), 64, tx),
+            resume: None,
+            outcome: otx,
+        }))
+        .unwrap();
+        // Let the generation reach the stalled state (first piece delivered,
+        // the next parked on the full channel).
+        std::thread::sleep(Duration::from_millis(500));
+        let (utx, mut urx) = oneshot::channel();
+        host.send(HostMsg::Unload { resp: utx }).unwrap();
+        // The unload's reply must arrive within the grace (plus slack) —
+        // without the stall reap this blocks until the client's connection
+        // dies, i.e. forever in this test.
+        let deadline = Instant::now() + SWAP_STALL_GRACE + Duration::from_secs(20);
+        loop {
+            match urx.try_recv() {
+                Ok(()) => break,
+                Err(oneshot::error::TryRecvError::Empty) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "the swap barrier must drain within the stall grace"
+                    );
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                Err(e) => panic!("unload reply dropped: {e}"),
+            }
+        }
+        assert!(matches!(
+            orx.blocking_recv().expect("reaped job reports an outcome"),
+            GenOutcome::Finished
+        ));
+        drop(rx);
+        host.send(HostMsg::Shutdown).unwrap();
+        handle.join().unwrap();
+    }
+
+    /// A resume carrying an already-decided finish (the interrupted attempt
+    /// had sampled EOG/stop; only delivery was pending) must deliver the
+    /// parked backlog and apply EXACTLY that finish — never re-prefill or
+    /// generate past the decided stop point, even with budget left.
+    #[test]
+    fn resume_with_decided_finish_delivers_backlog_then_original_stop() {
+        let Some((host, handle, smoke)) = spawn_with_smoke_model(None, HostPerf::default()) else {
+            return;
+        };
+        let (tx, mut rx) = mpsc::channel(8);
+        let (otx, orx) = oneshot::channel();
+        host.send(HostMsg::Generate(SupervisedGenerate {
+            // Budget for 8 tokens is LEFT — the carried finish must still
+            // end the generation at the decided point.
+            job: greedy_job(smoke, 8, tx),
+            resume: Some(ResumeState {
+                prompt_tokens: vec![1, 2, 3],
+                generated_tokens: vec![4, 5],
+                pieces_sent: 1,
+                scan: StopScan::new(vec![]),
+                finish: Some(FinishKind::Stop),
+            }),
+            outcome: otx,
+        }))
+        .unwrap();
+        let mut pieces = 0u32;
+        let done = loop {
+            match rx.blocking_recv().expect("stream must terminate") {
+                TokenEvent::Token(_) => pieces += 1,
+                TokenEvent::Done(stats) => break stats,
+                TokenEvent::Error(e) => panic!("unexpected error: {e}"),
+            }
+        };
+        assert_eq!(
+            pieces, 1,
+            "exactly the parked piece is delivered; nothing new is generated"
+        );
+        assert_eq!(done.prompt_tokens, 3, "original prompt length");
+        assert_eq!(done.completion_tokens, 2, "cumulative completion");
+        assert_eq!(
+            done.finish,
+            FinishKind::Stop,
+            "the DECIDED finish, not Length"
+        );
+        assert!(matches!(
+            orx.blocking_recv().expect("outcome must arrive"),
+            GenOutcome::Finished
+        ));
+        host.send(HostMsg::Shutdown).unwrap();
+        handle.join().unwrap();
+    }
+
+    /// docs/perf.md §5 × M5 ("the retry re-prefills and CONTINUES
+    /// speculating"): a resumed attempt with a draft loaded must complete
+    /// gap-free, count the carried prefix in the cumulative stats, and
+    /// still engage the speculative path on the new attempt.
+    #[test]
+    fn resume_with_draft_still_speculates_and_counts_the_prefix() {
+        let Some((host, handle, smoke)) = spawn_smoke(None, HostPerf::default(), true) else {
+            return;
+        };
+        let (tx, mut rx) = mpsc::channel(64);
+        let (otx, orx) = oneshot::channel();
+        host.send(HostMsg::Generate(SupervisedGenerate {
+            job: greedy_job(smoke, 24, tx),
+            resume: Some(ResumeState {
+                prompt_tokens: vec![1, 2, 3],
+                generated_tokens: vec![4, 5],
+                pieces_sent: 0,
+                scan: StopScan::new(vec![]),
+                finish: None,
+            }),
+            outcome: otx,
+        }))
+        .unwrap();
+        let mut pieces = 0u32;
+        let done = loop {
+            match rx.blocking_recv().expect("stream must terminate") {
+                TokenEvent::Token(_) => pieces += 1,
+                TokenEvent::Done(stats) => break stats,
+                TokenEvent::Error(e) => panic!("unexpected error: {e}"),
+            }
+        };
+        assert_eq!(done.prompt_tokens, 3, "original prompt length");
+        assert!(done.completion_tokens >= 2, "the carried prefix counts");
+        assert_eq!(pieces, done.completion_tokens, "gap-free stream");
+        assert!(
+            done.drafted > 0,
+            "the resumed attempt must keep speculating (drafted = {})",
+            done.drafted
+        );
+        assert!(
+            done.accepted > 0,
+            "draft==target greedy acceptance must be non-zero (accepted = {})",
+            done.accepted
+        );
+        assert!(matches!(
+            orx.blocking_recv().expect("outcome must arrive"),
+            GenOutcome::Finished
+        ));
+        host.send(HostMsg::Shutdown).unwrap();
+        handle.join().unwrap();
+    }
+
     /// docs/perf.md §6 status honesty: the loaded-model summary answers
     /// from cached state — instantly — while a generation is running.
     #[test]
@@ -3861,6 +4155,7 @@ mod tests {
                 generated_tokens: vec![4, 5],
                 pieces_sent: 2,
                 scan: StopScan::new(vec![]),
+                finish: None,
             }),
             outcome: otx,
         }))
@@ -3961,6 +4256,7 @@ mod tests {
                 generated_tokens: vec![],
                 pieces_sent: 0,
                 scan: StopScan::new(vec![]),
+                finish: None,
             }),
             outcome: otx_b,
         }))
@@ -4204,6 +4500,7 @@ mod tests {
                 generated_tokens: vec![4, 5],
                 pieces_sent: 0,
                 scan: StopScan::new(vec![]),
+                finish: None,
             }),
             outcome: otx,
         }))
@@ -4251,6 +4548,7 @@ mod tests {
                 generated_tokens: vec![4, 5],
                 pieces_sent: 1,
                 scan: StopScan::new(vec![]),
+                finish: None,
             }),
             outcome: otx,
         }))

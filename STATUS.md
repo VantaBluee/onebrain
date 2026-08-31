@@ -301,22 +301,30 @@ fmt, clippy, tests, CPU smoke inference with a tiny GGUF on all three OSes;
       e2e, pair-sim, sim 60 steps; sweeps (no new listeners, no prompt
       leak, auth boundaries, YAML/shell validation, README command
       spot-check)
-- [ ] M7 overlap DoD gap being closed first (see below), then: push,
+- [ ] M7 overlap DoD gap closed locally (see below), then: push,
       CI green incl. netem, tag v0.1.0-rc.1 (proves signed-release
       CI), then v0.1.0
 - [ ] Manual (user): fresh-machine README walkthrough per OS;
       Homebrew tap repo creation (RELEASING.md)
 
-## Known open item — M7 overlap DoD on CPU-only runners
+## M7 overlap DoD — root-caused and fixed locally; CI arbitration pending
 
-CI measured the truth: with clean baselines the netem overlap ratio is
-~0.86x (14% saving), not the contracted <=0.75x; the earlier pass rode
-a noise-inflated sequential baseline. Decode overlap works (2.4x). A
-deep-dive into the prefill pipeline (sched-thread serialization around
-the 2 MiB boundary GET with a synchronous-CPU final stage) is in
-flight: either a capture fix within patch 0003's no-wire-change
-envelope, or an evidence-backed structural-ceiling writeup + honest
-DoD amendment.
+The deep-dive concluded. Three landings closed the gap, all within
+patch 0003's no-wire-change envelope: (1) four stacked serializers in
+the prefill pipeline fixed (05f248b); (2) bounded client-side flow
+control, final policy depth-4 — adaptive 4.5x the burst's largest
+command + 1 MiB, floor 4 MiB (935041b first at depth-2, which left
+~15% of the win on the table; fe63f37 set the final policy); (3) the
+netem collapse root-caused NOT to qdisc drops but to kernel UDP
+receive-buffer overflow — stock net.core.rmem_max silently caps
+iroh's ~7 MB QUIC buffers, surfacing as invisible RcvbufErrors —
+fixed with a justified harness sysctl (rmem/wmem_max 8 MB, standard
+QUIC operational guidance; the contract's shaping is untouched).
+Proof by removal: RcvbufErrors exactly 0 across 10+ runs, collapse
+mode gone; the WSL netem gauntlet passed 5/5 on the final code
+(ratios 0.61-0.71 vs the 0.75 bar; healthy runs cluster 0.60-0.67,
+decode 1.7-1.9x sequential). The <=0.75x DoD checkbox above stays
+open until the CI netem leg confirms it on the fixed transport.
 
 ## Upcoming
 - v0.1.0-rc.1 → v0.1.0 release. All eight milestones implemented.

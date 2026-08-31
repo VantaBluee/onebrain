@@ -14,9 +14,10 @@ listener exists anywhere**, verified by a socket-scan test.
 - **Worker side** (`rpc` stream accepted, epoch must equal the worker's
   active epoch, sender must be the epoch's head — else close code 4
   `bad-epoch`): create a connected local socket pair (Unix `socketpair`;
-  Windows: loopback listener on 127.0.0.1:0, self-connect, accept, close
-  listener — exposure is a single accept race within one process, noted in
-  the threat model). Hand one end to a dedicated OS thread running
+  Windows: loopback listener on 127.0.0.1:0, self-connect, accept once,
+  verify the accepted peer is the connecting socket — a foreign local
+  connection is rejected and setup fails closed — then close the
+  listener). Hand one end to a dedicated OS thread running
   `ob_rpc_serve_fd` (shim over patched `ggml_backend_rpc_serve_fd`, cache
   disabled in M3); pump bytes 1:1 between the other end and the mesh
   stream. Serve returns when the stream closes → session over, thread

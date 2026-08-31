@@ -8,7 +8,7 @@ The value is **capacity, not speed**: OneBrain lets you *run models that don't f
 
 ## Install
 
-Every release artifact is checksummed (`SHA256SUMS`) and signed (sigstore/cosign, keyless); the installers verify checksums before touching your system. Verification one-liners are in the [release notes](https://github.com/VantaBluee/onebrain/releases) and in [RELEASING.md](RELEASING.md).
+Every release artifact is checksummed (`SHA256SUMS`) and signed (sigstore/cosign, keyless). The install script, the Homebrew formula, and `onebrain self-update` verify checksums automatically before touching your system; for the `.msi`, `.deb`, and `.rpm` downloads, verify manually with the one-liners in the [release notes](https://github.com/VantaBluee/onebrain/releases) and in [RELEASING.md](RELEASING.md).
 
 **macOS and Linux** — one line, no root needed (installs to `~/.local/bin`):
 

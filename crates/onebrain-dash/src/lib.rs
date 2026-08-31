@@ -4,8 +4,9 @@
 //!
 //! This crate owns ONLY the static assets and the router that serves them:
 //! `GET /` returns the HTML shell, `GET /dash/*` returns the JS/CSS the
-//! shell references. There is deliberately no auth logic here: the shell is
-//! the one Bearer-exempt page (it contains no data), and every number on
+//! shell references. There is deliberately no auth logic here: the shell
+//! and its `/dash/*` assets are the only Bearer-exempt routes (they
+//! contain no data), and every number on
 //! screen comes from the page itself calling `GET /api/internal/metrics`
 //! with the token the user pastes once (kept in `localStorage`). The daemon
 //! mounts this router and keeps enforcing auth on the metrics route exactly

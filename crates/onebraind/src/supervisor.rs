@@ -64,6 +64,15 @@ use crate::server::{
 /// frees complete; the patched RPC client never blocks on a dead bridge.
 const UNLOAD_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How many failed-epoch outcomes the retry ledger retains (bounded memory
+/// over a long daemon life on a flaky cluster). Epochs are monotonic per
+/// daemon (`next_epoch`), and a follower only ever looks up the epoch its
+/// own in-flight attempt ran against — an attempt interrupted within the
+/// last few epoch surgeries (bounded by `[perf] max_concurrent_requests`,
+/// far below this window), so pruning older records can never break a
+/// lookup.
+const RETAIN_EPOCHS: u64 = 32;
+
 /// Work for the supervisor task.
 #[derive(Debug)]
 pub enum SupervisorMsg {
@@ -287,10 +296,18 @@ async fn run_supervised(state: &Arc<InternalState>, job: GenerateJob) {
             }
             Attempt::HostGone(None) => {}
             Attempt::Outcome(GenOutcome::Interrupted(interrupted)) => {
-                if let Some((job, resume)) =
+                if let Some((job, resume, counted)) =
                     handle_interrupted(state, *interrupted, retries_used, attempt_epoch).await
                 {
-                    retries_used += 1;
+                    // An UNCOUNTED re-issue is the stale-snapshot case: a
+                    // rejoin epoch swap landed between the epoch snapshot
+                    // and the attempt running, so this job never actually
+                    // failed on the epoch it was blamed for — its single
+                    // transparent retry stays available for a genuine
+                    // failure of the re-issue.
+                    if counted {
+                        retries_used += 1;
+                    }
                     next = Some((job, Some(resume)));
                 }
             }
@@ -299,8 +316,9 @@ async fn run_supervised(state: &Arc<InternalState>, job: GenerateJob) {
     state.host.job_finished();
 }
 
-/// The failure lifecycle for one interruption. Returns `Some((job,
-/// resume))` when the job should be re-issued (the caller loops), `None`
+/// The failure lifecycle for one interruption. Returns `Some((job, resume,
+/// counted))` when the job should be re-issued (the caller loops; `counted`
+/// says whether the re-issue consumes the single transparent retry), `None`
 /// when it reached a terminal event here.
 ///
 /// Serialized on the retry ledger: the first interrupted job of a failed
@@ -314,7 +332,7 @@ async fn handle_interrupted(
     interrupted: InterruptedGen,
     retries_used: u32,
     attempt_epoch: Option<u64>,
-) -> Option<(GenerateJob, ResumeState)> {
+) -> Option<(GenerateJob, ResumeState, bool)> {
     let engine_error = interrupted.error.clone();
     let (job, resume) = interrupted.into_retry();
 
@@ -348,7 +366,7 @@ async fn handle_interrupted(
                             "re-issuing a sequence interrupted with the epoch another \
                              job already recovered"
                         );
-                        Some((job, resume))
+                        Some((job, resume, true))
                     }
                 }
                 Some(EpochOutcome::Failed { message, .. }) => {
@@ -357,13 +375,22 @@ async fn handle_interrupted(
                 }
                 None => {
                     // The epoch changed hands without a recorded failure
-                    // (e.g. a rejoin swap raced the interruption). With a
-                    // model still loaded and budget left, re-issue against
-                    // it; otherwise surface the engine error.
+                    // (e.g. a rejoin swap raced the interruption — the
+                    // attempt may even have RUN against the new epoch, its
+                    // snapshot taken before the swap landed). With a model
+                    // still loaded and budget left, re-issue against it —
+                    // UNCOUNTED: this job never failed on an epoch anyone
+                    // resolved, so burning its single retry here would let
+                    // one genuine failure of the re-issue exhaust the
+                    // budget after zero recovered re-plans. Bounded: once
+                    // the re-issue is in flight the host is non-idle, so no
+                    // new rejoin swap can start, and any later epoch change
+                    // goes through a leader that records the ledger — this
+                    // branch fires at most once per job.
                     if decide_interrupted(retries_used) == InterruptedAction::RetryOnce
                         && state.cluster.loaded_source().is_some()
                     {
-                        Some((job, resume))
+                        Some((job, resume, false))
                     } else {
                         fail_job(
                             &job,
@@ -417,6 +444,10 @@ async fn handle_interrupted(
     let record = |ledger: &mut RetryLedger, outcome: EpochOutcome| {
         if let Some(epoch) = failed_epoch {
             ledger.outcomes.insert(epoch, outcome);
+            // Bounded retention (see RETAIN_EPOCHS): without it a
+            // long-running daemon on a flaky cluster leaks one record per
+            // failed epoch forever.
+            ledger.outcomes.retain(|e, _| e + RETAIN_EPOCHS > epoch);
         }
     };
 
@@ -542,7 +573,7 @@ async fn handle_interrupted(
         pieces_sent = resume.pieces_sent,
         "reloaded after mid-generation failure; retrying transparently with the carried prefix"
     );
-    Some((job, resume))
+    Some((job, resume, true))
 }
 
 /// Tear down the failed epoch's local half: unload the model (its frees
