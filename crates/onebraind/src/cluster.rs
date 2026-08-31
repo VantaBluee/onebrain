@@ -163,12 +163,23 @@ pub struct ActivePlanView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub explanation: Option<String>,
     /// The scheduler's predicted time-per-token for a distributed plan
-    /// (head side only): `max_stage(layers / decode_tps) × 1000 + Σ boundary
-    /// RTT ms`. A RELATIVE comparison metric — decode_tps comes from the
-    /// tiny-model microbench, so this is never a latency promise (honest-UX
-    /// rule §1.6) and is absent on solo plans and on workers.
+    /// (head side only):
+    /// `max_stage(active layer units / decode_tps) × 1000 + Σ boundary RTT ms`
+    /// — the v2 primary metric (docs/perf.md §7-§8; active layer units
+    /// scale MoE layers to their active-expert fraction and equal the
+    /// plain layer count on dense models, so the field keeps its pre-M7
+    /// meaning there). A RELATIVE comparison metric — decode_tps comes
+    /// from the tiny-model microbench, so this is never a latency promise
+    /// (honest-UX rule §1.6) and is absent on solo plans and on workers.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub predicted_tpt_ms: Option<f64>,
+    /// The v2 scheduler's SECONDARY comparison key (docs/perf.md §7),
+    /// additive next to `predicted_tpt_ms`: Σ per pipeline boundary of
+    /// `RTT + (4·n_embd·n_ubatch)/measured_bandwidth` ms — the per-ubatch
+    /// prefill boundary cost. Unmeasured links contribute RTT only. Same
+    /// relative-only caveat; absent on solo plans and on workers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub predicted_prefill_ms: Option<f64>,
 }
 
 /// A worker's answer to a plan proposal, recorded for the awaiting head.
@@ -719,6 +730,7 @@ async fn handle_proposal(
                 plan: plan.clone(),
                 explanation: None,
                 predicted_tpt_ms: None,
+                predicted_prefill_ms: None,
             }));
             // Remembered for the polite drain at `onebrain stop` (M5).
             state.set_worker_shard(Some((epoch, sender.clone())));
@@ -1334,6 +1346,7 @@ mod tests {
             },
             explanation: None,
             predicted_tpt_ms: None,
+            predicted_prefill_ms: None,
         }
     }
 

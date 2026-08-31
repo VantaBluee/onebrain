@@ -7,11 +7,14 @@
 //!
 //! 1. **Distribute** — both daemons capped via `[debug]
 //!    usable_memory_override_bytes` so the tiny model fits neither alone.
-//!    The cap follows the M4 v1 budget rule (docs/scheduler-v1.md: budget =
-//!    usable minus the 512 MiB overhead reserve, layer capacity from real
-//!    weights + KV at the configured ctx): each node gets the reserve plus
-//!    exactly `n_layers - 1` layer-costs, so solo fails by one layer while
-//!    two nodes pool `2(n-1) >= n` layers. A `load` WITHOUT `--nodes` must
+//!    The cap follows the M7 v2 budget rule (docs/scheduler-v1.md budget =
+//!    usable minus the 512 MiB overhead reserve, plus — for DISTRIBUTED
+//!    participants — the v2 pipeline-parallel copy reserve of
+//!    docs/perf.md §3/§7; layer capacity from real weights + KV at the
+//!    configured ctx): each node gets both reserves plus exactly
+//!    `n_layers - 1` layer-costs, so solo (which subtracts only the plain
+//!    reserve) still falls short of the model while two nodes pool
+//!    `2(n-1) >= n` distributed layers. A `load` WITHOUT `--nodes` must
 //!    auto-engage `PipelineParallel` across 2 nodes, streaming `planning` +
 //!    `plan` NDJSON lines; both API dialects answer through the distributed
 //!    plan, and the OpenAI completion (temperature 0, max_tokens 12, fixed
@@ -34,9 +37,10 @@
 //! with new configs where the caps/ctx must change:
 //!
 //! 5. **Ctx 2048 (KV shifts with ctx, part 1)** — both daemons restarted
-//!    with EQUAL memory caps ([`m4_cap`]: the v1 512 MiB overhead reserve
-//!    plus a budget sized from the model's real dims so weights + KV fit
-//!    the head at ctx 2048 but not at 16384), `[debug]
+//!    with EQUAL memory caps ([`m4_cap`]: the 512 MiB overhead reserve
+//!    plus the v2 pipeline-copy reserve plus a budget sized from the
+//!    model's real dims so weights + KV fit the head at ctx 2048 but not
+//!    at 16384), `[debug]
 //!    decode_tps_override` 100.0 on A vs 50.0 on B, and `ctx_len = 2048`
 //!    (the load body has no ctx override — the daemon plans at its config
 //!    ctx, so ctx moves via config + restart). The load must plan `Solo`
@@ -250,19 +254,35 @@ pub fn run(netem: bool) -> Result<()> {
             let dims = read_gguf_dims(&path)?;
             let cap = m3_distribute_cap(&dims);
             let budget = m3_distribute_budget(&dims);
+            let copies = v2_pipeline_copy_bytes(&dims);
+            // Solo budgeting subtracts only the plain reserve, so the solo
+            // budget carries the v2 copy share on top of the distributed
+            // budget — it must STILL fall short of the model, or the
+            // distribute scenario would silently plan Solo.
+            if budget + copies >= dims.required_bytes(M3_DEFAULT_CTX) {
+                bail!(
+                    "solo budget {} B (distributed budget {budget} B + v2 pipeline copies \
+                     {copies} B) holds the whole model ({} B at ctx {M3_DEFAULT_CTX}); the \
+                     distribute cap no longer forces distribution for this model",
+                    budget + copies,
+                    dims.required_bytes(M3_DEFAULT_CTX),
+                );
+            }
             println!(
-            "  model {} ({} layers, kv {} B/token/layer, weights {} B)\n  per-node cap {cap} B \
-             = the v1 512 MiB reserve + budget {budget} B, which holds {} of {} layers at ctx \
-             {M3_DEFAULT_CTX} (solo needs {} B; two nodes pool {} layers)",
-            path.display(),
-            dims.n_layers,
-            dims.kv_rate,
-            dims.total_weight_bytes,
-            budget / dims.per_layer_cost(M3_DEFAULT_CTX),
-            dims.n_layers,
-            dims.required_bytes(M3_DEFAULT_CTX),
-            2 * (budget / dims.per_layer_cost(M3_DEFAULT_CTX)),
-        );
+                "  model {} ({} layers, kv {} B/token/layer, weights {} B, n_embd {})\n  per-node \
+             cap {cap} B = the 512 MiB reserve + {copies} B v2 pipeline copies + budget \
+             {budget} B, which holds {} of {} layers at ctx {M3_DEFAULT_CTX} (solo needs {} B; \
+             two nodes pool {} layers)",
+                path.display(),
+                dims.n_layers,
+                dims.kv_rate,
+                dims.total_weight_bytes,
+                dims.n_embd,
+                budget / dims.per_layer_cost(M3_DEFAULT_CTX),
+                dims.n_layers,
+                dims.required_bytes(M3_DEFAULT_CTX),
+                2 * (budget / dims.per_layer_cost(M3_DEFAULT_CTX)),
+            );
             Ok((path, dims, cap))
         },
     )?;
@@ -515,11 +535,12 @@ fn scenario(
         || {
             check_m4_scenario(dims)?;
             println!(
-                "  per-node budget {} B (cap {} B = budget + the v1 512 MiB overhead \
-                 reserve): ctx {M4_CTX_SMALL} needs {} B (solo fits), ctx {M4_CTX_BIG} \
-                 needs {} B (solo fails)",
+                "  per-node distributed budget {} B (cap {} B = budget + {} B v2 pipeline \
+                 copies + the 512 MiB overhead reserve): ctx {M4_CTX_SMALL} needs {} B \
+                 (solo fits), ctx {M4_CTX_BIG} needs {} B (solo fails)",
                 m4_budget(dims),
                 m4_cap(dims),
+                v2_pipeline_copy_bytes(dims),
                 dims.required_bytes(M4_CTX_SMALL),
                 dims.required_bytes(M4_CTX_BIG),
             );
@@ -3170,11 +3191,28 @@ const M4_CTX_BIG: u32 = 16384;
 /// on A vs 50.0 on B").
 const M4_DECODE_FAST: f64 = 100.0;
 const M4_DECODE_SLOW: f64 = 50.0;
-/// The fixed per-node compute/graph reserve the v1 scheduler subtracts
+/// The fixed per-node compute/graph reserve the scheduler subtracts
 /// from usable memory (docs/scheduler-v1.md "Placement algorithm" §1;
 /// `onebrain_scheduler::OVERHEAD_RESERVE_BYTES` — mirrored here because
-/// xtask deliberately depends on no workspace crates).
+/// xtask deliberately depends on no workspace crates). This plain reserve
+/// is ALL that solo budgeting subtracts — under v1 and v2 alike.
 const V1_OVERHEAD_RESERVE_BYTES: u64 = 512 * 1024 * 1024;
+
+/// The `[perf] n_ubatch` every capped phase (M3 distribute, M4, chaos)
+/// plans at: the daemon's config default — those phases never render the
+/// knob (only the M7 overlap step does, and it runs uncapped).
+const SIM_DEFAULT_N_UBATCH: u64 = 512;
+
+/// The extra per-node reserve the v2 scheduler folds into its DISTRIBUTED
+/// budget on top of [`V1_OVERHEAD_RESERVE_BYTES`]
+/// (`onebrain_scheduler::node_budget_v2`, docs/perf.md §3/§7): up to 4
+/// in-flight pipeline-parallel copies of the `4·n_embd·n_ubatch`-byte f32
+/// boundary activation. Solo budgets keep the plain reserve — a solo plan
+/// runs no RPC pipeline, so the copies never materialize. Every capped
+/// phase runs the default n_ubatch ([`SIM_DEFAULT_N_UBATCH`]).
+fn v2_pipeline_copy_bytes(dims: &SimModelDims) -> u64 {
+    16 * dims.n_embd * SIM_DEFAULT_N_UBATCH
+}
 
 /// What the M4 scenarios need to know about the model, read from the GGUF
 /// header with the scheduler's own rules (crates/onebrain-scheduler/src/
@@ -3193,6 +3231,10 @@ struct SimModelDims {
     /// Total tensor bytes (every layer's weights, embedding and output
     /// included — they ride on their host layers in the scheduler too).
     total_weight_bytes: u64,
+    /// `{arch}.embedding_length`: sizes the v2 scheduler's per-node
+    /// pipeline-parallel copy reserve (`4·(4·n_embd·n_ubatch)` bytes,
+    /// docs/perf.md §3/§7), which the DISTRIBUTED cap math must mirror.
+    n_embd: u64,
 }
 
 impl SimModelDims {
@@ -3227,10 +3269,17 @@ fn m4_budget(dims: &SimModelDims) -> u64 {
     low + (high - low) * 8 / 10
 }
 
-/// The `[debug] usable_memory_override_bytes` value: the budget plus the
-/// v1 overhead reserve the scheduler will subtract back out.
+/// The `[debug] usable_memory_override_bytes` value: the budget plus
+/// EVERYTHING the v2 scheduler subtracts from a distributed participant —
+/// the plain overhead reserve AND the pipeline-parallel copy reserve — so
+/// [`m4_budget`] is exactly the node's distributed budget and the ±1
+/// capacity reasoning is untouched by the v2 switch. The SOLO check
+/// subtracts only the plain reserve, leaving `budget + copies`; the copy
+/// term (0.5 MiB for stories260K) is far below the 20% headroom the
+/// budget keeps under the ctx-16384 requirement, so both solo boundaries
+/// still land on the intended side ([`check_m4_scenario`] verifies).
 fn m4_cap(dims: &SimModelDims) -> u64 {
-    V1_OVERHEAD_RESERVE_BYTES + m4_budget(dims)
+    V1_OVERHEAD_RESERVE_BYTES + v2_pipeline_copy_bytes(dims) + m4_budget(dims)
 }
 
 /// The score prediction for the asymmetric split, from the contract's own
@@ -3282,15 +3331,27 @@ fn check_m4_scenario(dims: &SimModelDims) -> Result<()> {
         bail!("model KV rate is 0 bytes/token/layer; ctx cannot shift its memory need");
     }
     let budget = m4_budget(dims);
+    // Solo budgeting subtracts only the plain reserve (scheduler contract),
+    // so the head's SOLO budget is the distributed budget plus the v2
+    // pipeline-copy share the cap carries for it.
+    let solo_budget = budget + v2_pipeline_copy_bytes(dims);
     let low = dims.required_bytes(M4_CTX_SMALL);
     let high = dims.required_bytes(M4_CTX_BIG);
-    if low > budget {
-        bail!("budget {budget} B cannot hold the ctx-{M4_CTX_SMALL} requirement {low} B solo");
+    if low > solo_budget {
+        bail!(
+            "solo budget {solo_budget} B cannot hold the ctx-{M4_CTX_SMALL} requirement \
+             {low} B solo"
+        );
     }
-    if high <= budget {
-        bail!("budget {budget} B still holds the ctx-{M4_CTX_BIG} requirement {high} B solo");
+    if high <= solo_budget {
+        bail!(
+            "solo budget {solo_budget} B still holds the ctx-{M4_CTX_BIG} requirement \
+             {high} B solo"
+        );
     }
     let (fast, slow) = predicted_counts(dims.n_layers);
+    // Distributed capacity under the v2 budget rule: the cap hands back
+    // exactly `budget` once the scheduler subtracts both reserves.
     let cap_layers = budget / dims.per_layer_cost(M4_CTX_BIG);
     if cap_layers < fast || 2 * cap_layers < dims.n_layers {
         bail!(
@@ -3581,6 +3642,7 @@ fn parse_gguf_dims(bytes: &[u8], file_len: u64) -> Result<SimModelDims> {
         n_layers,
         kv_rate: 2 * 2 * n_embd_kv, // K+V, f16
         total_weight_bytes: file_len - data_offset,
+        n_embd,
     })
 }
 
@@ -3603,10 +3665,17 @@ fn m3_distribute_budget(dims: &SimModelDims) -> u64 {
 }
 
 /// The `[debug] usable_memory_override_bytes` value for the distribute
-/// phase: the budget plus the v1 overhead reserve the scheduler subtracts
-/// back out (docs/scheduler-v1.md "Placement algorithm" §1).
+/// phase: the budget plus EVERYTHING the v2 scheduler subtracts from a
+/// distributed participant — the plain overhead reserve (docs/
+/// scheduler-v1.md "Placement algorithm" §1) AND the pipeline-parallel
+/// copy reserve (docs/perf.md §3/§7) — so each node's DISTRIBUTED capacity
+/// is exactly the intended `n_layers - 1`. The SOLO check subtracts only
+/// the plain reserve, leaving `budget + copies`, which must still fall
+/// short of the model by construction: the copy term is below one
+/// layer-cost for every shape the sim runs (the unit test pins it, and
+/// the model step bails loudly if a future model breaks it).
 fn m3_distribute_cap(dims: &SimModelDims) -> u64 {
-    V1_OVERHEAD_RESERVE_BYTES + m3_distribute_budget(dims)
+    V1_OVERHEAD_RESERVE_BYTES + v2_pipeline_copy_bytes(dims) + m3_distribute_budget(dims)
 }
 
 /// Optional sandbox-config knobs a scenario phase turns on (`None` renders
@@ -4203,35 +4272,50 @@ mod tests {
     use super::*;
 
     #[test]
-    fn m3_cap_makes_solo_fail_and_pooled_fit_under_v1_budgets() {
+    fn m3_cap_makes_solo_fail_and_pooled_fit_under_v2_budgets() {
         // The primary smoke model plus a sweep of other shapes: for each,
-        // the (n-1)-layer-cost budget must fail solo (weights + KV exceed
-        // it) while two such nodes pool enough capacity, with each node's
-        // ceil(n/2) share within its own capacity.
+        // the cap's SOLO budget (plain reserve subtracted — i.e. the
+        // (n-1)-layer distributed budget plus the v2 pipeline-copy share
+        // the cap carries) must fail solo, while each node's DISTRIBUTED
+        // budget (both reserves subtracted) holds exactly n-1 layers, so
+        // two nodes pool enough capacity with each node's ceil(n/2) share
+        // within its own capacity.
         let shapes = [
             stories260k_dims(),
             SimModelDims {
                 n_layers: 2,
-                kv_rate: 1152,
+                kv_rate: 1152, // 4 × n_embd_kv, no GQA: n_embd 288
                 total_weight_bytes: 8_300_000,
+                n_embd: 288,
             },
             SimModelDims {
                 n_layers: 6,
                 kv_rate: 1152,
                 total_weight_bytes: 8_300_000,
+                n_embd: 288,
             },
             SimModelDims {
                 n_layers: 32,
                 kv_rate: 0, // no KV growth at all still distributes
                 total_weight_bytes: 750_000_000,
+                n_embd: 1024,
             },
         ];
         for dims in shapes {
             let budget = m3_distribute_budget(&dims);
+            let copies = v2_pipeline_copy_bytes(&dims);
             let capacity = budget / dims.per_layer_cost(M3_DEFAULT_CTX);
+            // The copy share stays under one layer-cost, so the solo
+            // budget (budget + copies) is still a layer short of the model
+            // — the model step's runtime bail pins the same invariant.
             assert!(
-                budget < dims.required_bytes(M3_DEFAULT_CTX),
-                "{dims:?}: budget {budget} must NOT hold the model solo"
+                copies < dims.per_layer_cost(M3_DEFAULT_CTX),
+                "{dims:?}: v2 copy share {copies} must stay under one layer-cost"
+            );
+            assert!(
+                budget + copies < dims.required_bytes(M3_DEFAULT_CTX),
+                "{dims:?}: solo budget {} must NOT hold the model solo",
+                budget + copies
             );
             assert_eq!(capacity, dims.n_layers - 1, "{dims:?}");
             assert!(2 * capacity >= dims.n_layers, "{dims:?}: pooled must fit");
@@ -4239,14 +4323,17 @@ mod tests {
                 capacity >= dims.n_layers.div_ceil(2),
                 "{dims:?}: the bigger half-share must fit one node"
             );
-            assert_eq!(m3_distribute_cap(&dims), 536_870_912 + budget);
+            assert_eq!(m3_distribute_cap(&dims), 536_870_912 + copies + budget);
         }
         // Pinned numbers for stories260K at the daemon's default ctx 4096:
-        // cost = 234,240 + 128×4096 = 758,528; budget = 4 × cost.
+        // cost = 234,240 + 128×4096 = 758,528; budget = 4 × cost; v2
+        // pipeline copies = 16 × 64 × 512 = 524,288.
         let dims = stories260k_dims();
         assert_eq!(dims.per_layer_cost(M3_DEFAULT_CTX), 758_528);
         assert_eq!(m3_distribute_budget(&dims), 3_034_112);
+        assert_eq!(v2_pipeline_copy_bytes(&dims), 524_288);
         assert_eq!(dims.required_bytes(M3_DEFAULT_CTX), 3_792_640);
+        assert_eq!(m3_distribute_cap(&dims), 540_429_312);
     }
 
     #[test]
@@ -4317,12 +4404,15 @@ mod tests {
     /// stories260K.gguf, the sim's pinned first-choice model: 5 layers,
     /// n_embd 64, 8 heads / 4 KV heads -> n_embd_kv 32 -> kv_rate 128
     /// B/token/layer; tensor-data section 1,171,200 B of the 1,185,376 B
-    /// file. These constants pin the whole M4 cap derivation end to end.
+    /// file. These constants pin the whole M4 cap derivation end to end
+    /// (n_embd also sizes the v2 pipeline-copy reserve: 16 × 64 × 512 =
+    /// 524,288 B at the default n_ubatch).
     fn stories260k_dims() -> SimModelDims {
         SimModelDims {
             n_layers: 5,
             kv_rate: 128,
             total_weight_bytes: 1_171_200,
+            n_embd: 64,
         }
     }
 
@@ -4335,9 +4425,15 @@ mod tests {
         assert_eq!(dims.per_layer_cost(M4_CTX_BIG), 2_331_392);
         // 80% of the way from the 2k to the 16k requirement.
         assert_eq!(m4_budget(&dims), 9_821_952);
-        assert_eq!(m4_cap(&dims), 536_870_912 + 9_821_952);
-        // Per-node layer capacity at 16k: 4 — holds the tilted 3-layer
-        // share without clamping, and two nodes pool 8 >= 5.
+        // The cap adds BOTH reserves (v2 rule): 512 MiB + 524,288 B of
+        // pipeline copies + the budget. The solo budget the scheduler sees
+        // (plain reserve subtracted) is budget + copies = 10,346,240 B —
+        // still comfortably between the 2k and 16k requirements.
+        assert_eq!(m4_cap(&dims), 536_870_912 + 524_288 + 9_821_952);
+        assert!(m4_budget(&dims) + v2_pipeline_copy_bytes(&dims) < 11_656_960);
+        // Per-node DISTRIBUTED layer capacity at 16k (v2 budget): 4 —
+        // holds the tilted 3-layer share without clamping, and two nodes
+        // pool 8 >= 5.
         assert_eq!(m4_budget(&dims) / dims.per_layer_cost(M4_CTX_BIG), 4);
         check_m4_scenario(&dims).unwrap();
     }

@@ -783,12 +783,20 @@ pub(crate) struct PlannedLoad {
     /// Present exactly on distributed plans (the relative comparison
     /// metric, never a latency promise — §1.6).
     pub(crate) predicted_tpt_ms: Option<f64>,
+    /// The v2 scheduler's SECONDARY comparison key mirrored for the same
+    /// plan (docs/perf.md §7): Σ per pipeline boundary of
+    /// `RTT + (4·n_embd·n_ubatch)/measured_bandwidth` ms. Present exactly
+    /// on distributed plans, like `predicted_tpt_ms`; links without a
+    /// measured bandwidth contribute RTT only.
+    pub(crate) predicted_prefill_ms: Option<f64>,
     /// This node's mesh endpoint id (the head).
     pub(crate) own_id: String,
 }
 
-/// Plan a load of the already-local model at `path` (M4 scheduler v1: real
-/// model dims, device profiles, measured link RTTs — docs/scheduler-v1.md).
+/// Plan a load of the already-local model at `path` (M7 scheduler v2-lite:
+/// real model dims, device profiles, measured link RTTs + bandwidth, MoE
+/// active-expert scaling and the pipeline-copy reserve on top of the M4 v1
+/// rules — docs/scheduler-v1.md + docs/perf.md §7).
 /// Shared by the normal load flow, the M5 supervisor's retry re-plan, and
 /// the lazy rejoin re-plan. Eligible workers are the Connected peers that
 /// reported a budget, minus `exclude` (nodes lost to the failed epoch);
@@ -935,7 +943,12 @@ pub(crate) async fn plan_load(
         links,
         n_ubatch: state.n_ubatch,
     };
-    let placed = match onebrain_scheduler::plan_v1(&request) {
+    // plan_v2 (M7, docs/perf.md §7): same admission rules as plan_v1, plus
+    // the candidate-family search, the bandwidth-priced prefill transfer
+    // term, MoE active-expert compute scaling, and the pipeline-parallel
+    // copy reserve. With no profiles, no bandwidth, and dense dims it
+    // reproduces plan_v1's decisions exactly (scheduler contract).
+    let placed = match onebrain_scheduler::plan_v2(&request) {
         Ok(p) => p,
         Err(e @ ScheduleError::DoesNotFit { .. }) => {
             let ScheduleError::DoesNotFit {
@@ -960,11 +973,13 @@ pub(crate) async fn plan_load(
         plan.epoch = state.cluster.next_epoch();
     }
     let predicted_tpt_ms = (!solo).then(|| predicted_tpt_ms(&plan.assignments, &request));
+    let predicted_prefill_ms = (!solo).then(|| predicted_prefill_ms(&plan.assignments, &request));
     Ok(PlannedLoad {
         plan,
         tensor_split: placed.tensor_split,
         explanation: placed.explanation,
         predicted_tpt_ms,
+        predicted_prefill_ms,
         own_id,
     })
 }
@@ -1008,8 +1023,8 @@ async fn drive_load(state: Arc<InternalState>, body: LoadBody, tx: LineSender) {
         None
     };
 
-    // Phase B: plan (M4 scheduler v1 — factored into `plan_load`, shared
-    // with the M5 supervisor's re-plan paths).
+    // Phase B: plan (M7 scheduler v2-lite — factored into `plan_load`,
+    // shared with the M5 supervisor's re-plan paths).
     let _ = emit(&tx, serde_json::json!({ "status": "planning" })).await;
     let planned = match plan_load(
         &state,
@@ -1033,6 +1048,11 @@ async fn drive_load(state: Arc<InternalState>, body: LoadBody, tx: LineSender) {
         serde_json::to_value(&planned.plan).unwrap_or_else(|_| serde_json::json!({}));
     if let Some(tpt) = planned.predicted_tpt_ms {
         plan_json["predicted_tpt_ms"] = serde_json::json!(tpt);
+    }
+    // Additive (M7): the v2 secondary key — existing fields keep their
+    // meaning, this one only appears alongside predicted_tpt_ms.
+    if let Some(prefill) = planned.predicted_prefill_ms {
+        plan_json["predicted_prefill_ms"] = serde_json::json!(prefill);
     }
     if body.explain {
         plan_json["explanation"] = serde_json::json!(planned.explanation);
@@ -1064,12 +1084,16 @@ async fn drive_load(state: Arc<InternalState>, body: LoadBody, tx: LineSender) {
     }
 }
 
-/// Mirror of the scheduler's plan-comparison metric for the FINAL plan
-/// (v1 module docs): `max_stage(layers / decode_tps) × 1000 + Σ boundary
-/// RTT ms`, where an unprofiled node is costed at the slowest profiled
-/// node's rate (conservative) or contributes zero when nothing is profiled,
-/// and unmeasured links default to
-/// [`onebrain_scheduler::DEFAULT_LINK_RTT_MS`]. A RELATIVE figure (the
+/// Mirror of the scheduler's PRIMARY plan-comparison metric for the FINAL
+/// plan (v2 module docs, docs/perf.md §7-§8):
+/// `max_stage(active layer units / decode_tps) × 1000 + Σ boundary RTT ms`,
+/// where a stage's active units are [`onebrain_scheduler::ModelDims::
+/// active_compute_units`] over its assigned range (a MoE layer costs only
+/// the weight fraction a token actually touches; dense models reduce to
+/// the plain layer count, i.e. the v1 figure), an unprofiled node is
+/// costed at the slowest profiled node's rate (conservative) or
+/// contributes zero when nothing is profiled, and unmeasured links default
+/// to [`onebrain_scheduler::DEFAULT_LINK_RTT_MS`]. A RELATIVE figure (the
 /// decode rates come from the tiny-model microbench), surfaced as
 /// `predicted_tpt_ms` on the plan view — never as a latency promise (§1.6).
 fn predicted_tpt_ms(assignments: &[Assignment], request: &PlanRequest) -> f64 {
@@ -1092,7 +1116,15 @@ fn predicted_tpt_ms(assignments: &[Assignment], request: &PlanRequest) -> f64 {
     let compute_ms = assignments
         .iter()
         .map(|a| match decode_of(&a.node) {
-            Some(tps) => a.layers.len() as f64 / tps * 1000.0,
+            // MoE active-unit scaling (v2): the assigned range's active
+            // compute units, not its raw layer count. Dense: identical.
+            Some(tps) => {
+                request
+                    .dims
+                    .active_compute_units(a.layers.start, a.layers.end)
+                    / tps
+                    * 1000.0
+            }
             None => 0.0,
         })
         .fold(0.0f64, f64::max);
@@ -1113,6 +1145,41 @@ fn predicted_tpt_ms(assignments: &[Assignment], request: &PlanRequest) -> f64 {
     compute_ms + boundary_ms
 }
 
+/// Mirror of the scheduler's SECONDARY plan-comparison key for the FINAL
+/// plan (v2 module docs, docs/perf.md §7): Σ per pipeline boundary of
+/// `RTT + (4·n_embd·n_ubatch)/measured_bandwidth` ms — the per-ubatch
+/// prefill boundary cost. Links without a measured bandwidth (or with an
+/// unknown embedding width) contribute RTT only, and unprobed pairs
+/// default to [`onebrain_scheduler::DEFAULT_LINK_RTT_MS`] — exactly the
+/// scheduler's own degradation. Surfaced additively as
+/// `predicted_prefill_ms` next to `predicted_tpt_ms`; same relative-only
+/// caveat (§1.6).
+fn predicted_prefill_ms(assignments: &[Assignment], request: &PlanRequest) -> f64 {
+    assignments
+        .windows(2)
+        .map(|pair| {
+            let link = request.links.iter().find(|l| {
+                (l.a == pair[0].node && l.b == pair[1].node)
+                    || (l.a == pair[1].node && l.b == pair[0].node)
+            });
+            let rtt = link
+                .map(|l| l.rtt_ms)
+                .unwrap_or(onebrain_scheduler::DEFAULT_LINK_RTT_MS);
+            let transfer = link
+                .and_then(|l| l.bandwidth_mbps)
+                .map(|bw| {
+                    onebrain_scheduler::boundary_transfer_ms(
+                        request.dims.n_embd,
+                        request.n_ubatch,
+                        bw,
+                    )
+                })
+                .unwrap_or(0.0);
+            rtt + transfer
+        })
+        .sum()
+}
+
 /// Install the head-side state of a freshly ready SOLO load: the active
 /// plan view, the loaded-model source (M5 — the supervisor's re-plan paths
 /// read it), and the teardown of any replaced distributed plan's bridges
@@ -1131,6 +1198,7 @@ fn install_solo_active(
         plan,
         explanation: Some(explanation),
         predicted_tpt_ms: None,
+        predicted_prefill_ms: None,
     }));
     state.cluster.teardown_head_bridges();
     state.cluster.note_loaded(LoadedSource {
@@ -1280,6 +1348,7 @@ pub(crate) async fn activate_distributed_plan(
         tensor_split,
         explanation,
         predicted_tpt_ms,
+        predicted_prefill_ms,
         own_id,
     } = planned;
     let epoch = plan.epoch;
@@ -1370,6 +1439,7 @@ pub(crate) async fn activate_distributed_plan(
                 plan,
                 explanation: Some(explanation),
                 predicted_tpt_ms,
+                predicted_prefill_ms,
             }));
             state.cluster.note_loaded(LoadedSource {
                 reference: reference.to_string(),
