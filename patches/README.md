@@ -149,22 +149,29 @@ round trip per ubatch. This patch adds:
   reading its own response;
 - client-side flow control (`ob_rpc_inflight_cap`): the ledger also
   counts wire BYTES, and fire-and-forget sends keep the unproven
-  in-flight window at roughly TWO ubatches of traffic (adaptive:
-  2.5× the largest command of the current burst + 1 MiB, floor 4 MiB;
-  the learned size resets whenever the ledger fully drains, so the
-  request-response-paced model load never inflates the cap with weight
-  push sizes; `OB_RPC_INFLIGHT_CAP` overrides the floor, `0` disables).
-  Rationale, measured the hard way: UNBOUNDED pipelining collapsed on the
-  CI netem leg — a client bursting ~4 ubatches (~9 MiB) of unread backlog
-  turns the receiver's window reopening into line-rate bursts that
-  overflow the bounded netem qdisc (default ~1000 packets ≈ 1.5 MB):
-  tail drops, retransmit storms, RTO stalls, overlapped prefill 2.5x
-  SLOWER than sequential with huge variance. Two ubatches is exactly deep
-  enough that ubatch k+1 streams while ubatch k computes — the entire
-  overlap win — and keeps TCP in the same stable regime as the
-  sequential baseline (which carries one ~2 MiB burst per ubatch without
-  trouble). An over-cap send first pops a ticket, i.e. blocks until the
-  server has executed one whole earlier ubatch;
+  in-flight window at roughly FOUR ubatches of traffic — the scheduler's
+  own rotation depth (adaptive: 4.5× the largest command of the current
+  burst + 1 MiB, floor 4 MiB; the learned size resets whenever the
+  ledger fully drains, so the request-response-paced model load never
+  inflates the cap with weight push sizes; `OB_RPC_INFLIGHT_CAP`
+  overrides the floor, `0` disables). Rationale, measured the hard way:
+  UNBOUNDED pipelining collapsed on the CI netem leg (overlapped prefill
+  2.5x SLOWER than sequential, bimodal, decode poisoned afterwards). The
+  reproduced mechanism is RECEIVER-side: the RPC bytes ride a QUIC
+  tunnel, and with stock `net.core.rmem_max` (212992 B ≈ 1.7 ms of
+  1 Gbit) the worker's kernel UDP buffer overflows whenever QUIC receive
+  processing falls behind line-rate arrival — routine while the same
+  host computes a graph. Every overflow episode is packet loss to QUIC
+  (`netstat -su` RcvbufErrors; the netem qdisc itself dropped zero
+  packets), and loss recovery collapses the congestion window. The cap
+  bounds the standing backlog — the duration of sustained line-rate
+  pressure and the worst-case damage of any one loss episode — while
+  measuring within a few percent of uncapped on a healthy path
+  (depth 2 left ~15% of the overlap win on the table). An over-cap send
+  first pops a ticket, i.e. blocks until the server has executed one
+  whole earlier ubatch. The sim's netem harness additionally provisions
+  `rmem_max` for QUIC (see xtask pair_sim `netem_setup`), which is what
+  eliminates the overflow at its source on that leg;
 - `synchronize` = drain everything submitted on the backend's socket;
   `event_wait`/`event_synchronize` = drain to the recorded marker
   (tickets first, then — only if the ledger still cannot prove the

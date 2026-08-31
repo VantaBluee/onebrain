@@ -847,6 +847,26 @@ pub(crate) fn netem_setup() -> Result<()> {
     let _ = sh(&["ip", "netns", "del", NS_B]);
     // Hosted runners usually ship sch_netem but do not load it by default.
     let _ = sh(&["modprobe", "sch_netem"]);
+    // HARNESS PROVISIONING (M7 netem leg, coordinator-authorized harness
+    // edit): raise the kernel UDP socket-buffer ceiling to 8 MB. The mesh
+    // rides QUIC over UDP and iroh requests ~7 MB socket buffers, but stock
+    // Ubuntu's net.core.rmem_max (212992 B = 1.7 ms of line rate at 1 Gbit)
+    // silently caps them; once a receiver that is also computing falls
+    // ~2 ms behind line-rate arrival, the kernel drops datagrams AT THE
+    // SOCKET (`netstat -su` RcvbufErrors -- measured 1000+ per overlapped
+    // prefill on this leg while the netem qdisc itself dropped ZERO
+    // packets), and every such episode is packet loss to QUIC whose
+    // recovery collapses throughput for seconds. Raising the ceiling is
+    // standard QUIC operational guidance for >= 500 Mbit paths; this makes
+    // the leg represent a sanely provisioned 1 Gbit deployment instead of
+    // one mis-tuned for QUIC, and touches NONE of the contract's shaping
+    // (netem rate, delay, and the qdisc's own limit are unchanged). The
+    // values are host-global and ephemeral on CI runners; errors are
+    // ignored so restricted hosts fall through to their SKIP paths.
+    for key in ["net.core.rmem_max", "net.core.wmem_max"] {
+        let setting = format!("{key}=8388608");
+        let _ = sh(&["sysctl", "-w", setting.as_str()]);
+    }
     sh(&["ip", "netns", "add", NS_A])?;
     sh(&["ip", "netns", "add", NS_B])?;
     sh(&[

@@ -23,16 +23,23 @@ before it fully executed. The patch adds
    Without tickets, a wait-side fence can only wait for the WHOLE queue,
    which re-serializes a deep ubatch train to depth one;
  - client-side flow control: the unproven in-flight wire bytes are capped
-   at roughly TWO ubatches of traffic (adaptive: 2.5x the largest command
-   of the current burst + 1 MiB, floor 4 MiB, OB_RPC_INFLIGHT_CAP
-   overrides, 0 disables; the learned size resets whenever the ledger
-   fully drains so load-time weight pushes never inflate it). Ubatch k+1
-   streams while ubatch k computes — the entire overlap win — and the
-   client never builds the multi-megabyte unread backlog that overflowed
-   the CI netem leg's bounded qdisc (~1000 packets ≈ 1.5 MB) into
-   tail-drop/retransmit collapse (measured 2.5x SLOWER than sequential).
-   Over-cap sends first pop a ticket, i.e. block until the server has
-   executed one whole earlier ubatch;
+   at roughly FOUR ubatches of traffic — the scheduler's own rotation
+   depth (adaptive: 4.5x the largest command of the current burst +
+   1 MiB, floor 4 MiB, OB_RPC_INFLIGHT_CAP overrides, 0 disables; the
+   learned size resets whenever the ledger fully drains so load-time
+   weight pushes never inflate it). Measured root cause of the unbounded
+   collapse (2.5x SLOWER than sequential on the CI netem leg, bimodal):
+   the RPC bytes ride a QUIC tunnel, and with stock net.core.rmem_max
+   (212992 B ~= 1.7 ms of 1 Gbit) the receiver's kernel UDP buffer
+   overflows whenever QUIC receive processing falls behind line-rate
+   arrival — routine while the same host computes a graph. Every
+   overflow is packet loss to QUIC (netstat -su RcvbufErrors; the netem
+   qdisc dropped zero packets) and loss recovery collapses the
+   congestion window. The cap bounds the standing backlog and with it
+   the damage of any one loss episode, while measuring within a few
+   percent of uncapped on a healthy path. Over-cap sends first pop a
+   ticket, i.e. block until the server has executed one whole earlier
+   ubatch;
  - synchronize as drain-everything; events as markers into the ledger;
    async set/get/cpy tensor entry points;
  - a client-side cache for GET_ALLOC_SIZE responses (resolves upstream's
@@ -102,29 +109,8 @@ index 1d1646d84..3ae4ff9a0 100644
  GGML_BACKEND_API ggml_backend_reg_t ggml_backend_rpc_reg(void);
  GGML_BACKEND_API ggml_backend_reg_t ggml_backend_rpc_add_server(const char * endpoint);
  
-diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index e519bdf50..57acd6c0f 100644
---- a/ggml/src/ggml-backend.cpp
-+++ b/ggml/src/ggml-backend.cpp
-@@ -1624,6 +1624,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
-             struct ggml_tensor * input = split->inputs[input_id];
-             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
- 
-+            // ob-patch-0003: an empty tensor (a zero in ne, e.g. a graph that
-+            // gathers 0 output rows during chunked prefill) carries no data,
-+            // so there is nothing to copy and no dependency to synchronize.
-+            // Without this, the synchronizing fallback below stalls the
-+            // scheduler on the producing backend once per ubatch for a
-+            // zero-byte copy, serializing pipeline-parallel prefill.
-+            if (ggml_nbytes(input) == 0) {
-+                continue;
-+            }
-+
-             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
-                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
-                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
 diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
-index 815e9ad88..76b239803 100644
+index 815e9ad88..1ed9224cc 100644
 --- a/ggml/src/ggml-rpc/ggml-rpc.cpp
 +++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
 @@ -6,6 +6,7 @@
@@ -149,7 +135,7 @@ index 815e9ad88..76b239803 100644
  
  // all RPC structures must be packed
  #pragma pack(push, 1)
-@@ -348,6 +356,174 @@ static void ob_rpc_log_fail(const char * where) {
+@@ -348,6 +356,188 @@ static void ob_rpc_log_fail(const char * where) {
      }
  }
  
@@ -231,19 +217,26 @@ index 815e9ad88..76b239803 100644
 +};
 +
 +// onebrain: patches/0003: client-side flow control. Unbounded pipelining is
-+// actively harmful on real networks: a client that bursts several ubatches
-+// of fire-and-forget SET_TENSOR/GRAPH_COMPUTE bytes while the (serial)
-+// server is busy computing builds a multi-megabyte unread backlog along the
-+// path. On the CI netem leg (1 Gbit, tc qdisc limit ~1000 packets ≈ 1.5 MB)
-+// that backlog turns the receive-window reopening into line-rate bursts
-+// that overflow the qdisc — tail drops, retransmit storms, RTO stalls —
-+// measured 2.5x SLOWER than the sequential baseline. The fix: bound the
-+// unproven ("in-flight") wire bytes to roughly TWO of the largest commands,
-+// i.e. exactly deep enough that ubatch k+1 streams while ubatch k computes
-+// (the entire overlap win) and no deeper. The sequential baseline routinely
-+// carries one ~2 MiB burst per ubatch without trouble, so a two-command
-+// window keeps TCP in the same stable regime. Enforcement is one ticket pop
-+// per over-cap send — the ticket frees a whole earlier ubatch — and a
++// actively harmful on real transports: a client that bursts several
++// ubatches of fire-and-forget SET_TENSOR/GRAPH_COMPUTE bytes while the
++// (serial) server is busy computing keeps the path at sustained line rate
++// with a multi-megabyte unread backlog. Measured on the CI netem leg
++// (1 Gbit / 0.5 ms namespaces, RPC bridged over a QUIC tunnel), the
++// failure mode is RECEIVER-side: the worker's kernel UDP receive buffer
++// (stock net.core.rmem_max = 212992 B ≈ 1.7 ms of line rate) overflows
++// whenever the QUIC endpoint's receive processing falls behind arrival —
++// routine while the same host is computing a graph — and every overflow
++// episode is packet loss to the QUIC stack (`netstat -su` RcvbufErrors;
++// the tc qdisc itself dropped nothing). Loss recovery then collapses the
++// congestion window so hard that overlapped prefill measured 2.5x SLOWER
++// than the sequential baseline, bimodally, and even decode's tiny
++// messages crawled afterwards. The cap bounds the standing backlog — and
++// with it both the duration of sustained line-rate pressure and the
++// worst-case damage of any one loss episode — to about FOUR ubatches:
++// the scheduler's own rotation depth (measured within a few percent of
++// uncapped on a healthy path), so a stalled receiver is exposed to a
++// bounded burst rather than an unbounded train. Enforcement is one ticket
++// pop per over-cap send — the ticket frees a whole earlier ubatch — and a
 +// command larger than the whole cap always passes once the queue is empty
 +// (no deadlock). `OB_RPC_INFLIGHT_CAP` overrides the byte floor for
 +// experiments; 0 disables the cap.
@@ -263,13 +256,20 @@ index 815e9ad88..76b239803 100644
 +    }
 +    // At least two full UBATCHES of traffic must fit, or the pipeline
 +    // degenerates to lock-step (the streamed ubatch could never sit behind
-+    // the computing one). An ubatch is one dominant transfer (the largest
-+    // command — the boundary/input activation SET) plus secondary commands
-+    // (attention mask, serialized graph, fences) that are a fraction of it;
-+    // half-the-largest-again plus fixed slack covers them with room for the
-+    // mask growing across a long prompt.
-+    const uint64_t two_ubatches = 2 * pending.largest_cmd + pending.largest_cmd / 2 + 1024 * 1024;
-+    return env_cap > two_ubatches ? env_cap : two_ubatches;
++    // the computing one); FOUR matches the scheduler's own rotation depth
++    // (GGML_SCHED_MAX_COPIES), which its per-slot event waits already
++    // enforce — measured on the 1 Gbit netem leg, depth 4 tracks the
++    // uncapped pipeline within a few percent while depth 2 leaves ~15% on
++    // the table. The cap therefore normally shadows the scheduler's own
++    // throttle and exists to bound workloads whose submissions do NOT pass
++    // through rotating-slot waits (bulk async copies, future callers) and
++    // any pathological over-deep train. An ubatch is one dominant transfer
++    // (the largest command — the boundary/input activation SET) plus
++    // secondary commands (attention mask, serialized graph, fences) that
++    // are a fraction of it; half-the-largest-again plus fixed slack covers
++    // them with room for the mask growing across a long prompt.
++    const uint64_t four_ubatches = 4 * pending.largest_cmd + pending.largest_cmd / 2 + 1024 * 1024;
++    return env_cap > four_ubatches ? env_cap : four_ubatches;
 +}
 +
 +static std::mutex ob_rpc_pending_map_mutex;
@@ -324,7 +324,7 @@ index 815e9ad88..76b239803 100644
  // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
  // No response
  static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size) {
-@@ -356,6 +532,29 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input,
+@@ -356,6 +546,29 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input,
      if (ob_rpc_is_dead(sock)) {
          return false;
      }
@@ -354,7 +354,7 @@ index 815e9ad88..76b239803 100644
      uint8_t cmd_byte = cmd;
      if (!sock->send_data(&cmd_byte, sizeof(cmd_byte)) ||
          !sock->send_data(&input_size, sizeof(input_size)) ||
-@@ -364,15 +563,40 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input,
+@@ -364,15 +577,40 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input,
          ob_rpc_mark_dead(sock); // onebrain: error-return semantics (patches/0002)
          return false;
      }
@@ -395,7 +395,7 @@ index 815e9ad88..76b239803 100644
      uint64_t out_size;
      if (!sock->recv_data(&out_size, sizeof(out_size)) ||
          out_size != output_size ||
-@@ -382,9 +606,115 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input,
+@@ -382,9 +620,115 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input,
          ob_rpc_mark_dead(sock);
          return false;
      }
@@ -511,7 +511,7 @@ index 815e9ad88..76b239803 100644
  // RPC client-side implementation
  
  // Performs HELLO handshake with transport auto-negotiation.
-@@ -467,10 +797,22 @@ static void * ggml_backend_rpc_buffer_get_base(ggml_backend_buffer_t buffer) {
+@@ -467,10 +811,22 @@ static void * ggml_backend_rpc_buffer_get_base(ggml_backend_buffer_t buffer) {
      rpc_msg_buffer_get_base_rsp response;
      bool status = send_rpc_cmd(ctx->sock, RPC_CMD_BUFFER_GET_BASE, &request, sizeof(request), &response, sizeof(response));
      if (!status) { // onebrain: error-return semantics (patches/0002)
@@ -537,7 +537,7 @@ index 815e9ad88..76b239803 100644
      }
      ctx->base_ptr = reinterpret_cast<void *>(response.base_ptr);
      return ctx->base_ptr;
-@@ -711,6 +1053,36 @@ static size_t ggml_backend_rpc_get_max_size(ggml_backend_buffer_type_t buft) {
+@@ -711,6 +1067,36 @@ static size_t ggml_backend_rpc_get_max_size(ggml_backend_buffer_type_t buft) {
      return buft_ctx->max_size;
  }
  
@@ -574,7 +574,7 @@ index 815e9ad88..76b239803 100644
  static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
      // should we query the remote server for the actual size
      bool rpc_get = false;
-@@ -738,16 +1110,44 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
+@@ -738,16 +1124,44 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
              request.srcs[i] = serialize_tensor(tensor->src[i]);
          }
  
@@ -620,7 +620,7 @@ index 815e9ad88..76b239803 100644
          return response.alloc_size;
      }
  
-@@ -776,8 +1176,142 @@ static void ggml_backend_rpc_free(ggml_backend_t backend) {
+@@ -776,8 +1190,142 @@ static void ggml_backend_rpc_free(ggml_backend_t backend) {
  }
  
  static void ggml_backend_rpc_synchronize(ggml_backend_t backend) {
@@ -764,7 +764,7 @@ index 815e9ad88..76b239803 100644
  }
  
  static void add_tensor(ggml_tensor * tensor, const ggml_cgraph * cgraph, std::vector<rpc_tensor> & tensors, std::unordered_set<ggml_tensor*> & visited) {
-@@ -865,19 +1399,20 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
+@@ -865,19 +1413,20 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
  static ggml_backend_i ggml_backend_rpc_interface = {
      /* .get_name                = */ ggml_backend_rpc_name,
      /* .free                    = */ ggml_backend_rpc_free,
@@ -790,7 +790,7 @@ index 815e9ad88..76b239803 100644
      /* .graph_optimize          = */ NULL,
  };
  
-@@ -2055,15 +2590,43 @@ static void ggml_backend_rpc_device_get_props(ggml_backend_dev_t dev, struct ggm
+@@ -2055,15 +2604,43 @@ static void ggml_backend_rpc_device_get_props(ggml_backend_dev_t dev, struct ggm
      props->description = ggml_backend_rpc_device_get_description(dev);
      props->type        = ggml_backend_rpc_device_get_type(dev);
      ggml_backend_rpc_device_get_memory(dev, &props->memory_free, &props->memory_total);
@@ -836,7 +836,7 @@ index 815e9ad88..76b239803 100644
  static ggml_backend_t ggml_backend_rpc_device_init(ggml_backend_dev_t dev, const char * params) {
      ggml_backend_rpc_device_context * ctx = (ggml_backend_rpc_device_context *)dev->context;
  
-@@ -2109,9 +2672,10 @@ static const struct ggml_backend_device_i ggml_backend_rpc_device_i = {
+@@ -2109,9 +2686,10 @@ static const struct ggml_backend_device_i ggml_backend_rpc_device_i = {
      /* .supports_op          = */ ggml_backend_rpc_device_supports_op,
      /* .supports_buft        = */ ggml_backend_rpc_device_supports_buft,
      /* .offload_op           = */ NULL,

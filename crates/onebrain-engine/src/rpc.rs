@@ -262,7 +262,14 @@ impl RpcServeSession {
         let n_threads = if n_threads > 0 {
             n_threads
         } else {
-            thread::available_parallelism().map_or(1, |n| n.get() as i32)
+            // Serving RPC is inherently concurrent with the transport: while
+            // a graph computes, the NEXT ubatch's tensors are already
+            // streaming in (docs/perf.md §3), and the QUIC endpoint + bridge
+            // pump need CPU to receive them. Compute threads spin-wait in
+            // ggml's threadpool, so taking every core starves the receive
+            // path exactly when overlap needs it — measured on the netem
+            // leg as multi-second loss-recovery stalls. Reserve one core.
+            thread::available_parallelism().map_or(1, |n| (n.get() as i32 - 1).max(1))
         };
         let handle = thread::Builder::new()
             .name("ob-rpc-serve".into())
