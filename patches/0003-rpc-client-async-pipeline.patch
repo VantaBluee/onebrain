@@ -109,6 +109,27 @@ index 1d1646d84..3ae4ff9a0 100644
  GGML_BACKEND_API ggml_backend_reg_t ggml_backend_rpc_reg(void);
  GGML_BACKEND_API ggml_backend_reg_t ggml_backend_rpc_add_server(const char * endpoint);
  
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index e519bdf50..57acd6c0f 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1624,6 +1624,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+             struct ggml_tensor * input = split->inputs[input_id];
+             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
+ 
++            // ob-patch-0003: an empty tensor (a zero in ne, e.g. a graph that
++            // gathers 0 output rows during chunked prefill) carries no data,
++            // so there is nothing to copy and no dependency to synchronize.
++            // Without this, the synchronizing fallback below stalls the
++            // scheduler on the producing backend once per ubatch for a
++            // zero-byte copy, serializing pipeline-parallel prefill.
++            if (ggml_nbytes(input) == 0) {
++                continue;
++            }
++
+             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
+                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
+                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
 diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
 index 815e9ad88..1ed9224cc 100644
 --- a/ggml/src/ggml-rpc/ggml-rpc.cpp
