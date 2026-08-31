@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>OneBrain</title>
+<!-- No external origins anywhere on this page (ADR 0005): no CDN, no web
+     fonts, favicon inlined as a data: URI so the browser never 404s. -->
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/dash/app.css">
+</head>
+<body>
+<div id="ob-dash-root">
+  <header class="ob-header">
+    <h1>OneBrain</h1>
+    <p id="capacity-line" class="capacity">Connecting to the daemon&hellip;</p>
+    <p id="status-line" class="status" hidden></p>
+  </header>
+
+  <section id="token-panel" class="panel token-panel" hidden>
+    <h2>Connect to your daemon</h2>
+    <p>
+      This page reads <code>/api/internal/metrics</code>, which requires the
+      daemon's API token. Run <code>onebrain status</code> on this machine to
+      print it, then paste it below. It is stored only in this browser's
+      <code>localStorage</code> &mdash; it never leaves this machine.
+    </p>
+    <p id="token-error" class="error" hidden></p>
+    <form id="token-form">
+      <input id="token-input" type="password" autocomplete="off"
+             spellcheck="false" placeholder="API token" required>
+      <button type="submit">Save &amp; connect</button>
+    </form>
+  </section>
+
+  <main id="dash-main" class="grid" hidden>
+    <section id="advisor-panel" class="panel span-all">
+      <h2>Advisor</h2>
+      <div id="advisor"></div>
+    </section>
+
+    <section id="topology-panel" class="panel">
+      <h2>Topology</h2>
+      <div id="topology"></div>
+    </section>
+
+    <section id="plan-panel" class="panel">
+      <h2>Active plan</h2>
+      <div id="plan"></div>
+    </section>
+
+    <section id="nodes-panel" class="panel span-all">
+      <h2>Machines</h2>
+      <div id="nodes" class="cards"></div>
+    </section>
+
+    <section id="requests-panel" class="panel span-all">
+      <h2>Recent requests</h2>
+      <div id="requests"></div>
+    </section>
+  </main>
+
+  <footer class="ob-footer">
+    <p>
+      Every number here is measured on your machines and stays on them.
+      Pooling adds capacity &mdash; room for bigger models &mdash; not a
+      speed multiplier.
+    </p>
+  </footer>
+
+  <noscript><p class="panel">The dashboard needs JavaScript (served from
+    this daemon, nowhere else) to poll metrics.</p></noscript>
+</div>
+<script src="/dash/render.js"></script>
+<script src="/dash/app.js"></script>
+</body>
+</html>

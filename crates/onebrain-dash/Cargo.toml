@@ -1,6 +1,6 @@
 [package]
 name = "onebrain-dash"
-description = "Embedded dashboard SPA and the metrics endpoints feeding it"
+description = "Embedded dashboard SPA: static assets plus the router that serves them"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,7 +8,12 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-onebrain-proto = { workspace = true }
-serde = { workspace = true }
-thiserror = { workspace = true }
-# rust-embed + the built SPA arrive with M8 (product polish).
+axum = { workspace = true }
+rust-embed = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+# Route tests follow the onebrain-api pattern: real server on an ephemeral
+# loopback port, hit over real HTTP.
+tokio = { workspace = true }
+reqwest = { workspace = true }
