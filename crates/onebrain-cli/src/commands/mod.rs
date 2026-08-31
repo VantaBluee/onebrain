@@ -6,6 +6,7 @@ pub mod pin;
 pub mod pull;
 pub mod rm;
 pub mod run;
+pub mod self_update;
 pub mod status;
 pub mod stop;
 pub mod unpair;
@@ -35,6 +36,12 @@ impl From<ClientError> for CliError {
 
 impl From<onebraind::DaemonError> for CliError {
     fn from(e: onebraind::DaemonError) -> CliError {
+        CliError(e.to_string())
+    }
+}
+
+impl From<crate::update::UpdateError> for CliError {
+    fn from(e: crate::update::UpdateError) -> CliError {
         CliError(e.to_string())
     }
 }

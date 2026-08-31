@@ -4,6 +4,8 @@
 
 mod client;
 mod commands;
+mod metrics;
+mod update;
 
 use clap::{Parser, Subcommand};
 
@@ -82,6 +84,17 @@ enum Command {
     },
     /// Diagnose GPU/driver/firewall/version problems with remedies.
     Doctor,
+    /// Update this binary from the latest GitHub release (SHA256SUMS
+    /// verified; cosign checked when a cosign binary is on PATH).
+    #[command(name = "self-update")]
+    SelfUpdate {
+        /// Report whether an update exists; change nothing.
+        #[arg(long)]
+        check: bool,
+        /// Install even when the latest release is older than this build.
+        #[arg(long)]
+        allow_downgrade: bool,
+    },
     /// Stop the daemon, draining politely.
     Stop,
     /// Revoke pairing with a peer.
@@ -135,6 +148,10 @@ fn main() {
         }
         Command::Unpair { name } => commands::unpair::run(&name, cli.json),
         Command::Bench { cluster } => commands::bench::run(cli.json, cluster),
+        Command::SelfUpdate {
+            check,
+            allow_downgrade,
+        } => commands::self_update::run(check, allow_downgrade, cli.json),
     };
 
     if let Err(err) = outcome {
@@ -225,6 +242,40 @@ mod tests {
         match cli.command {
             Some(Command::Bench { cluster }) => assert!(cluster),
             _ => panic!("expected Bench"),
+        }
+    }
+
+    #[test]
+    fn self_update_parses_check_and_allow_downgrade() {
+        let cli = Cli::try_parse_from(["onebrain", "self-update"]).unwrap();
+        match cli.command {
+            Some(Command::SelfUpdate {
+                check,
+                allow_downgrade,
+            }) => {
+                assert!(!check);
+                assert!(!allow_downgrade);
+            }
+            _ => panic!("expected SelfUpdate"),
+        }
+        let cli = Cli::try_parse_from([
+            "onebrain",
+            "self-update",
+            "--check",
+            "--allow-downgrade",
+            "--json",
+        ])
+        .unwrap();
+        assert!(cli.json);
+        match cli.command {
+            Some(Command::SelfUpdate {
+                check,
+                allow_downgrade,
+            }) => {
+                assert!(check);
+                assert!(allow_downgrade);
+            }
+            _ => panic!("expected SelfUpdate"),
         }
     }
 

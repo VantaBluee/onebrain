@@ -387,6 +387,27 @@ impl DaemonClient {
         Self::success_json(resp)
     }
 
+    /// `GET /api/internal/metrics` — the M8 metrics document
+    /// (docs/product.md §1): node identity, peers with their
+    /// Hello-reported version + engine build, active plan, request ring,
+    /// advisor findings. Doctor reads it for cross-node skew checks;
+    /// parse the value with [`crate::metrics::MetricsDoc`], which
+    /// tolerates any additive revision of the schema.
+    pub fn metrics(&self) -> Result<serde_json::Value, ClientError> {
+        let url = format!("{}/api/internal/metrics", self.base_url);
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(&self.token)
+            .timeout(Duration::from_secs(5))
+            .send()
+            .map_err(|e| ClientError::Unreachable {
+                url: url.clone(),
+                detail: e.to_string(),
+            })?;
+        Self::success_json(resp)
+    }
+
     /// `GET /api/internal/peers` — paired peers with live link state.
     pub fn peers(&self) -> Result<serde_json::Value, ClientError> {
         let url = format!("{}/api/internal/peers", self.base_url);

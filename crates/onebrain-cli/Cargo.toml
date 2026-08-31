@@ -29,6 +29,55 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+hex = { workspace = true }
+# Self-update needs a private temp dir for the downloaded asset before the
+# verified swap; also used by the crate's tests.
+tempfile = { workspace = true }
+# M8 self-update only (docs/product.md §3): SHA256SUMS verification and
+# release-archive extraction. Pinned here instead of the workspace list
+# because no other crate needs them.
+sha2 = "0.10"
+flate2 = "1"
+tar = "0.4"
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
-tempfile = { workspace = true }
+# Local fixture HTTP server for the offline self-update tests (same pattern
+# as onebrain-models' download tests — no real network, ever).
+axum = { workspace = true }
+
+# ---------------------------------------------------------------------------
+# Linux package metadata (docs/product.md §4), consumed by `cargo deb` and
+# `cargo generate-rpm` in release.yml / ci.yml's release-dry-run job. Both
+# run with --no-build against the release binary `cargo xtask dist` already
+# produced. `name` drops the -cli suffix so the installed package is named
+# after the binary users type. Metadata only — nothing here affects
+# `cargo build`.
+
+[package.metadata.deb]
+name = "onebrain"
+maintainer = "OneBrain contributors <onebrain@users.noreply.github.com>"
+copyright = "2026 OneBrain contributors"
+section = "utils"
+priority = "optional"
+# $auto: dpkg-shlibdeps derives the real shared-library dependencies from
+# the built binary instead of a hand-maintained (and rotting) list.
+depends = "$auto"
+extended-description = """\
+OneBrain connects your own devices — a MacBook, a Windows PC, a Linux box, \
+in any combination — into a single logical machine for running local AI \
+models. If a model does not fit in one device's memory, OneBrain shards it \
+across your paired devices and serves it through one API endpoint; if it \
+does fit, OneBrain runs it on that device alone and stays out of the way. \
+The value is capacity, not speed."""
+assets = [
+    # target/release/ is special-cased by cargo-deb to the real target dir.
+    ["target/release/onebrain", "usr/bin/", "755"],
+]
+
+[package.metadata.generate-rpm]
+name = "onebrain"
+summary = "One logical machine for local AI"
+assets = [
+    { source = "target/release/onebrain", dest = "/usr/bin/onebrain", mode = "755" },
+]
