@@ -390,6 +390,101 @@ fn scenario(ctx: &Ctx, model_path: &Path) -> Result<()> {
         Ok(())
     })?;
 
+    // e2. Embeddings: /v1/embeddings end-to-end (the last M1.x surface).
+    step(
+        "embed: /v1/embeddings returns n_embd-wide finite vectors",
+        || {
+            // The dims oracle: n_embd straight from the smoke model's own
+            // GGUF header (`<arch>.embedding_length`), never a hardcode.
+            let n_embd = gguf_embedding_length(model_path)?;
+            let resp = ctx
+                .client
+                .post(format!("http://127.0.0.1:{port}/v1/embeddings"))
+                .bearer_auth(&token)
+                .json(&serde_json::json!({
+                    "model": model_name,
+                    "input": ["Once upon a time", "The little dog"],
+                }))
+                .timeout(GEN_TIMEOUT)
+                .send()
+                .context("POST /v1/embeddings failed")?;
+            let status = resp.status();
+            let body: Value = resp.json().context("embeddings body is not JSON")?;
+            if status.as_u16() != 200 {
+                bail!("HTTP {status}; body: {body}");
+            }
+            if body["object"] != "list" {
+                bail!("object must be \"list\": {body}");
+            }
+            let data = body["data"].as_array().context("data must be an array")?;
+            if data.len() != 2 {
+                bail!("expected 2 embeddings, got {}: {body}", data.len());
+            }
+            let mut vectors: Vec<Vec<f32>> = Vec::new();
+            for (i, entry) in data.iter().enumerate() {
+                if entry["index"] != i as u64 {
+                    bail!("data[{i}].index mismatch: {entry}");
+                }
+                let vector: Vec<f32> = entry["embedding"]
+                    .as_array()
+                    .with_context(|| format!("data[{i}].embedding must be an array"))?
+                    .iter()
+                    .map(|v| v.as_f64().map(|f| f as f32))
+                    .collect::<Option<_>>()
+                    .with_context(|| format!("data[{i}].embedding has non-numbers"))?;
+                if vector.len() != n_embd {
+                    bail!(
+                        "data[{i}].embedding has {} dims; the model's n_embd is {n_embd}",
+                        vector.len()
+                    );
+                }
+                if !vector.iter().all(|v| v.is_finite()) {
+                    bail!("data[{i}].embedding contains non-finite values");
+                }
+                vectors.push(vector);
+            }
+            if vectors[0] == vectors[1] {
+                bail!("distinct inputs produced identical embeddings");
+            }
+            if body["usage"]["prompt_tokens"].as_u64().unwrap_or(0) == 0 {
+                bail!("usage.prompt_tokens must be > 0: {body}");
+            }
+            // The base64 variant must decode to bit-identical floats.
+            let b64: Value = ctx
+                .client
+                .post(format!("http://127.0.0.1:{port}/v1/embeddings"))
+                .bearer_auth(&token)
+                .json(&serde_json::json!({
+                    "model": model_name,
+                    "input": ["Once upon a time", "The little dog"],
+                    "encoding_format": "base64",
+                }))
+                .timeout(GEN_TIMEOUT)
+                .send()
+                .context("POST /v1/embeddings (base64) failed")?
+                .json()
+                .context("base64 embeddings body is not JSON")?;
+            for (i, expected) in vectors.iter().enumerate() {
+                let encoded = b64["data"][i]["embedding"]
+                    .as_str()
+                    .with_context(|| format!("base64 data[{i}].embedding must be a string"))?;
+                use base64::Engine as _;
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(encoded)
+                    .with_context(|| format!("data[{i}].embedding is not valid base64"))?;
+                let (chunks, rest) = bytes.as_chunks::<4>();
+                if !rest.is_empty() {
+                    bail!("data[{i}].embedding payload is not whole f32s");
+                }
+                let decoded: Vec<f32> = chunks.iter().map(|c| f32::from_le_bytes(*c)).collect();
+                if &decoded != expected {
+                    bail!("base64 embedding {i} does not decode to the float variant");
+                }
+            }
+            Ok(())
+        },
+    )?;
+
     // f. kill -9 → port dies → `up` again comes back healthy, proving the
     //    fs4 lock died with the process (never trust the stale pid file).
     let (port, token) = step("kill9: hard kill frees the lock; restart is clean", || {
@@ -454,6 +549,24 @@ fn scenario(ctx: &Ctx, model_path: &Path) -> Result<()> {
     )?;
 
     Ok(())
+}
+
+/// `n_embd` (`<arch>.embedding_length`) straight from a GGUF header — the
+/// oracle for the embeddings step's dimension assertion.
+fn gguf_embedding_length(path: &Path) -> Result<usize> {
+    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let header = onebrain_models::gguf::GgufHeader::parse(&bytes)
+        .map_err(|e| anyhow!("parsing GGUF header of {}: {e}", path.display()))?;
+    let arch = header
+        .architecture()
+        .context("GGUF header declares no architecture")?
+        .to_string();
+    header
+        .metadata
+        .get(&format!("{arch}.embedding_length"))
+        .and_then(onebrain_models::gguf::MetaValue::as_u64)
+        .map(|v| v as usize)
+        .with_context(|| format!("GGUF header has no {arch}.embedding_length"))
 }
 
 /// One checklist entry. On failure the detailed cause is printed here and a

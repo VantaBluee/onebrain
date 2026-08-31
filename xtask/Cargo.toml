@@ -10,7 +10,11 @@ publish = false
 
 [dependencies]
 anyhow = { workspace = true }
+# e2e embeddings step: decode encoding_format="base64" responses and read
+# the smoke model's n_embd from its GGUF header (the dims oracle).
+base64 = { workspace = true }
 clap = { workspace = true }
+onebrain-models = { workspace = true }
 reqwest = { workspace = true }
 serde_json = { workspace = true }
 sha2 = "0.10"
