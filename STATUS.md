@@ -251,8 +251,14 @@ fmt, clippy, tests, CPU smoke inference with a tiny GGUF on all three OSes;
       send audit)
 - [ ] CI green incl. the netem perf DoD (overlap ≤ 0.75× sequential,
       decode ≥ 0.9×) — rides the M7 push
-- [ ] Follow-up queued: switch daemon plan_load to plan_v2 (+ xtask
-      mirror + predicted_tpt_ms updates), own gate + commit
+- [x] Follow-up landed (3ec0a79): plan_load switched to plan_v2;
+      predicted_tpt_ms mirrors v2 (MoE active-units), additive
+      predicted_prefill_ms surfaces the transfer term; xtask mirrors
+      v2's copy-reserve budget. Full gate green, ZERO sim expectation
+      changes (v2's winners == v1's everywhere, tie-break included)
+- Noted: one transient chaos-2 flake (worker-restart → immediate load
+  hit a torn RPC transport once; identical binary green on re-run) —
+  pre-existing timing race, tracked as a separate task
 - Deferred by contract: int8 activation compression (docs/perf.md §9
   records why); per-seq sampler chains for interleaved non-greedy
   (documented divergence class, engine follow-up)
