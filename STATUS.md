@@ -47,7 +47,7 @@ fmt, clippy, tests, CPU smoke inference with a tiny GGUF on all three OSes;
 - [x] Daemon: single-instance fs lock (kill -9 safe), API token, engine-host
       thread, internal control API (status/load/shutdown, always-auth'd)
 - [x] OpenAI dialect (`/v1/*`): chat + text completions (SSE streaming),
-      models; embeddings endpoint present (501 until later in M1.x)
+      models; embeddings endpoint (implemented in the finishing pass)
 - [x] Ollama dialect (`/api/*`): generate/chat (NDJSON streaming default),
       tags/show/ps/pull/version
 - [x] Bearer auth everywhere; loopback exemption (configurable off) never
@@ -62,10 +62,14 @@ fmt, clippy, tests, CPU smoke inference with a tiny GGUF on all three OSes;
 - [x] Fixed on the way: Windows handle-inheritance leak in `onebrain up`
       (captured-output callers would hang forever; see up.rs)
 - [x] e2e green on all three OSes via CI
-- [ ] Manual: unmodified OpenAI SDK script (scripts/check_openai_sdk.py)
-      against a real model — run per OS before tagging
-- [ ] /v1/embeddings implementation (deferred within M1; endpoint returns a
-      clean 501 with remedy until then)
+- [x] Unmodified OpenAI SDK script (scripts/check_openai_sdk.py) proven
+      on Windows against a live daemon (models.list + 32 streamed
+      chunks, exit 0; automated as a gate step) — macOS/Linux runs
+      remain manual pre-tag items
+- [x] /v1/embeddings implemented (post-M8 finishing pass): engine
+      pooled/mean-pool paths, OpenAI float+base64 + Ollama /api/embed,
+      e2e step; distributed targets refuse with a typed 501 + solo
+      remedy (second-context-over-pipelined-RPC unproven — honest)
 
 ## M2 — Mesh & pairing (CI proof met 2026-08-27, incl. netem leg)
 

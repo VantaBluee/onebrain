@@ -10,6 +10,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 M0 (skeleton & CI) complete locally; M1 (excellent single-node) implemented,
 cross-OS CI proof in flight.
 
+### Added — release hardening (post-M8 finishing pass)
+
+- `/v1/embeddings` (and Ollama `/api/embed`) — the last stubbed
+  endpoint: pooled reads for embedding models, a documented mean-pool
+  for generative ones, float and base64 formats; distributed targets
+  refuse with a typed 501 naming the solo fallback rather than
+  returning unverified numbers.
+- Exact sampling under concurrency: every request now owns its own
+  sampler chain, so interleaved temperature>0 requests are
+  byte-identical to running alone (previously a documented divergence).
+- Error terminals now drain behind confirmed-but-undelivered tokens the
+  same way normal finishes do — a stalled client can no longer lose the
+  last tokens of a failing stream.
+- Prefill overlap survived contact with a real network: client-side
+  flow control caps in-flight pipelining at ~2 microbatches (CI's
+  1 Gbit netem leg collapsed 2.5x under unbounded bursts before the
+  cap; with it the ≥25% overlap saving holds). A torn connection during
+  session creation is now a typed error instead of a llama.cpp abort.
+
 ### Added — M8
 
 - Dashboard v1 at the head's `/`: live topology with measured
