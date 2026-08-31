@@ -6,7 +6,13 @@
 //!    n_embd 8192, 2 layers, thin 16-wide attention and a 32-wide FFN —
 //!    a fat hidden state to ship, almost nothing to multiply it by);
 //!  - a bandwidth-paced loopback bridge (default 125 MB/s ≈ the netem
-//!    leg's 1 Gbit) in place of netem, which Windows lacks;
+//!    leg's 1 Gbit) in place of netem, which Windows lacks, with BOUNDED
+//!    path queues (`OB_OVERLAP_QUEUE_KB` per queue, default 4096; two
+//!    queues per direction: sndbuf+qdisc before the wire, rcvbuf after)
+//!    whose producers BLOCK when full — TCP backpressure, the behavior a
+//!    real bounded netem qdisc forces end to end. An optional
+//!    `OB_OVERLAP_DROP_PENALTY_MS` adds a crude per-overflow retransmit
+//!    stall to demonstrate the drop-tail failure mode;
 //!  - a distributed load over one bridged RPC server + the local CPU
 //!    device (the exact 2-node CI topology: worker = first stage remote,
 //!    head = final stage local), n_batch 512 / n_ubatch 64.
@@ -16,8 +22,9 @@
 //! (identical greedy tokens, overlap not slower than 1.35x sequential) so
 //! it stays green on noisy shared runners. Set `OB_OVERLAP_MAX_RATIO`
 //! (e.g. `0.75`) to enforce a ratio locally, `OB_OVERLAP_BW_MBPS` to move
-//! the emulated bandwidth off the 125 MB/s default, and `OB_RPC_TRACE=1`
-//! (with `--nocapture`) for the client-side command timeline.
+//! the emulated bandwidth off the 125 MB/s default, and
+//! `OB_RPC_INFLIGHT_CAP` to move (or 0 to disable) the client's in-flight
+//! byte cap when studying pipelining depth.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -205,54 +212,174 @@ fn build_perf_model() -> Vec<u8> {
 
 // ---- bandwidth-paced loopback bridge (the local stand-in for netem) ----
 
-/// Pace one direction at `bytes_per_sec`, decoupling reads from writes the
-/// way a real network path does: an eager reader drains the source into an
-/// in-memory queue (standing in for the kernel socket buffers + netem
-/// queue, which on the CI leg hold several MiB), while a pacer thread
-/// writes the queue out at wire rate. Without the queue, a receiver that
-/// stops reading while it computes (the single-threaded RPC server) would
-/// stall the SENDER through the tiny default loopback socket buffers,
-/// serializing the very pipeline this test measures. Deadline pacing uses
-/// yield-spinning — Windows `thread::sleep` is far too coarse (~15 ms) for
+/// A byte-bounded blocking FIFO of chunks — the emulation's stand-in for a
+/// BOUNDED network buffer. A producer that finds it full BLOCKS until the
+/// consumer drains it; end to end that is exactly what TCP flow control
+/// does to the sending application. Real netem is a bounded qdisc (default
+/// limit ~1000 packets ≈ 1.5 MB) in front of a bounded kernel rcvbuf —
+/// modeling the path as an unbounded queue is what let the
+/// unbounded-pipelining regression through to CI.
+struct ByteQueue {
+    state: std::sync::Mutex<ByteQueueState>,
+    cond: std::sync::Condvar,
+    cap: usize,
+    /// Crude drop-tail model (off by default; OB_OVERLAP_DROP_PENALTY_MS):
+    /// a producer that finds the queue full first serves this delay per
+    /// overflowing chunk — standing in for the retransmit/recovery stall a
+    /// real tail-drop causes — then blocks for space. A byte relay cannot
+    /// literally drop bytes: real TCP retransmits them and the RPC stream
+    /// must stay intact, so the penalty models the stall, not the loss.
+    overflow_penalty: Duration,
+}
+
+struct ByteQueueState {
+    chunks: std::collections::VecDeque<Vec<u8>>,
+    bytes: usize,
+    closed: bool,
+}
+
+impl ByteQueue {
+    fn new(cap: usize, overflow_penalty: Duration) -> ByteQueue {
+        ByteQueue {
+            state: std::sync::Mutex::new(ByteQueueState {
+                chunks: std::collections::VecDeque::new(),
+                bytes: 0,
+                closed: false,
+            }),
+            cond: std::sync::Condvar::new(),
+            cap,
+            overflow_penalty,
+        }
+    }
+
+    /// Blocking push; a chunk is never split, so a non-empty queue that
+    /// would exceed the cap blocks (one chunk may overshoot an otherwise
+    /// empty queue, like a packet entering an empty qdisc).
+    fn push(&self, chunk: Vec<u8>) {
+        let mut st = self.state.lock().unwrap();
+        if !st.chunks.is_empty() && st.bytes + chunk.len() > self.cap {
+            if !self.overflow_penalty.is_zero() {
+                drop(st);
+                thread::sleep(self.overflow_penalty);
+                st = self.state.lock().unwrap();
+            }
+            while !st.chunks.is_empty() && st.bytes + chunk.len() > self.cap {
+                st = self.cond.wait(st).unwrap();
+            }
+        }
+        st.bytes += chunk.len();
+        st.chunks.push_back(chunk);
+        self.cond.notify_all();
+    }
+
+    /// Blocking pop; `None` once closed and drained.
+    fn pop(&self) -> Option<Vec<u8>> {
+        let mut st = self.state.lock().unwrap();
+        loop {
+            if let Some(chunk) = st.chunks.pop_front() {
+                st.bytes -= chunk.len();
+                self.cond.notify_all();
+                return Some(chunk);
+            }
+            if st.closed {
+                return None;
+            }
+            st = self.cond.wait(st).unwrap();
+        }
+    }
+
+    fn close(&self) {
+        self.state.lock().unwrap().closed = true;
+        self.cond.notify_all();
+    }
+}
+
+/// Per-queue byte bound (`OB_OVERLAP_QUEUE_KB`, default 4096 KiB). The
+/// relay has two bounded queues per direction (sndbuf+qdisc before the
+/// wire, rcvbuf after it), so total path buffering is twice this.
+fn queue_bytes() -> usize {
+    std::env::var("OB_OVERLAP_QUEUE_KB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(4096)
+        * 1024
+}
+
+fn overflow_penalty() -> Duration {
+    Duration::from_millis(
+        std::env::var("OB_OVERLAP_DROP_PENALTY_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0),
+    )
+}
+
+/// The two stream types a relay leg can carry: the accepted loopback
+/// `TcpStream` on every OS, and the bridge end of a [`SocketPair`], which
+/// is `TcpStream` on Windows but `UnixStream` elsewhere — the CI matrix
+/// caught the concrete-`TcpStream` version of this signature.
+trait RelayStream: Read + Write + Send + 'static {
+    fn shutdown_write(&self);
+}
+
+impl RelayStream for TcpStream {
+    fn shutdown_write(&self) {
+        let _ = self.shutdown(std::net::Shutdown::Write);
+    }
+}
+
+#[cfg(unix)]
+impl RelayStream for std::os::unix::net::UnixStream {
+    fn shutdown_write(&self) {
+        let _ = self.shutdown(std::net::Shutdown::Write);
+    }
+}
+
+/// Pace one direction at `bytes_per_sec` through BOUNDED buffers:
+///
+/// ```text
+///   reader -> [pre queue]   -> pacer  -> [post queue] -> writer
+///             (sndbuf+qdisc)   (wire)     (rcvbuf)
+/// ```
+///
+/// Both queues are bounded (`OB_OVERLAP_QUEUE_KB` each) and BLOCK their
+/// producer when full — TCP backpressure end to end: the reader blocking
+/// propagates to the client's `send`, and the pacer blocking on a full
+/// post queue stalls the wire clock exactly as a closed receive window
+/// does. Deadline pacing is banking-free (an idle wire earns no credit —
+/// it cannot send yesterday's unused bytes faster today) and uses
+/// yield-spinning: Windows `thread::sleep` is far too coarse (~15 ms) for
 /// sub-millisecond chunk budgets.
-fn paced_relay(mut from: TcpStream, mut to: TcpStream, bytes_per_sec: f64) {
-    let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+fn paced_relay(mut from: impl RelayStream, mut to: impl RelayStream, bytes_per_sec: f64) {
+    let cap = queue_bytes();
+    let pre = Arc::new(ByteQueue::new(cap, overflow_penalty()));
+    let post = Arc::new(ByteQueue::new(cap, Duration::ZERO));
+
+    let pre_r = Arc::clone(&pre);
     let reader = thread::spawn(move || {
         let mut buf = vec![0u8; 256 * 1024];
         loop {
             match from.read(&mut buf) {
                 Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    if tx.send(buf[..n].to_vec()).is_err() {
-                        break;
-                    }
-                }
+                Ok(n) => pre_r.push(buf[..n].to_vec()),
             }
         }
-        // Dropping tx signals EOF to the pacer.
+        pre_r.close();
     });
-    // The writer stands in for the receiver's kernel socket buffer: the
-    // pacer hands it each chunk exactly when the wire would have delivered
-    // it, and the writer blocks on the destination's (tiny loopback)
-    // buffer without ever stalling the wire clock — just as netem keeps
-    // streaming into Linux's multi-megabyte rcvbuf while the RPC server is
-    // busy computing instead of reading.
-    let (wtx, wrx) = std::sync::mpsc::channel::<Vec<u8>>();
+
+    let post_w = Arc::clone(&post);
     let writer = thread::spawn(move || {
-        while let Ok(chunk) = wrx.recv() {
+        while let Some(chunk) = post_w.pop() {
             if to.write_all(&chunk).is_err() {
                 break;
             }
             let _ = to.flush();
         }
-        let _ = to.shutdown(std::net::Shutdown::Write);
+        to.shutdown_write();
     });
-    // No banking: an idle link earns no credit (a real wire cannot send
-    // yesterday's unused bytes faster today). Each chunk's delivery time is
-    // its serialization delay after the LATER of "now" and the previous
-    // chunk's delivery.
+
     let mut deadline = Instant::now();
-    while let Ok(chunk) = rx.recv() {
+    while let Some(chunk) = pre.pop() {
         let now = Instant::now();
         if deadline < now {
             deadline = now;
@@ -261,11 +388,9 @@ fn paced_relay(mut from: TcpStream, mut to: TcpStream, bytes_per_sec: f64) {
         while Instant::now() < deadline {
             thread::yield_now();
         }
-        if wtx.send(chunk).is_err() {
-            break;
-        }
+        post.push(chunk);
     }
-    drop(wtx);
+    post.close();
     let _ = writer.join();
     let _ = reader.join();
 }
@@ -435,11 +560,12 @@ fn overlap_ratio_timeline() {
     let n_ubatches = PROMPT_TOKENS.div_ceil(N_UBATCH as usize);
     let ratio = ovl.prefill_ms as f64 / seq.prefill_ms.max(1) as f64;
     println!(
-        "overlap-timeline @ {:.0} MB/s emulated wire:\n\
+        "overlap-timeline @ {:.0} MB/s emulated wire, {} KiB path queues:\n\
          sequential: load {} ms, prefill {} ms ({:.1} ms/ubatch), decode {} ms ({} tok)\n\
          overlapped: load {} ms, prefill {} ms ({:.1} ms/ubatch), decode {} ms ({} tok)\n\
          prefill ratio overlap/sequential = {ratio:.3}",
         bytes_per_sec / 1e6,
+        queue_bytes() / 1024,
         seq.load_ms,
         seq.prefill_ms,
         seq.prefill_ms as f64 / n_ubatches as f64,

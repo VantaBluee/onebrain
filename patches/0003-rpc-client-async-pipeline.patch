@@ -13,14 +13,26 @@ MEMSET_TENSOR). Deferring "acks" is therefore free: the response of ANY
 later response-bearing command on the same socket proves every command
 before it fully executed. The patch adds
 
- - a per-socket pending-command ledger (submitted/completed counters — the
-   pending-ack FIFO with implicit, batched acks);
+ - a per-socket pending-command ledger (submitted/completed counters, in
+   commands AND wire bytes — the pending-ack FIFO with implicit, batched
+   acks);
  - pipelined fences ("ack tickets"): event_record puts one
    GET_DEVICE_MEMORY REQUEST on the wire immediately and defers reading
    the response; a later event wait pops tickets in FIFO order, so
    draining to an old marker never waits for work submitted after it.
    Without tickets, a wait-side fence can only wait for the WHOLE queue,
    which re-serializes a deep ubatch train to depth one;
+ - client-side flow control: the unproven in-flight wire bytes are capped
+   at roughly TWO ubatches of traffic (adaptive: 2.5x the largest command
+   of the current burst + 1 MiB, floor 4 MiB, OB_RPC_INFLIGHT_CAP
+   overrides, 0 disables; the learned size resets whenever the ledger
+   fully drains so load-time weight pushes never inflate it). Ubatch k+1
+   streams while ubatch k computes — the entire overlap win — and the
+   client never builds the multi-megabyte unread backlog that overflowed
+   the CI netem leg's bounded qdisc (~1000 packets ≈ 1.5 MB) into
+   tail-drop/retransmit collapse (measured 2.5x SLOWER than sequential).
+   Over-cap sends first pop a ticket, i.e. block until the server has
+   executed one whole earlier ubatch;
  - synchronize as drain-everything; events as markers into the ledger;
    async set/get/cpy tensor entry points;
  - a client-side cache for GET_ALLOC_SIZE responses (resolves upstream's
@@ -28,6 +40,14 @@ before it fully executed. The patch adds
    (FLASH_ATTN_EXT nodes), and any response-bearing round trip must first
    drain every outstanding ticket — cached, steady state issues no
    allocation round trips at all;
+ - a stable non-NULL sentinel from buffer_get_base on a dead socket
+   (patches/0002 gap): a model can outlive its bridge, and the next
+   session's setup walks existing buffers — NULL escalated into
+   upstream's generic GGML_ASSERT(base != NULL) abort. An RPC base is a
+   REMOTE address used only for pointer arithmetic, never dereferenced
+   locally, and every later command on the dead socket fails fast, so a
+   well-aligned sentinel is safe and the failure surfaces as the typed
+   session-creation error instead of an abort;
  - device caps flip to async=true, events=true — exactly what llama.cpp's
    pipeline_parallel gate requires; ggml_backend_rpc_pipeline_enable(false)
    reverts the caps advertisement process-wide (the hook behind OneBrain's
@@ -104,7 +124,7 @@ index e519bdf50..57acd6c0f 100644
                  // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
                  if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
 diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
-index 815e9ad88..248e8bec0 100644
+index 815e9ad88..76b239803 100644
 --- a/ggml/src/ggml-rpc/ggml-rpc.cpp
 +++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
 @@ -6,6 +6,7 @@
@@ -129,7 +149,7 @@ index 815e9ad88..248e8bec0 100644
  
  // all RPC structures must be packed
  #pragma pack(push, 1)
-@@ -348,6 +356,108 @@ static void ob_rpc_log_fail(const char * where) {
+@@ -348,6 +356,174 @@ static void ob_rpc_log_fail(const char * where) {
      }
  }
  
@@ -170,6 +190,13 @@ index 815e9ad88..248e8bec0 100644
 +// error where its signature allows (graph_compute -> GGML_STATUS_FAILED,
 +// cpy -> false), and void paths (synchronize/event_wait) log loudly and let
 +// the next status-returning command on the dead socket fail fast.
++// onebrain: patches/0003: one pipelined fence whose response is still
++// unread — see ob_rpc_pending::tickets.
++struct ob_rpc_ticket {
++    uint64_t marker;       // command count proven executed once popped
++    uint64_t marker_bytes; // wire bytes proven executed once popped
++};
++
 +struct ob_rpc_pending {
 +    // Serializes whole transactions (send, or send+recv) on one socket, so a
 +    // cross-thread event wait can never interleave bytes into another
@@ -180,6 +207,17 @@ index 815e9ad88..248e8bec0 100644
 +    uint64_t submitted = 0;
 +    // Highest `submitted` value proven executed by a later response.
 +    uint64_t completed = 0;
++    // Same ledger in wire bytes: the in-flight window (`bytes_submitted -
++    // bytes_completed`) is what the flow-control cap below bounds.
++    uint64_t bytes_submitted = 0;
++    uint64_t bytes_completed = 0;
++    // Largest single command in the CURRENT burst; feeds the adaptive cap.
++    // Reset whenever the ledger fully drains, so request-response-paced
++    // phases (model load, whose multi-megabyte weight SETs would otherwise
++    // inflate the cap for the whole session) never leak their sizes into
++    // the pipelined phase — the cap always reflects the traffic actually
++    // in flight.
++    uint64_t largest_cmd = 0;
 +    // Pipelined fences ("ack tickets"): positions whose fence REQUEST is
 +    // already on the wire but whose response has not been read yet. The
 +    // server answers a response-bearing command only after executing
@@ -189,8 +227,50 @@ index 815e9ad88..248e8bec0 100644
 +    // order (the server is serial per connection), so this is a FIFO, and
 +    // every response-bearing exchange must pop ALL outstanding tickets
 +    // before reading its own response.
-+    std::deque<uint64_t> tickets;
++    std::deque<ob_rpc_ticket> tickets;
 +};
++
++// onebrain: patches/0003: client-side flow control. Unbounded pipelining is
++// actively harmful on real networks: a client that bursts several ubatches
++// of fire-and-forget SET_TENSOR/GRAPH_COMPUTE bytes while the (serial)
++// server is busy computing builds a multi-megabyte unread backlog along the
++// path. On the CI netem leg (1 Gbit, tc qdisc limit ~1000 packets ≈ 1.5 MB)
++// that backlog turns the receive-window reopening into line-rate bursts
++// that overflow the qdisc — tail drops, retransmit storms, RTO stalls —
++// measured 2.5x SLOWER than the sequential baseline. The fix: bound the
++// unproven ("in-flight") wire bytes to roughly TWO of the largest commands,
++// i.e. exactly deep enough that ubatch k+1 streams while ubatch k computes
++// (the entire overlap win) and no deeper. The sequential baseline routinely
++// carries one ~2 MiB burst per ubatch without trouble, so a two-command
++// window keeps TCP in the same stable regime. Enforcement is one ticket pop
++// per over-cap send — the ticket frees a whole earlier ubatch — and a
++// command larger than the whole cap always passes once the queue is empty
++// (no deadlock). `OB_RPC_INFLIGHT_CAP` overrides the byte floor for
++// experiments; 0 disables the cap.
++static const uint64_t OB_RPC_INFLIGHT_FLOOR = 4ull * 1024 * 1024;
++
++static uint64_t ob_rpc_inflight_cap(const ob_rpc_pending & pending) {
++    static const uint64_t env_cap = [] {
++        const char * v = std::getenv("OB_RPC_INFLIGHT_CAP");
++        return v ? (uint64_t) strtoull(v, nullptr, 10) : OB_RPC_INFLIGHT_FLOOR;
++    }();
++    static const bool disabled = [] {
++        const char * v = std::getenv("OB_RPC_INFLIGHT_CAP");
++        return v && strtoull(v, nullptr, 10) == 0;
++    }();
++    if (disabled) {
++        return UINT64_MAX;
++    }
++    // At least two full UBATCHES of traffic must fit, or the pipeline
++    // degenerates to lock-step (the streamed ubatch could never sit behind
++    // the computing one). An ubatch is one dominant transfer (the largest
++    // command — the boundary/input activation SET) plus secondary commands
++    // (attention mask, serialized graph, fences) that are a fraction of it;
++    // half-the-largest-again plus fixed slack covers them with room for the
++    // mask growing across a long prompt.
++    const uint64_t two_ubatches = 2 * pending.largest_cmd + pending.largest_cmd / 2 + 1024 * 1024;
++    return env_cap > two_ubatches ? env_cap : two_ubatches;
++}
 +
 +static std::mutex ob_rpc_pending_map_mutex;
 +static std::unordered_map<socket_t *, std::pair<std::weak_ptr<socket_t>, std::shared_ptr<ob_rpc_pending>>> ob_rpc_pending_map;
@@ -219,7 +299,7 @@ index 815e9ad88..248e8bec0 100644
 +// desyncs the stream exactly like any other failed response, so the socket
 +// is marked dead (patches/0002) and the caller fails fast from then on.
 +static bool ob_rpc_ticket_pop(const socket_ptr & sock, ob_rpc_pending & pending) {
-+    uint64_t marker = pending.tickets.front();
++    ob_rpc_ticket ticket = pending.tickets.front();
 +    pending.tickets.pop_front();
 +    uint64_t out_size;
 +    rpc_msg_get_device_memory_rsp response;
@@ -229,8 +309,14 @@ index 815e9ad88..248e8bec0 100644
 +        ob_rpc_mark_dead(sock);
 +        return false;
 +    }
-+    if (marker > pending.completed) {
-+        pending.completed = marker;
++    if (ticket.marker > pending.completed) {
++        pending.completed = ticket.marker;
++    }
++    if (ticket.marker_bytes > pending.bytes_completed) {
++        pending.bytes_completed = ticket.marker_bytes;
++    }
++    if (pending.completed == pending.submitted) {
++        pending.largest_cmd = 0; // fully drained: next burst relearns its size
 +    }
 +    return true;
 +}
@@ -238,7 +324,7 @@ index 815e9ad88..248e8bec0 100644
  // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
  // No response
  static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size) {
-@@ -356,6 +466,12 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input,
+@@ -356,6 +532,29 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input,
      if (ob_rpc_is_dead(sock)) {
          return false;
      }
@@ -248,14 +334,32 @@ index 815e9ad88..248e8bec0 100644
 +    // interleaving bytes on the wire.
 +    auto pending = ob_rpc_pending_for(sock);
 +    std::lock_guard<std::recursive_mutex> lock(pending->mtx);
++    const uint64_t wire_bytes = sizeof(uint8_t) + sizeof(uint64_t) + input_size;
++    if (wire_bytes > pending->largest_cmd) {
++        pending->largest_cmd = wire_bytes;
++    }
++    // Flow control (see ob_rpc_inflight_cap): keep the unproven in-flight
++    // window bounded. Each popped ticket blocks only until the server has
++    // executed past that marker, freeing a whole earlier ubatch's bytes.
++    // When no tickets are outstanding (e.g. model load, which is naturally
++    // punctuated by response-bearing commands) the send proceeds — there
++    // is nothing to wait on, and waiting is not needed for correctness.
++    const uint64_t cap = ob_rpc_inflight_cap(*pending);
++    while (!pending->tickets.empty() &&
++           pending->bytes_submitted - pending->bytes_completed + wire_bytes > cap) {
++        if (!ob_rpc_ticket_pop(sock, *pending)) {
++            return false;
++        }
++    }
      uint8_t cmd_byte = cmd;
      if (!sock->send_data(&cmd_byte, sizeof(cmd_byte)) ||
          !sock->send_data(&input_size, sizeof(input_size)) ||
-@@ -364,15 +480,38 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input,
+@@ -364,15 +563,40 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input,
          ob_rpc_mark_dead(sock); // onebrain: error-return semantics (patches/0002)
          return false;
      }
 +    pending->submitted++;
++    pending->bytes_submitted += wire_bytes;
      return true;
  }
  
@@ -286,16 +390,23 @@ index 815e9ad88..248e8bec0 100644
 +    // The server is serial and in-order per connection: this command's
 +    // response proves every command submitted before it (itself included)
 +    // has fully executed — the implicit ack that drains the pending FIFO.
-+    uint64_t fence = pending->submitted;
++    uint64_t fence       = pending->submitted;
++    uint64_t fence_bytes = pending->bytes_submitted;
      uint64_t out_size;
      if (!sock->recv_data(&out_size, sizeof(out_size)) ||
          out_size != output_size ||
-@@ -382,9 +521,109 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input,
+@@ -382,9 +606,115 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input,
          ob_rpc_mark_dead(sock);
          return false;
      }
 +    if (fence > pending->completed) {
 +        pending->completed = fence; // onebrain: patches/0003 implicit ack
++    }
++    if (fence_bytes > pending->bytes_completed) {
++        pending->bytes_completed = fence_bytes;
++    }
++    if (pending->completed == pending->submitted) {
++        pending->largest_cmd = 0; // fully drained: next burst relearns its size
 +    }
      return true;
  }
@@ -363,7 +474,7 @@ index 815e9ad88..248e8bec0 100644
 +    // The marker includes the fence command itself: the server has run it
 +    // by the time the response exists, and nothing else moved `submitted`
 +    // (the transaction lock is held).
-+    pending->tickets.push_back(pending->submitted);
++    pending->tickets.push_back({pending->submitted, pending->bytes_submitted});
 +}
 +
 +// onebrain: patches/0003: drain everything currently submitted on `sock`.
@@ -400,7 +511,33 @@ index 815e9ad88..248e8bec0 100644
  // RPC client-side implementation
  
  // Performs HELLO handshake with transport auto-negotiation.
-@@ -711,6 +950,36 @@ static size_t ggml_backend_rpc_get_max_size(ggml_backend_buffer_type_t buft) {
+@@ -467,10 +797,22 @@ static void * ggml_backend_rpc_buffer_get_base(ggml_backend_buffer_t buffer) {
+     rpc_msg_buffer_get_base_rsp response;
+     bool status = send_rpc_cmd(ctx->sock, RPC_CMD_BUFFER_GET_BASE, &request, sizeof(request), &response, sizeof(response));
+     if (!status) { // onebrain: error-return semantics (patches/0002)
+-        // Residual: ggml_backend_buffer_get_base asserts base != NULL, but the
+-        // base is cached at load time — mid-generation this path never runs.
++        // A buffer can outlive its bridge (a tear between requests leaves
++        // loaded models holding buffers on a dead socket), and the next
++        // session/graph allocation then asks for the base of a buffer whose
++        // socket is gone. Returning NULL here escalates into upstream's
++        // generic `GGML_ASSERT(base != NULL)` (ggml-backend.cpp) — an abort.
++        // Return a stable, well-aligned NON-NULL sentinel instead and cache
++        // it like a real base. Safety: an RPC "base" is a REMOTE address the
++        // client only ever uses for pointer arithmetic (allocator offsets,
++        // serialized back into rpc_tensor.data) — it is never dereferenced
++        // locally, and every later command carrying a sentinel-derived
++        // address fails fast on the dead socket (patches/0002) before it
++        // could reach a live server. The 1 MiB alignment satisfies any
++        // backend's alignment the allocators may assert on.
+         ob_rpc_log_fail(__func__);
+-        return nullptr;
++        ctx->base_ptr = reinterpret_cast<void *>((uintptr_t) 1 << 20);
++        return ctx->base_ptr;
+     }
+     ctx->base_ptr = reinterpret_cast<void *>(response.base_ptr);
+     return ctx->base_ptr;
+@@ -711,6 +1053,36 @@ static size_t ggml_backend_rpc_get_max_size(ggml_backend_buffer_type_t buft) {
      return buft_ctx->max_size;
  }
  
@@ -437,7 +574,7 @@ index 815e9ad88..248e8bec0 100644
  static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
      // should we query the remote server for the actual size
      bool rpc_get = false;
-@@ -738,16 +1007,44 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
+@@ -738,16 +1110,44 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
              request.srcs[i] = serialize_tensor(tensor->src[i]);
          }
  
@@ -483,7 +620,7 @@ index 815e9ad88..248e8bec0 100644
          return response.alloc_size;
      }
  
-@@ -776,8 +1073,142 @@ static void ggml_backend_rpc_free(ggml_backend_t backend) {
+@@ -776,8 +1176,142 @@ static void ggml_backend_rpc_free(ggml_backend_t backend) {
  }
  
  static void ggml_backend_rpc_synchronize(ggml_backend_t backend) {
@@ -627,7 +764,7 @@ index 815e9ad88..248e8bec0 100644
  }
  
  static void add_tensor(ggml_tensor * tensor, const ggml_cgraph * cgraph, std::vector<rpc_tensor> & tensors, std::unordered_set<ggml_tensor*> & visited) {
-@@ -865,19 +1296,20 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
+@@ -865,19 +1399,20 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
  static ggml_backend_i ggml_backend_rpc_interface = {
      /* .get_name                = */ ggml_backend_rpc_name,
      /* .free                    = */ ggml_backend_rpc_free,
@@ -653,7 +790,7 @@ index 815e9ad88..248e8bec0 100644
      /* .graph_optimize          = */ NULL,
  };
  
-@@ -2055,15 +2487,43 @@ static void ggml_backend_rpc_device_get_props(ggml_backend_dev_t dev, struct ggm
+@@ -2055,15 +2590,43 @@ static void ggml_backend_rpc_device_get_props(ggml_backend_dev_t dev, struct ggm
      props->description = ggml_backend_rpc_device_get_description(dev);
      props->type        = ggml_backend_rpc_device_get_type(dev);
      ggml_backend_rpc_device_get_memory(dev, &props->memory_free, &props->memory_total);
@@ -699,7 +836,7 @@ index 815e9ad88..248e8bec0 100644
  static ggml_backend_t ggml_backend_rpc_device_init(ggml_backend_dev_t dev, const char * params) {
      ggml_backend_rpc_device_context * ctx = (ggml_backend_rpc_device_context *)dev->context;
  
-@@ -2109,9 +2569,10 @@ static const struct ggml_backend_device_i ggml_backend_rpc_device_i = {
+@@ -2109,9 +2672,10 @@ static const struct ggml_backend_device_i ggml_backend_rpc_device_i = {
      /* .supports_op          = */ ggml_backend_rpc_device_supports_op,
      /* .supports_buft        = */ ggml_backend_rpc_device_supports_buft,
      /* .offload_op           = */ NULL,

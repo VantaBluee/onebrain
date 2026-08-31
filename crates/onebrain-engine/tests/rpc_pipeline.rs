@@ -257,6 +257,57 @@ fn teardown_with_pending_acks_does_not_hang() {
     );
 }
 
+/// A model can outlive its bridge: a tear BETWEEN requests leaves loaded
+/// weights (and KV/compute buffers) on sockets in the dead registry, and
+/// the next thing to touch them may be SESSION CREATION, not a decode —
+/// context setup walks existing buffers (`buffer_get_base`) and allocates
+/// new ones on the dead socket. This is the exact shape of the CI crash:
+/// `transport failure in ggml_backend_rpc_buffer_get_base` followed by
+/// upstream's `GGML_ASSERT(base != NULL)` abort. With the 0002/0003
+/// sentinel-base fix, creating a session on a torn model must fail with
+/// the typed `EngineError::SessionCreate` — never an abort — and freeing
+/// the model afterwards must stay silent and prompt.
+#[test]
+fn session_create_on_torn_model_is_an_error_not_an_abort() {
+    let Ok(model_path) = std::env::var("OB_SMOKE_MODEL") else {
+        eprintln!("OB_SMOKE_MODEL not set; skipping rpc session-after-tear test");
+        return;
+    };
+    let model_path = Path::new(&model_path);
+    let dev_index = cpu_device_index();
+
+    let bridge = Bridge::spawn(dev_index);
+    let endpoint = format!("127.0.0.1:{}", bridge.port);
+    let server = RemoteServer::register(&endpoint).expect("register bridged rpc server");
+
+    let model = load_distributed(model_path, &server);
+    // A healthy session + decode first, so the tear lands on a model whose
+    // buffers are real and warm (bases cached for some, not for others).
+    {
+        let mut session =
+            Session::new(&model, &pipeline_session_params()).expect("healthy session");
+        session
+            .decode(&long_prompt(&model)[..N_BATCH as usize])
+            .expect("healthy decode");
+    }
+    bridge.kill_all();
+
+    // Session creation on the torn model: context setup asks for buffer
+    // bases and fresh allocations over the dead bridge. It must surface as
+    // the typed error, not abort the process.
+    match Session::new(&model, &pipeline_session_params()) {
+        Err(EngineError::SessionCreate) => {}
+        Ok(_) => panic!("session creation over a torn bridge unexpectedly succeeded"),
+        Err(other) => panic!("expected EngineError::SessionCreate, got {other:?}"),
+    }
+
+    drop(model);
+    bridge.finish_join(
+        Duration::from_secs(10),
+        "session-after-tear (frees over the dead bridge must stay clean)",
+    );
+}
+
 /// 0002 composition: tear the bridge while the pending ledger holds work
 /// from a pipelined decode. The next decode must fail with the typed
 /// `EngineError::Decode` (a pending ack that fails surfaces as an error on

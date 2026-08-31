@@ -72,11 +72,15 @@ Residual abort paths (each unreachable in OneBrain's flows because the
 retry design never loads or computes through an already-dead bridge — new
 epochs bridge through fresh connections):
 
-1. `ggml_backend_rpc_buffer_get_base` returns nullptr on failure, and
+1. ~~`ggml_backend_rpc_buffer_get_base` returns nullptr on failure, and
    upstream `ggml_backend_buffer_get_base` (ggml-backend.cpp) asserts
-   `base != NULL`. Only reachable at load/alloc time: the base pointer is
-   cached in the buffer context on first use, so mid-generation this RPC
-   never happens.
+   `base != NULL`.~~ CLOSED by patch 0003: a model can outlive its bridge
+   (a tear between requests), and the next session's setup walks existing
+   buffers — CI hit exactly this abort. `get_base` now returns a stable,
+   well-aligned non-NULL sentinel on a dead socket; an RPC base is a
+   remote address used only for pointer arithmetic (never dereferenced
+   locally), and every later command on the dead socket fails fast, so
+   the failure surfaces as the typed session-creation error.
 2. `ggml_backend_rpc_buffer_type` returns nullptr when the
    alignment/max-size queries fail, and several upstream `GGML_ASSERT(buft)`
    call sites (ggml-backend.cpp) would then fire during model LOAD. Left
@@ -137,6 +141,24 @@ round trip per ubatch. This patch adds:
   the pipeline to depth one. Tickets are strictly FIFO with the stream,
   so every response-bearing exchange pops all outstanding tickets before
   reading its own response;
+- client-side flow control (`ob_rpc_inflight_cap`): the ledger also
+  counts wire BYTES, and fire-and-forget sends keep the unproven
+  in-flight window at roughly TWO ubatches of traffic (adaptive:
+  2.5× the largest command of the current burst + 1 MiB, floor 4 MiB;
+  the learned size resets whenever the ledger fully drains, so the
+  request-response-paced model load never inflates the cap with weight
+  push sizes; `OB_RPC_INFLIGHT_CAP` overrides the floor, `0` disables).
+  Rationale, measured the hard way: UNBOUNDED pipelining collapsed on the
+  CI netem leg — a client bursting ~4 ubatches (~9 MiB) of unread backlog
+  turns the receiver's window reopening into line-rate bursts that
+  overflow the bounded netem qdisc (default ~1000 packets ≈ 1.5 MB):
+  tail drops, retransmit storms, RTO stalls, overlapped prefill 2.5x
+  SLOWER than sequential with huge variance. Two ubatches is exactly deep
+  enough that ubatch k+1 streams while ubatch k computes — the entire
+  overlap win — and keeps TCP in the same stable regime as the
+  sequential baseline (which carries one ~2 MiB burst per ubatch without
+  trouble). An over-cap send first pops a ticket, i.e. blocks until the
+  server has executed one whole earlier ubatch;
 - `synchronize` = drain everything submitted on the backend's socket;
   `event_wait`/`event_synchronize` = drain to the recorded marker
   (tickets first, then — only if the ledger still cannot prove the
@@ -161,6 +183,21 @@ round trip per ubatch. This patch adds:
   ticket, i.e. one full pipeline stall per graph. Cached, steady state
   issues no allocation round trips at all. Bounded (4096 entries,
   clear-on-overflow); failed exchanges are never cached;
+- `buffer_get_base` on a dead socket returns a stable, well-aligned
+  non-NULL sentinel (cached like a real base) instead of NULL, closing a
+  patch-0002 gap CI hit: a model can outlive its bridge, and the next
+  session's setup walks existing buffers straight into upstream's generic
+  `GGML_ASSERT(base != NULL)` abort. An RPC base is a REMOTE address the
+  client only ever uses for pointer arithmetic — never dereferenced
+  locally — and every later command carrying a sentinel-derived address
+  fails fast on the dead socket, so the failure surfaces as the typed
+  session-creation error (asserted by
+  `session_create_on_torn_model_is_an_error_not_an_abort`). The other
+  post-tear escalation sites were audited: `alloc_buffer` → nullptr fails
+  graph/context creation cleanly; alignment/max-size live in the cached
+  buffer type (never re-queried); `get_alloc_size` falls back to
+  `ggml_nbytes`; `init_tensor`'s failed status is tolerated by the
+  allocator; device memory 0/0 falls back to host memory in llama;
 - device caps flip to `async = true, events = true`, which is exactly what
   `llama_context`'s pipeline-parallel gate checks. With our distributed
   loads (n_devices > 1, split-mode layer, full offload, offload_kqv, no
