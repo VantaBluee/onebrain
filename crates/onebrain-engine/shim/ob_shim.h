@@ -159,11 +159,20 @@ typedef struct ob_session_params {
     // 8 = Q8_0). llama.cpp's default is F16 for both.
     int32_t  type_k;
     int32_t  type_v;
+    // Mirrors enum llama_pooling_type: -1 UNSPECIFIED (the model's own
+    // declared pooling; generative models resolve to 0 NONE), 1 MEAN,
+    // 2 CLS, 3 LAST. Only meaningful with `embeddings = true`; llama.cpp's
+    // default is -1.
+    int32_t  pooling_type;
     // One KV buffer shared across sequences: required for the §6 unified-KV
     // admission headroom math. llama.cpp's default is false.
     bool     kv_unified;
     // Offload KQV ops (incl. the KV cache) to GPU. llama.cpp default: true.
     bool     offload_kqv;
+    // Extract embeddings from decodes (llama_context_params.embeddings).
+    // llama.cpp's default is false; a false session is bit-for-bit the
+    // pre-embeddings generation context.
+    bool     embeddings;
 } ob_session_params;
 
 // Returns NULL on failure (including p == NULL).
@@ -193,6 +202,30 @@ void ob_session_set_sampler(ob_session * s, float temp, float top_p,
                             int32_t top_k, uint32_t seed);
 // Sample from the last decoded logits with the configured chain.
 int32_t ob_sample(ob_session * s);
+
+// ---- standalone sampler chains (per-sequence sampling) ----
+// One chain per generation, owned by the caller instead of the session:
+// interleaved sampled sequences each keep their own RNG/chain state, so a
+// request behaves identically whether it runs alone or interleaved.
+// llama_sampler_chain_init takes only chain params (verified in the pinned
+// llama.h) — a chain is context-independent and may be built before any
+// session exists and sampled against any context.
+typedef struct ob_sampler ob_sampler;
+
+// Build a standalone chain with EXACTLY the ob_session_set_sampler
+// construction (one shared builder in the .c, so they cannot drift):
+// temp <= 0 selects pure greedy; otherwise top-k (k <= 0 disables) ->
+// top-p (p >= 1 disables) -> temp -> dist(seed). Returns NULL on
+// allocation failure.
+ob_sampler * ob_sampler_new(float temp, float top_p, int32_t top_k, uint32_t seed);
+void ob_sampler_free(ob_sampler * smp);
+// Reset the chain's internal state (the dist sampler reseeds to its
+// creation seed, replaying the draw sequence from the start).
+void ob_sampler_reset(ob_sampler * smp);
+// ob_sample_ith with THIS chain instead of the session's built-in one:
+// sample from the logits of batch token index i of s's most recent decode
+// (same index contract; -1 = last output).
+int32_t ob_sampler_sample_ith(ob_session * s, ob_sampler * smp, int32_t i);
 
 // ---- explicit multi-sequence batches (docs/perf.md §2) ----
 // A reusable token batch with per-token position, sequence id, and logits
@@ -229,6 +262,31 @@ int32_t ob_decode_batch(ob_session * s, const ob_batch * b);
 // token index i (only valid for indexes pushed with logits=true in the
 // most recent decode; -1 = last output).
 int32_t ob_sample_ith(ob_session * s, int32_t i);
+
+// ---- embeddings (M1 /v1/embeddings) ----
+// Only meaningful on a session created with `embeddings = true`; the safe
+// Rust wrapper (Session::embed) owns the decode/pooling protocol.
+
+// The session's RESOLVED pooling type (enum llama_pooling_type): the
+// creation-time UNSPECIFIED (-1) has been replaced by the model's own
+// declared pooling by now (0 NONE for generative models). Lets the caller
+// pick the read path before decoding: > 0 means llama pools per sequence
+// and ob_embeddings_seq works; 0 means only per-token rows exist.
+int32_t ob_session_pooling(const ob_session * s);
+
+// Copy the pooled embedding of `seq_id` from the most recent decode into
+// buf (exactly n_embd floats). Returns n_embd on success; -1 when the
+// context holds no pooled row for the sequence (pooling NONE, no decode
+// yet, or RANK pooling — rerankers emit n_cls_out ranks, not an n_embd
+// vector, so they are refused here rather than over-read); -2 when
+// buf_len < n_embd (nothing written).
+int32_t ob_embeddings_seq(ob_session * s, int32_t seq_id, float * buf, int32_t buf_len);
+
+// Copy the per-token embedding of batch output index `i` from the most
+// recent decode into buf (exactly n_embd floats). Same return contract as
+// ob_embeddings_seq (-1 covers an invalid index or a context that produced
+// no per-token rows).
+int32_t ob_embeddings_ith(ob_session * s, int32_t i, float * buf, int32_t buf_len);
 
 // ---- per-sequence KV surgery (docs/perf.md §2) ----
 // Thin wrappers over llama_memory_seq_*. p0/p1 follow upstream range

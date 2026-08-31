@@ -175,6 +175,11 @@ ob_session * ob_session_new(ob_model * m, const ob_session_params * p) {
     params.flash_attn_type = (enum llama_flash_attn_type) p->flash_attn_type;
     params.type_k = (enum ggml_type) p->type_k;
     params.type_v = (enum ggml_type) p->type_v;
+    // Embeddings surface (M1 /v1/embeddings): both values default to
+    // llama.cpp's own (-1 UNSPECIFIED / false), so a params struct that
+    // does not opt in reproduces the pre-embeddings context bit-for-bit.
+    params.pooling_type = (enum llama_pooling_type) p->pooling_type;
+    params.embeddings = p->embeddings;
     params.kv_unified = p->kv_unified;
     params.offload_kqv = p->offload_kqv;
 
@@ -256,12 +261,15 @@ void ob_session_reset(ob_session * s) {
     llama_sampler_reset(s->sampler);
 }
 
-void ob_session_set_sampler(ob_session * s, float temp, float top_p,
-                            int32_t top_k, uint32_t seed) {
+// The ONE chain construction, shared by the session chain and standalone
+// ob_sampler objects so the two can never drift: temp <= 0 is pure greedy;
+// otherwise top-k -> top-p -> temp -> dist(seed).
+static struct llama_sampler * ob_build_chain(float temp, float top_p,
+                                             int32_t top_k, uint32_t seed) {
     struct llama_sampler * chain =
         llama_sampler_chain_init(llama_sampler_chain_default_params());
     if (chain == NULL) {
-        return; // keep the existing chain rather than crash
+        return NULL;
     }
     if (temp <= 0.0f) {
         llama_sampler_chain_add(chain, llama_sampler_init_greedy());
@@ -275,8 +283,53 @@ void ob_session_set_sampler(ob_session * s, float temp, float top_p,
         llama_sampler_chain_add(chain, llama_sampler_init_temp(temp));
         llama_sampler_chain_add(chain, llama_sampler_init_dist(seed));
     }
+    return chain;
+}
+
+void ob_session_set_sampler(ob_session * s, float temp, float top_p,
+                            int32_t top_k, uint32_t seed) {
+    struct llama_sampler * chain = ob_build_chain(temp, top_p, top_k, seed);
+    if (chain == NULL) {
+        return; // keep the existing chain rather than crash
+    }
     llama_sampler_free(s->sampler);
     s->sampler = chain;
+}
+
+// ---- standalone sampler chains (per-sequence sampling) ----
+
+struct ob_sampler {
+    struct llama_sampler * chain;
+};
+
+ob_sampler * ob_sampler_new(float temp, float top_p, int32_t top_k, uint32_t seed) {
+    struct llama_sampler * chain = ob_build_chain(temp, top_p, top_k, seed);
+    if (chain == NULL) {
+        return NULL;
+    }
+    ob_sampler * smp = calloc(1, sizeof(ob_sampler));
+    if (smp == NULL) {
+        llama_sampler_free(chain);
+        return NULL;
+    }
+    smp->chain = chain;
+    return smp;
+}
+
+void ob_sampler_free(ob_sampler * smp) {
+    if (smp == NULL) {
+        return;
+    }
+    llama_sampler_free(smp->chain);
+    free(smp);
+}
+
+void ob_sampler_reset(ob_sampler * smp) {
+    llama_sampler_reset(smp->chain);
+}
+
+int32_t ob_sampler_sample_ith(ob_session * s, ob_sampler * smp, int32_t i) {
+    return llama_sampler_sample(smp->chain, s->ctx, i);
 }
 
 int32_t ob_sample(ob_session * s) {
@@ -349,6 +402,42 @@ int32_t ob_decode_batch(ob_session * s, const ob_batch * b) {
 
 int32_t ob_sample_ith(ob_session * s, int32_t i) {
     return llama_sampler_sample(s->sampler, s->ctx, i);
+}
+
+// ---- embeddings (M1 /v1/embeddings) ----
+
+int32_t ob_session_pooling(const ob_session * s) {
+    return (int32_t) llama_pooling_type(s->ctx);
+}
+
+// Shared copy-out for both embedding readers: full n_embd rows only, no
+// partial writes (a truncated embedding is silently wrong, not smaller).
+static int32_t ob_copy_embd(const ob_session * s, const float * emb,
+                            float * buf, int32_t buf_len) {
+    const int32_t n_embd = llama_model_n_embd(llama_get_model(s->ctx));
+    if (buf == NULL || buf_len < n_embd || n_embd <= 0) {
+        return -2;
+    }
+    if (emb == NULL) {
+        return -1;
+    }
+    memcpy(buf, emb, (size_t) n_embd * sizeof(float));
+    return n_embd;
+}
+
+int32_t ob_embeddings_seq(ob_session * s, int32_t seq_id, float * buf, int32_t buf_len) {
+    // RANK pooling emits float[n_cls_out] (reranker scores), not an n_embd
+    // vector: copying n_embd floats would over-read. Refuse instead —
+    // OneBrain never creates RANK contexts, so this only guards models
+    // that declare RANK themselves.
+    if (llama_pooling_type(s->ctx) == LLAMA_POOLING_TYPE_RANK) {
+        return -1;
+    }
+    return ob_copy_embd(s, llama_get_embeddings_seq(s->ctx, seq_id), buf, buf_len);
+}
+
+int32_t ob_embeddings_ith(ob_session * s, int32_t i, float * buf, int32_t buf_len) {
+    return ob_copy_embd(s, llama_get_embeddings_ith(s->ctx, i), buf, buf_len);
 }
 
 // ---- per-sequence KV surgery (docs/perf.md §2) ----

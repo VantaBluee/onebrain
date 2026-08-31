@@ -385,8 +385,21 @@ fn paced_relay(mut from: impl RelayStream, mut to: impl RelayStream, bytes_per_s
             deadline = now;
         }
         deadline += Duration::from_secs_f64(chunk.len() as f64 / bytes_per_sec);
+        // Windows needs yield-spinning (thread::sleep is ~15 ms coarse);
+        // everywhere else sleep to the deadline — spinning pacer threads
+        // oversubscribe the 3-core macOS CI runners and starve the very
+        // compute this test times (macos-14 measured ratio 1.45 from
+        // pacer-thread contention alone).
+        #[cfg(windows)]
         while Instant::now() < deadline {
             thread::yield_now();
+        }
+        #[cfg(not(windows))]
+        {
+            let now = Instant::now();
+            if now < deadline {
+                thread::sleep(deadline - now);
+            }
         }
         post.push(chunk);
     }

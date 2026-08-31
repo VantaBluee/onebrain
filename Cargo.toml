@@ -47,6 +47,9 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 postcard = { version = "1", features = ["alloc", "use-std"] }
+# OpenAI /v1/embeddings encoding_format="base64" (already in-tree
+# transitively; pinned here for the API layer and the e2e check).
+base64 = "0.22"
 directories = "6"
 toml = "0.8"
 blake3 = "1"

@@ -112,6 +112,28 @@ pub enum EngineError {
          back by clearing the whole sequence instead."
     )]
     SeqRemove { seq_id: i32, p0: i32, p1: i32 },
+    #[error(
+        "this session cannot produce embeddings; create it with \
+         SessionParams {{ embeddings: true, .. }}"
+    )]
+    NotEmbeddingSession,
+    #[error("embedding input produced no tokens; provide non-empty text")]
+    EmbedEmptyInput,
+    #[error(
+        "embedding input is {got} tokens but this model pools embeddings over a single \
+         batch of at most {max}; shorten the input or raise the session's batch size"
+    )]
+    EmbedInputTooLong { got: usize, max: usize },
+    #[error(
+        "the engine produced no embedding rows for the decoded input; the model may not \
+         support embedding extraction (rerankers emit ranks, not embeddings)"
+    )]
+    EmbedOutput,
+    #[error(
+        "failed to allocate a sampler chain; the process is out of memory — \
+         free memory and retry the request"
+    )]
+    SamplerAlloc,
     #[error("RPC tensor cache directory path contains an interior NUL byte: {0}")]
     BadCacheDir(String),
     #[error(
@@ -633,6 +655,39 @@ impl KvCacheType {
     }
 }
 
+/// How an embeddings context pools per-token states into one vector per
+/// sequence (mirrors `enum llama_pooling_type`; only meaningful with
+/// [`SessionParams::embeddings`]). `Unspecified` defers to the model's own
+/// declared pooling (GGUF metadata): purpose-built embedding models
+/// resolve to their trained head (mean/CLS/last), generative models
+/// resolve to no pooling — [`Session::embed`] then mean-pools per-token
+/// rows in Rust. RANK (rerankers) is deliberately not exposed: its pooled
+/// output is classification scores, not an `n_embd` vector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PoolingType {
+    /// Use the model's own declared pooling (llama.cpp's default).
+    #[default]
+    Unspecified,
+    /// No pooling: only per-token embedding rows exist.
+    None,
+    Mean,
+    Cls,
+    Last,
+}
+
+impl PoolingType {
+    fn code(self) -> i32 {
+        // llama_pooling_type enum values (llama.h); the shim casts back.
+        match self {
+            PoolingType::Unspecified => -1,
+            PoolingType::None => 0,
+            PoolingType::Mean => 1,
+            PoolingType::Cls => 2,
+            PoolingType::Last => 3,
+        }
+    }
+}
+
 /// Options for creating a [`Session`] (perf contract, docs/perf.md §2).
 ///
 /// The `Default` values reproduce the pre-M7 session EXACTLY (each new
@@ -665,6 +720,13 @@ pub struct SessionParams {
     pub type_v: KvCacheType,
     /// Offload the KQV ops (including the KV cache) to GPU backends.
     pub offload_kqv: bool,
+    /// Extract embeddings from decodes ([`Session::embed`]). Off by
+    /// default: a `false` session is bit-for-bit the pre-embeddings
+    /// generation context, and `embed` on it fails typed.
+    pub embeddings: bool,
+    /// Sequence pooling for an embeddings context; ignored by the engine
+    /// when `embeddings` is off.
+    pub pooling: PoolingType,
 }
 
 impl Default for SessionParams {
@@ -682,6 +744,8 @@ impl Default for SessionParams {
             type_k: KvCacheType::F16,
             type_v: KvCacheType::F16,
             offload_kqv: true,
+            embeddings: false,
+            pooling: PoolingType::Unspecified,
         }
     }
 }
@@ -697,8 +761,10 @@ impl SessionParams {
             flash_attn_type: self.flash_attn_type.code(),
             type_k: self.type_k.code(),
             type_v: self.type_v.code(),
+            pooling_type: self.pooling.code(),
             kv_unified: self.kv_unified,
             offload_kqv: self.offload_kqv,
+            embeddings: self.embeddings,
         }
     }
 }
@@ -723,6 +789,54 @@ impl Default for SamplerParams {
             top_k: 40,
             seed: 0xFFFF_FFFF, // llama.cpp's "random seed" sentinel
         }
+    }
+}
+
+/// A standalone sampler chain, independent of any [`Session`].
+///
+/// The chain construction is EXACTLY [`Session::set_sampler`]'s (one shared
+/// builder in the shim, so the two cannot drift): `temperature <= 0` is pure
+/// greedy, otherwise top-k → top-p → temp → dist(seed). Chains are
+/// context-independent (`llama_sampler_chain_init` takes only chain params,
+/// verified in the pinned llama.h): a `Sampler` may be created before any
+/// session exists and sampled against any session via
+/// [`Session::sample_ith_with`].
+///
+/// This is the per-sequence sampling primitive: a caller serving concurrent
+/// sequences holds one `Sampler` per sequence, so each sequence's RNG/chain
+/// state advances independently and a sampled request behaves identically
+/// whether it runs alone or interleaved.
+pub struct Sampler {
+    ptr: *mut sys::ObSampler,
+}
+
+// The chain owns plain heap state with no thread affinity.
+unsafe impl Send for Sampler {}
+
+impl Sampler {
+    /// Build a chain from `params`. Fails typed only on allocation failure
+    /// (OOM-class).
+    pub fn new(params: &SamplerParams) -> Result<Sampler, EngineError> {
+        init();
+        let ptr = unsafe {
+            sys::ob_sampler_new(params.temperature, params.top_p, params.top_k, params.seed)
+        };
+        if ptr.is_null() {
+            return Err(EngineError::SamplerAlloc);
+        }
+        Ok(Sampler { ptr })
+    }
+
+    /// Reset the chain's internal state: the dist sampler reseeds to its
+    /// creation seed, replaying the draw sequence from the start.
+    pub fn reset(&mut self) {
+        unsafe { sys::ob_sampler_reset(self.ptr) };
+    }
+}
+
+impl Drop for Sampler {
+    fn drop(&mut self) {
+        unsafe { sys::ob_sampler_free(self.ptr) };
     }
 }
 
@@ -902,6 +1016,7 @@ pub struct Session<'m> {
     model: &'m Model,
     n_batch: u32,
     n_seq_max: u32,
+    embeddings: bool,
 }
 
 unsafe impl Send for Session<'_> {}
@@ -918,6 +1033,7 @@ impl<'m> Session<'m> {
             model,
             n_batch: params.n_batch.max(1),
             n_seq_max: params.n_seq_max.max(1),
+            embeddings: params.embeddings,
         })
     }
 
@@ -990,12 +1106,21 @@ impl<'m> Session<'m> {
     /// with `logits = true` in the most recently decoded batch (`-1` means
     /// the last logits-bearing token).
     ///
-    /// The sampler chain is shared across sequences; that is sound for
-    /// greedy (stateless) sampling, which is all the multi-sequence path
-    /// uses (docs/perf.md §6 — concurrent decode asserts greedy
-    /// determinism). Per-sequence sampler state is the caller's concern.
+    /// The SESSION's chain is one object shared across sequences, which is
+    /// only sound when its state does not matter (greedy is stateless).
+    /// Callers serving concurrent sampled sequences hold one standalone
+    /// [`Sampler`] per sequence and use [`Session::sample_ith_with`]
+    /// instead, so each sequence's chain state advances independently.
     pub fn sample_ith(&mut self, i: i32) -> Token {
         unsafe { sys::ob_sample_ith(self.ptr, i) }
+    }
+
+    /// [`Session::sample_ith`] with a caller-owned standalone [`Sampler`]
+    /// instead of the session's built-in chain — the per-sequence sampling
+    /// primitive (see [`Sampler`]). Same index contract; the session's own
+    /// chain is neither read nor advanced.
+    pub fn sample_ith_with(&mut self, sampler: &mut Sampler, i: i32) -> Token {
+        unsafe { sys::ob_sampler_sample_ith(self.ptr, sampler.ptr, i) }
     }
 
     /// Remove positions `[p0, p1)` of `seq_id` from the KV memory (negative
@@ -1145,6 +1270,107 @@ impl<'m> Session<'m> {
         Ok(stats)
     }
 
+    /// Embed one input: decode `tokens` as a fresh sequence and return its
+    /// pooled embedding — exactly `n_embd` floats (M1 `/v1/embeddings`).
+    ///
+    /// Requires a session created with `SessionParams { embeddings: true }`
+    /// (typed error otherwise). Two paths, chosen by the context's RESOLVED
+    /// pooling type:
+    ///
+    /// - **Engine-pooled** (the model declares a pooling head, or the
+    ///   session asked for an explicit [`PoolingType`]): the whole input is
+    ///   decoded in ONE call — the pooling graph reduces over a single
+    ///   batch, so a chunked decode would silently embed only the last
+    ///   chunk — and the engine's own pooled sequence row is returned.
+    ///   Inputs beyond `n_batch` tokens fail typed.
+    /// - **Mean-pool fallback** (pooling resolved to NONE — every
+    ///   generative model under the default `Unspecified`): per-token
+    ///   embedding rows are MEAN-POOLED here in Rust, the standard trick
+    ///   for embedding with a generative model. The decode is chunked (KV
+    ///   carries the prefix, so each token's row is identical to the
+    ///   single-shot value under causal attention) to bound the transient
+    ///   output buffer, which this llama build sizes at
+    ///   `n_vocab + n_embd` floats PER OUTPUT ROW.
+    ///
+    /// The session's KV is reset on entry (each input embeds
+    /// independently) and left holding this input afterwards. Vectors are
+    /// returned raw (un-normalized); unit-norm parity with OpenAI is the
+    /// serving layer's choice.
+    pub fn embed(&mut self, tokens: &[Token]) -> Result<Vec<f32>, EngineError> {
+        /// Mean-pool decode chunk cap: bounds the per-decode output buffer
+        /// (`(n_vocab + n_embd) × 4` bytes per row — ~256 MiB per 512
+        /// tokens on a 128k-vocab model) without changing any row's value.
+        const EMBED_CHUNK: usize = 512;
+
+        if !self.embeddings {
+            return Err(EngineError::NotEmbeddingSession);
+        }
+        if tokens.is_empty() {
+            return Err(EngineError::EmbedEmptyInput);
+        }
+        let n_embd = self.model.n_embd().max(0) as usize;
+        if n_embd == 0 {
+            return Err(EngineError::EmbedOutput);
+        }
+        self.reset();
+        let mut out = vec![0f32; n_embd];
+
+        if unsafe { sys::ob_session_pooling(self.ptr) } > 0 {
+            let max = self.n_batch as usize;
+            if tokens.len() > max {
+                return Err(EngineError::EmbedInputTooLong {
+                    got: tokens.len(),
+                    max,
+                });
+            }
+            // want_logits = true leaves the batch's output flags NULL,
+            // which an embeddings context reads as "output every token"
+            // (llama.h batch docs) — required input for the pooling graph.
+            let status =
+                unsafe { sys::ob_decode(self.ptr, tokens.as_ptr(), tokens.len() as i32, true) };
+            if status != 0 {
+                return Err(EngineError::Decode { status });
+            }
+            let n = unsafe { sys::ob_embeddings_seq(self.ptr, 0, out.as_mut_ptr(), n_embd as i32) };
+            if n != n_embd as i32 {
+                // Declared pooling but no pooled row (RANK, or an engine
+                // regression): honest typed error, never a zero vector.
+                return Err(EngineError::EmbedOutput);
+            }
+            return Ok(out);
+        }
+
+        // Mean-pool fallback. f64 accumulation keeps long inputs from
+        // losing low-order bits; the result is cast back to the engine's
+        // own f32.
+        let mut acc = vec![0f64; n_embd];
+        let mut row = vec![0f32; n_embd];
+        let chunk_len = (self.n_batch as usize).min(EMBED_CHUNK);
+        for chunk in tokens.chunks(chunk_len) {
+            let status =
+                unsafe { sys::ob_decode(self.ptr, chunk.as_ptr(), chunk.len() as i32, true) };
+            if status != 0 {
+                return Err(EngineError::Decode { status });
+            }
+            for i in 0..chunk.len() {
+                let n = unsafe {
+                    sys::ob_embeddings_ith(self.ptr, i as i32, row.as_mut_ptr(), n_embd as i32)
+                };
+                if n != n_embd as i32 {
+                    return Err(EngineError::EmbedOutput);
+                }
+                for (a, v) in acc.iter_mut().zip(row.iter()) {
+                    *a += f64::from(*v);
+                }
+            }
+        }
+        let inv = 1.0 / tokens.len() as f64;
+        for (o, a) in out.iter_mut().zip(acc.iter()) {
+            *o = (a * inv) as f32;
+        }
+        Ok(out)
+    }
+
     /// Convenience loop: prefill `prompt_tokens`, then greedily generate up
     /// to `max_new`, invoking `on_token` per generated token. Returns the
     /// generated tokens (EOG excluded).
@@ -1245,12 +1471,23 @@ mod tests {
         assert_eq!(p.type_k, KvCacheType::F16);
         assert_eq!(p.type_v, KvCacheType::F16);
         assert!(p.offload_kqv, "llama.cpp default offload_kqv = true");
+        assert!(!p.embeddings, "llama.cpp default embeddings = false");
+        assert_eq!(
+            p.pooling,
+            PoolingType::Unspecified,
+            "llama.cpp default pooling_type = UNSPECIFIED"
+        );
         // The enum codes the shim casts back into llama/ggml enums.
         assert_eq!(FlashAttnType::Auto.code(), -1);
         assert_eq!(KvCacheType::F32.code(), 0);
         assert_eq!(KvCacheType::F16.code(), 1);
         assert_eq!(KvCacheType::Q4_0.code(), 2);
         assert_eq!(KvCacheType::Q8_0.code(), 8);
+        assert_eq!(PoolingType::Unspecified.code(), -1);
+        assert_eq!(PoolingType::None.code(), 0);
+        assert_eq!(PoolingType::Mean.code(), 1);
+        assert_eq!(PoolingType::Cls.code(), 2);
+        assert_eq!(PoolingType::Last.code(), 3);
     }
 
     /// Batch bookkeeping without a model: capacity and seq-id bounds fail
@@ -1454,5 +1691,232 @@ mod tests {
         );
         assert_eq!(stats.drafted, 0, "speculative counters are 0 until §5");
         assert_eq!(stats.accepted, 0, "speculative counters are 0 until §5");
+    }
+
+    /// A standalone [`Sampler`] must reproduce the session-chain path
+    /// byte-for-byte: same chain construction, same seed semantics (the
+    /// shim shares one builder, and this pins it observably). Greedy
+    /// standalone chains must equal `sample_greedy` too.
+    #[test]
+    fn smoke_standalone_sampler_matches_session_chain() {
+        let Ok(model_path) = std::env::var("OB_SMOKE_MODEL") else {
+            eprintln!("OB_SMOKE_MODEL not set; skipping standalone sampler smoke test");
+            return;
+        };
+        let model = Model::load(Path::new(&model_path), &ModelParams::default()).unwrap();
+        let prompt = model.tokenize("Once upon a time", true).unwrap();
+        let params = SessionParams {
+            n_ctx: 256,
+            n_batch: 64,
+            ..SessionParams::default()
+        };
+        let sampler_params = SamplerParams {
+            temperature: 0.8,
+            top_p: 0.95,
+            top_k: 40,
+            seed: 42,
+        };
+
+        // Oracle: the session's own chain via set_sampler + generate.
+        let mut chain_session = Session::new(&model, &params).unwrap();
+        chain_session.set_sampler(&sampler_params);
+        let mut expected = Vec::new();
+        chain_session
+            .generate(&prompt, 12, |t, _| {
+                expected.push(t);
+                std::ops::ControlFlow::Continue(())
+            })
+            .unwrap();
+        assert!(!expected.is_empty(), "the oracle run must emit tokens");
+
+        // Same loop shape (sample → EOG check → confirming decode) with a
+        // standalone Sampler against a fresh session.
+        let mut session = Session::new(&model, &params).unwrap();
+        let mut sampler = Sampler::new(&sampler_params).unwrap();
+        session.decode(&prompt).unwrap();
+        let mut got = Vec::new();
+        for _ in 0..12 {
+            let tok = session.sample_ith_with(&mut sampler, -1);
+            if model.is_eog(tok) {
+                break;
+            }
+            session.decode(&[tok]).unwrap();
+            got.push(tok);
+        }
+        assert_eq!(
+            got, expected,
+            "a standalone Sampler must reproduce the session chain exactly"
+        );
+
+        // reset() replays the draw sequence: re-decoding the same prompt on
+        // a reset session with a reset sampler reproduces the same tokens.
+        session.reset();
+        sampler.reset();
+        session.decode(&prompt).unwrap();
+        let mut replay = Vec::new();
+        for _ in 0..12 {
+            let tok = session.sample_ith_with(&mut sampler, -1);
+            if model.is_eog(tok) {
+                break;
+            }
+            session.decode(&[tok]).unwrap();
+            replay.push(tok);
+        }
+        assert_eq!(replay, expected, "reset must replay the seeded draws");
+
+        // Greedy standalone chain == sample_greedy on the same logits.
+        let mut greedy_session = Session::new(&model, &params).unwrap();
+        let mut greedy = Sampler::new(&SamplerParams {
+            temperature: 0.0,
+            ..SamplerParams::default()
+        })
+        .unwrap();
+        greedy_session.decode(&prompt).unwrap();
+        assert_eq!(
+            greedy_session.sample_ith_with(&mut greedy, -1),
+            greedy_session.sample_greedy(),
+            "a greedy standalone chain must equal the built-in greedy sampler"
+        );
+    }
+
+    /// Max absolute element difference between two embeddings.
+    fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
+        a.iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0, f32::max)
+    }
+
+    /// The embeddings surface end-to-end on the tiny model: the mean-pool
+    /// fallback (stories260K is causal with no pooling head, so the default
+    /// `Unspecified` resolves to NONE), the engine-pooled path (explicit
+    /// MEAN), chunked-vs-single-shot equivalence, and the typed refusals.
+    #[test]
+    fn smoke_embeddings() {
+        let Ok(model_path) = std::env::var("OB_SMOKE_MODEL") else {
+            eprintln!("OB_SMOKE_MODEL not set; skipping embeddings smoke test");
+            return;
+        };
+        let model = Model::load(Path::new(&model_path), &ModelParams::default()).unwrap();
+        let n_embd = model.n_embd() as usize;
+        assert!(n_embd > 0);
+        let short = model.tokenize("Once upon a time", true).unwrap();
+        let other = model.tokenize("The little dog barked", true).unwrap();
+        // Longer than the fallback session's n_batch below, to force a
+        // chunked mean-pool decode.
+        let long = model
+            .tokenize(&"once upon a time ".repeat(30), true)
+            .unwrap();
+        assert!(long.len() > 64);
+
+        // Fallback path: embeddings on, pooling left Unspecified.
+        let mut fallback = Session::new(
+            &model,
+            &SessionParams {
+                n_ctx: 1024,
+                n_batch: 64,
+                embeddings: true,
+                ..SessionParams::default()
+            },
+        )
+        .unwrap();
+        let e_short = fallback.embed(&short).unwrap();
+        assert_eq!(e_short.len(), n_embd, "embedding must be n_embd wide");
+        assert!(e_short.iter().all(|v| v.is_finite()));
+        assert!(
+            e_short.iter().any(|v| *v != 0.0),
+            "embedding must not be the zero vector"
+        );
+        assert_eq!(
+            e_short,
+            fallback.embed(&short).unwrap(),
+            "embedding must be deterministic"
+        );
+        let e_other = fallback.embed(&other).unwrap();
+        assert_ne!(e_short, e_other, "different texts must embed differently");
+
+        // Chunked mean-pool (n_batch 64) must match a single-shot decode of
+        // the same input (causal rows depend only on their prefix; only
+        // f32 graph-order noise may differ).
+        let e_long_chunked = fallback.embed(&long).unwrap();
+        let mut single = Session::new(
+            &model,
+            &SessionParams {
+                n_ctx: 1024,
+                n_batch: 1024,
+                n_ubatch: 1024,
+                embeddings: true,
+                ..SessionParams::default()
+            },
+        )
+        .unwrap();
+        let e_long_single = single.embed(&long).unwrap();
+        let diff = max_abs_diff(&e_long_chunked, &e_long_single);
+        assert!(
+            diff < 1e-3,
+            "chunked and single-shot mean-pool diverged (max abs diff {diff})"
+        );
+
+        // Engine-pooled path: explicit MEAN makes llama pool the sequence
+        // itself; it must agree with the Rust mean of the same rows.
+        let mut pooled = Session::new(
+            &model,
+            &SessionParams {
+                n_ctx: 256,
+                n_batch: 64,
+                n_ubatch: 64,
+                embeddings: true,
+                pooling: PoolingType::Mean,
+                ..SessionParams::default()
+            },
+        )
+        .unwrap();
+        let e_pooled = pooled.embed(&short).unwrap();
+        assert_eq!(e_pooled.len(), n_embd);
+        let diff = max_abs_diff(&e_pooled, &e_short);
+        assert!(
+            diff < 1e-3,
+            "engine MEAN pooling and the Rust mean-pool fallback diverged \
+             (max abs diff {diff})"
+        );
+        // The pooled path cannot chunk: over-long input fails typed.
+        match pooled.embed(&long) {
+            Err(EngineError::EmbedInputTooLong { got, max: 64 }) if got == long.len() => {}
+            other => panic!("expected EmbedInputTooLong, got {other:?}"),
+        }
+
+        // A generation session refuses embed typed; empty input too.
+        let mut gen = Session::new(
+            &model,
+            &SessionParams {
+                n_ctx: 256,
+                n_batch: 64,
+                ..SessionParams::default()
+            },
+        )
+        .unwrap();
+        match gen.embed(&short) {
+            Err(EngineError::NotEmbeddingSession) => {}
+            other => panic!("expected NotEmbeddingSession, got {other:?}"),
+        }
+        match fallback.embed(&[]) {
+            Err(EngineError::EmbedEmptyInput) => {}
+            other => panic!("expected EmbedEmptyInput, got {other:?}"),
+        }
+
+        // The generation surface is untouched by an embeddings session
+        // having existed: greedy output on a fresh default session matches
+        // a fresh run (bit-identical defaults contract).
+        let mut a = Session::new(
+            &model,
+            &SessionParams {
+                n_ctx: 256,
+                n_batch: 64,
+                ..SessionParams::default()
+            },
+        )
+        .unwrap();
+        let toks = a.generate_greedy(&short, 8, |_, _| {}).unwrap();
+        assert!(!toks.is_empty());
     }
 }

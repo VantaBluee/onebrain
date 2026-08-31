@@ -18,6 +18,11 @@ pub struct ObBatch {
     _private: [u8; 0],
 }
 
+#[repr(C)]
+pub struct ObSampler {
+    _private: [u8; 0],
+}
+
 /// Mirror of the shim-owned `ob_session_params` (shim/ob_shim.h). This is
 /// deliberately NOT a llama.cpp struct: the shim defines it and this crate
 /// compiles both sides, so the definitions can only drift together. Field
@@ -33,8 +38,10 @@ pub struct ObSessionParams {
     pub flash_attn_type: i32,
     pub type_k: i32,
     pub type_v: i32,
+    pub pooling_type: i32,
     pub kv_unified: bool,
     pub offload_kqv: bool,
+    pub embeddings: bool,
 }
 
 extern "C" {
@@ -93,6 +100,18 @@ extern "C" {
     pub fn ob_batch_n_tokens(b: *const ObBatch) -> i32;
     pub fn ob_decode_batch(s: *mut ObSession, b: *const ObBatch) -> i32;
     pub fn ob_sample_ith(s: *mut ObSession, i: i32) -> i32;
+    // Standalone sampler chains (per-sequence sampling): context-independent
+    // chain objects owned by the caller; contracts in ob_shim.h.
+    pub fn ob_sampler_new(temp: f32, top_p: f32, top_k: i32, seed: u32) -> *mut ObSampler;
+    pub fn ob_sampler_free(smp: *mut ObSampler);
+    pub fn ob_sampler_reset(smp: *mut ObSampler);
+    pub fn ob_sampler_sample_ith(s: *mut ObSession, smp: *mut ObSampler, i: i32) -> i32;
+    // Embeddings (M1 /v1/embeddings). The safe wrapper (Session::embed)
+    // owns the decode/pooling protocol; contracts in ob_shim.h.
+    pub fn ob_session_pooling(s: *const ObSession) -> i32;
+    pub fn ob_embeddings_seq(s: *mut ObSession, seq_id: i32, buf: *mut f32, buf_len: i32) -> i32;
+    pub fn ob_embeddings_ith(s: *mut ObSession, i: i32, buf: *mut f32, buf_len: i32) -> i32;
+
     pub fn ob_memory_seq_rm(s: *mut ObSession, seq_id: i32, p0: i32, p1: i32) -> bool;
     pub fn ob_memory_seq_cp(s: *mut ObSession, seq_id_src: i32, seq_id_dst: i32, p0: i32, p1: i32);
     pub fn ob_memory_seq_keep(s: *mut ObSession, seq_id: i32);
