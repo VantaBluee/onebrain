@@ -335,3 +335,113 @@ jobs:
           name: onebrain-${{ matrix.os }}
           path: dist/**
           if-no-files-found: error
+
+  # M8 §5 rehearsal: build every installer artifact exactly as release.yml
+  # will — .msi on Windows, .deb + .rpm on Ubuntu, the release tarball/zip
+  # everywhere — on PRs and main, WITHOUT publishing anything, so a tag
+  # never discovers WiX/deb/rpm config rot or installer-script breakage
+  # first. Deliberately mirrors release.yml's dist job step-for-step
+  # (including NO -Dwarnings: the test job owns the warnings gate; this job
+  # rehearses the release build as it will actually run).
+  release-dry-run:
+    name: release-dry-run (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, ubuntu-22.04, windows-2022]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 75
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout (with vendored llama.cpp submodule)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}
+
+      # Same MAX_PATH mitigation as the gpu-compile job / release.yml.
+      - name: Shorten target dir (Windows path-length limit)
+        if: runner.os == 'Windows'
+        run: echo "CARGO_TARGET_DIR=D:\t" >> "$GITHUB_ENV"
+
+      # No tag here, so the workspace version stands in for it (release.yml
+      # asserts the two agree at tag time). cargo pkgid output is
+      # ...#name@x.y.z, or ...#x.y.z when the dir name matches the package.
+      - name: Resolve workspace version
+        id: version
+        run: |
+          id="$(cargo pkgid -p onebrain-cli)"
+          ver="${id##*#}"
+          ver="${ver##*@}"
+          echo "ver=${ver}" >> "$GITHUB_OUTPUT"
+
+      - name: cargo xtask dist
+        run: cargo xtask dist
+
+      - name: Package archive (as release.yml will)
+        run: |
+          mkdir -p dist/upload
+          cd dist
+          target="$(rustc -vV | sed -n 's/host: //p')"
+          stage="onebrain-v${{ steps.version.outputs.ver }}-${target}"
+          test -d "$stage"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            7z a "upload/${stage}.zip" "$stage"
+          else
+            tar -czf "upload/${stage}.tar.gz" "$stage"
+          fi
+
+      # WiX v4 pinned to the 4.x line, exactly as release.yml does. The MSI
+      # ProductVersion must be numeric x.y.z (prerelease suffix stripped).
+      - name: Build .msi (WiX v4, dry run)
+        if: runner.os == 'Windows'
+        run: |
+          dotnet tool install --global wix --version 4.0.5
+          ver="${{ steps.version.outputs.ver }}"
+          msi_ver="${ver%%-*}"
+          target="$(rustc -vV | sed -n 's/host: //p')"
+          wix build -arch x64 \
+            -d Version="$msi_ver" \
+            -d BinDir="dist/onebrain-v${ver}-${target}" \
+            wix/onebrain.wxs \
+            -o "dist/upload/onebrain-v${ver}-${target}.msi"
+
+      # deb/rpm from [package.metadata.*] in crates/onebrain-cli/Cargo.toml;
+      # --no-build reuses the release binary xtask dist just built.
+      - name: Build .deb and .rpm (dry run)
+        if: runner.os == 'Linux'
+        run: |
+          cargo install cargo-deb cargo-generate-rpm --locked
+          cargo deb -p onebrain-cli --no-build -o dist/upload/
+          cargo generate-rpm -p crates/onebrain-cli -o dist/upload/
+
+      # shellcheck is preinstalled on ubuntu runners; the installer script
+      # must stay clean (product.md DoD).
+      - name: Lint install.sh (bash -n + shellcheck)
+        if: runner.os == 'Linux'
+        run: |
+          bash -n install.sh
+          shellcheck install.sh
+
+      # Formula syntax gate (ruby ships on the macOS runners). Real formula
+      # audits need a tap; syntax rot is what bites first.
+      - name: Validate Homebrew formula (ruby -c)
+        if: runner.os == 'macOS'
+        run: ruby -c Formula/onebrain.rb
+
+      - name: Upload dry-run installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-dry-run-${{ matrix.os }}
+          path: dist/upload/*
+          if-no-files-found: error
+          retention-days: 7

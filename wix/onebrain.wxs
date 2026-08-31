@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  OneBrain Windows installer (WiX v4) - docs/product.md section 4.
+
+  Built by release.yml (and rehearsed by ci.yml's release-dry-run job):
+
+    wix build -arch x64 -d Version=<x.y.z> -d BinDir=<staged dist dir> \
+      wix/onebrain.wxs -o dist/upload/onebrain-<tag>-x86_64-pc-windows-msvc.msi
+
+  Version MUST be numeric x.y.z: MSI ProductVersion rejects semver
+  prerelease suffixes, so the workflow strips them (the .msi FILE name
+  keeps the full tag). BinDir points at xtask dist's staged directory so
+  the MSI packages the exact binary the tarballs ship.
+
+  What installing does: puts onebrain.exe in Program Files\OneBrain,
+  appends that directory to the SYSTEM PATH (removed again on uninstall -
+  Permanent="no"), and registers the standard Add/Remove Programs entry
+  every MSI gets for free.
+
+  UpgradeCode is this product's permanent identity: NEVER change it, or
+  new versions stop replacing old installs. Component GUIDs are likewise
+  stable so upgrades count as the same component, not a new one.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="OneBrain"
+           Manufacturer="OneBrain contributors"
+           Version="$(var.Version)"
+           UpgradeCode="F541FD34-F4CE-4ADD-80DA-BE23193D16EA"
+           Language="1033"
+           Scope="perMachine"
+           Compressed="yes">
+
+    <SummaryInformation Description="OneBrain - one logical machine for local AI" />
+
+    <!-- AllowSameVersionUpgrades keeps re-running the same .msi idempotent
+         (repair semantics) instead of erroring with "already installed". -->
+    <MajorUpgrade AllowSameVersionUpgrades="yes"
+                  DowngradeErrorMessage="A newer version of OneBrain is already installed. Uninstall it first to downgrade." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="OneBrain">
+        <Component Id="OnebrainExe" Guid="C1F5C46E-B7F2-41B6-8848-B39036B6E024">
+          <File Id="OnebrainExeFile" Source="$(var.BinDir)/onebrain.exe" KeyPath="yes" />
+          <!-- System PATH so `onebrain` works in any new shell; Part="last"
+               appends rather than clobbering. -->
+          <Environment Id="OnebrainPathEntry"
+                       Name="PATH"
+                       Value="[INSTALLFOLDER]"
+                       Action="set"
+                       Part="last"
+                       Permanent="no"
+                       System="yes" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+
+    <Feature Id="Main" Title="OneBrain" Level="1">
+      <ComponentRef Id="OnebrainExe" />
+    </Feature>
+  </Package>
+</Wix>

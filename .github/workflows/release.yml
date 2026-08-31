@@ -1,6 +1,19 @@
-# OneBrain release — tag-triggered (v*). Builds `cargo xtask dist` on the
-# three OSes and attaches the archives to a draft GitHub release. Artifacts
-# are unsigned for now; signing arrives in M8.
+# OneBrain release — tag-triggered (v*), the M8 §5 pipeline (docs/product.md).
+#
+# On tag vX.Y.Z[-pre.N]:
+#   1. dist matrix (4 targets): `cargo xtask dist`, archive the staged dir as
+#      onebrain-<tag>-<target>.tar.gz (.zip on Windows), plus the per-OS
+#      installers — .msi (WiX v4 via dotnet tool), .deb + .rpm (cargo-deb /
+#      cargo-generate-rpm, configs in crates/onebrain-cli/Cargo.toml).
+#   2. release job: merge ONE SHA256SUMS over every published file, sign it
+#      KEYLESSLY with cosign (GitHub OIDC → sigstore; no key exists to leak),
+#      publish a GitHub release with verification one-liners in the body.
+#
+# The tag IS the version (§4: installers get the version from the tag): an
+# early step fails the build if the tag != v<workspace version>, so artifact
+# names, MSI/deb/rpm versions, and `onebrain --version` all agree. The tag
+# ritual lives in RELEASING.md. ci.yml's release-dry-run job rehearses the
+# installer builds on PRs so a tag never discovers config rot first.
 
 name: Release
 
@@ -9,19 +22,33 @@ on:
     tags:
       - "v*"
 
+# Least privilege at the workflow level; the release job elevates itself.
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   dist:
-    name: dist (${{ matrix.os }})
+    name: dist (${{ matrix.target }})
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-15, ubuntu-22.04, windows-2022]
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+          # Intel macOS: macos-13 (the contract's suggestion) was retired by
+          # GitHub in Dec 2025; macos-15-intel is the supported Intel image
+          # (announced Aug 2025, available into 2027).
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          # 22.04, not 24.04: release binaries must link the oldest glibc we
+          # support (see ci.yml's cache note on __isoc23_* symbols).
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     defaults:
@@ -38,63 +65,191 @@ jobs:
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # MSBuild's FileTracker still enforces MAX_PATH; the llama.cpp CMake
+      # build nests deep enough inside cargo's OUT_DIR to blow past 260
+      # chars (see ci.yml's gpu-compile job). A short target dir fixes it.
+      - name: Shorten target dir (Windows path-length limit)
+        if: runner.os == 'Windows'
+        run: echo "CARGO_TARGET_DIR=D:\t" >> "$GITHUB_ENV"
+
+      # Refuse to build artifacts that lie about their version: the tag must
+      # equal v<workspace version> (cargo pkgid needs no build; the format is
+      # ...#name@x.y.z, or ...#x.y.z when the dir name matches the package).
+      - name: Version must match the tag
+        id: version
+        run: |
+          id="$(cargo pkgid -p onebrain-cli)"
+          ver="${id##*#}"
+          ver="${ver##*@}"
+          if [ "v${ver}" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match workspace version v${ver} — bump [workspace.package].version and re-tag (see RELEASING.md)"
+            exit 1
+          fi
+          echo "ver=${ver}" >> "$GITHUB_OUTPUT"
+
+      # Guards a mislabeled runner (e.g. an Intel image quietly going arm64):
+      # every artifact is named after matrix.target, so the host must BE it.
+      - name: Assert runner arch matches the target triple
+        run: |
+          host="$(rustc -vV | sed -n 's/host: //p')"
+          test "$host" = "${{ matrix.target }}"
 
       - name: cargo xtask dist
         run: cargo xtask dist
 
       - name: Verify staged binary runs (--version)
         run: |
-          bin="$(find dist -type f \( -name onebrain -o -name onebrain.exe \) | head -n 1)"
+          stage="dist/onebrain-v${{ steps.version.outputs.ver }}-${{ matrix.target }}"
+          test -d "$stage"
+          bin="$(find "$stage" -maxdepth 1 -type f \( -name onebrain -o -name onebrain.exe \))"
           test -n "$bin"
           "$bin" --version
 
-      # Stage dirs are dist/onebrain-v<version>-<target>/ — archive each one.
-      - name: Package archives
+      # Naming scheme (consumed by install.sh and Formula/onebrain.rb):
+      #   onebrain-<tag>-<target>.tar.gz   (zip on Windows)
+      # where <tag> = v<version>, matching xtask dist's stage dir.
+      - name: Package archive
         run: |
+          mkdir -p dist/upload
           cd dist
-          for d in onebrain-*/ ; do
-            d="${d%/}"
-            if [ "$RUNNER_OS" = "Windows" ]; then
-              7z a "${d}.zip" "$d"
-            else
-              tar -czf "${d}.tar.gz" "$d"
-            fi
-          done
+          stage="onebrain-v${{ steps.version.outputs.ver }}-${{ matrix.target }}"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            7z a "upload/${stage}.zip" "$stage"
+          else
+            tar -czf "upload/${stage}.tar.gz" "$stage"
+          fi
 
-      - name: Upload archives
+      # Windows installer: WiX v4 as a dotnet tool. Pinned to the 4.x line —
+      # an unpinned install pulls WiX 5/6 and the contract says v4. The MSI
+      # ProductVersion must be numeric x.y.z, so prerelease suffixes are
+      # stripped there; the FILE name keeps the full tag.
+      - name: Build .msi (WiX v4)
+        if: runner.os == 'Windows'
+        run: |
+          dotnet tool install --global wix --version 4.0.5
+          ver="${{ steps.version.outputs.ver }}"
+          msi_ver="${ver%%-*}"
+          wix build -arch x64 \
+            -d Version="$msi_ver" \
+            -d BinDir="dist/onebrain-v${ver}-${{ matrix.target }}" \
+            wix/onebrain.wxs \
+            -o "dist/upload/onebrain-v${ver}-${{ matrix.target }}.msi"
+
+      # Linux packages from [package.metadata.deb] / [package.metadata.
+      # generate-rpm] in the CLI crate. --no-build: xtask dist already put
+      # the release binary in target/release. cargo install (not a binary
+      # download) keeps the toolchain path boring; rust-cache caches the
+      # installed binaries in ~/.cargo/bin.
+      - name: Build .deb and .rpm
+        if: runner.os == 'Linux'
+        run: |
+          cargo install cargo-deb cargo-generate-rpm --locked
+          cargo deb -p onebrain-cli --no-build -o dist/upload/
+          cargo generate-rpm -p crates/onebrain-cli -o dist/upload/
+
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: onebrain-${{ matrix.os }}
-          path: |
-            dist/*.tar.gz
-            dist/*.zip
+          name: onebrain-${{ matrix.target }}
+          path: dist/upload/*
           if-no-files-found: error
 
   release:
-    name: draft release
+    name: publish release
     needs: dist
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    permissions:
+      contents: write # create the release and attach assets
+      id-token: write # sigstore keyless: prove this workflow's OIDC identity
+    defaults:
+      run:
+        shell: bash
     steps:
       - name: Checkout (gh needs repo context)
         uses: actions/checkout@v4
 
-      - name: Download all dist archives
+      - name: Download all dist artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
 
-      - name: Create draft GitHub release
+      # ONE SHA256SUMS covering every published file, computed here — after
+      # the upload/download round-trip — so it attests exactly the bytes a
+      # user will get. Per-target artifact names cannot collide.
+      - name: Merge SHA256SUMS
+        run: |
+          mkdir out
+          find artifacts -type f -exec mv {} out/ \;
+          cd out
+          sha256sum -- * > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      # Keyless signing: the GitHub OIDC token binds the signature to THIS
+      # repo + workflow + tag via a short-lived Fulcio certificate. There is
+      # no private key to store, rotate, or leak; verifiers pin the workflow
+      # identity instead (one-liner in the release body).
+      - name: Sign SHA256SUMS (cosign keyless)
+        run: |
+          cosign sign-blob --yes \
+            --output-signature out/SHA256SUMS.sig \
+            --output-certificate out/SHA256SUMS.pem \
+            out/SHA256SUMS
+
+      # Prerelease tags (anything with a hyphen, e.g. v0.1.0-rc.1) publish
+      # as GitHub prereleases: visible for validation, never `latest`, so
+      # install.sh keeps resolving the last stable release.
+      - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-        shell: bash
         run: |
-          shopt -s nullglob
-          files=(artifacts/*/*.tar.gz artifacts/*/*.zip)
-          test "${#files[@]}" -gt 0
-          gh release create "$GITHUB_REF_NAME" \
-            --draft \
+          tag="${GITHUB_REF_NAME}"
+          cat > notes.md.tpl <<'EOF'
+          ## Install
+
+          - **macOS / Linux**: `curl -fsSL https://raw.githubusercontent.com/__REPO__/__TAG__/install.sh | bash`
+          - **Windows**: download and run `onebrain-__TAG__-x86_64-pc-windows-msvc.msi`
+          - **Debian/Ubuntu**: `sudo dpkg -i` the `.deb` &nbsp;·&nbsp; **Fedora/RHEL**: `sudo rpm -i` the `.rpm`
+          - **Homebrew**: `Formula/onebrain.rb` in the repo (tap instructions in RELEASING.md)
+
+          ## Verify what you downloaded
+
+          Every file above is listed in `SHA256SUMS`, which is signed keylessly
+          (sigstore) by this repository's release workflow — no maintainer key
+          exists to leak.
+
+          **1. Checksum** (macOS: use `shasum -a 256 -c` instead):
+
+          ```sh
+          sha256sum --check --ignore-missing SHA256SUMS
+          ```
+
+          **2. Signature** ([cosign](https://docs.sigstore.dev/)) — proves
+          `SHA256SUMS` was produced by this repo's release workflow for this
+          tag, not uploaded by hand from a compromised account:
+
+          ```sh
+          cosign verify-blob \
+            --certificate SHA256SUMS.pem \
+            --signature SHA256SUMS.sig \
+            --certificate-identity "https://github.com/__REPO__/.github/workflows/release.yml@refs/tags/__TAG__" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            SHA256SUMS
+          ```
+          EOF
+          sed -e "s|__TAG__|${tag}|g" -e "s|__REPO__|${GITHUB_REPOSITORY}|g" \
+            notes.md.tpl > notes.md
+          prerelease=()
+          case "$tag" in *-*) prerelease=(--prerelease) ;; esac
+          gh release create "$tag" \
             --verify-tag \
-            --title "$GITHUB_REF_NAME" \
-            --notes "Draft release for $GITHUB_REF_NAME. Artifacts are unsigned; signing lands in M8." \
-            "${files[@]}"
+            --title "$tag" \
+            --notes-file notes.md \
+            "${prerelease[@]}" \
+            out/*
