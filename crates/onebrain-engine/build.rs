@@ -59,6 +59,17 @@ fn main() {
         "cargo:rerun-if-changed={}",
         vendor.join("include/llama.h").display()
     );
+    // The vendor files the maintained patches modify: editing them in the
+    // working tree (patch development) must retrigger the CMake build, or
+    // an edit after a successful build silently tests stale objects.
+    for patched in [
+        "ggml/include/ggml-rpc.h",
+        "ggml/src/ggml-rpc/ggml-rpc.cpp",
+        "ggml/src/ggml-backend.cpp",
+        "src/llama-context.cpp",
+    ] {
+        println!("cargo:rerun-if-changed={}", vendor.join(patched).display());
+    }
     println!("cargo:rerun-if-env-changed=OB_GGML_NATIVE");
     println!("cargo:rerun-if-env-changed=OB_CUDA_ARCHS");
 

@@ -30,6 +30,9 @@ struct ob_session {
     // scratch copy so callers can pass const slices.
     int32_t * scratch;
     int32_t   scratch_cap;
+    // All-zero per-token output flags for want_logits = false decodes
+    // (llama treats a NULL logits array as "output the last token").
+    int8_t  * scratch_logits;
 };
 
 static void ob_null_logger(enum ggml_log_level level, const char * text, void * user) {
@@ -206,10 +209,12 @@ void ob_session_free(ob_session * s) {
     llama_sampler_free(s->sampler);
     llama_free(s->ctx);
     free(s->scratch);
+    free(s->scratch_logits);
     free(s);
 }
 
-int32_t ob_decode(ob_session * s, const int32_t * tokens, int32_t n_tokens) {
+int32_t ob_decode(ob_session * s, const int32_t * tokens, int32_t n_tokens,
+                  bool want_logits) {
     if (n_tokens <= 0) {
         return -1;
     }
@@ -218,12 +223,27 @@ int32_t ob_decode(ob_session * s, const int32_t * tokens, int32_t n_tokens) {
         if (grown == NULL) {
             return -1;
         }
+        int8_t * grown_logits =
+            realloc(s->scratch_logits, (size_t) n_tokens * sizeof(int8_t));
+        if (grown_logits == NULL) {
+            // scratch already grew; keep the larger buffer but do not
+            // advance the cap past what BOTH buffers can hold.
+            s->scratch = grown;
+            return -1;
+        }
+        memset(grown_logits, 0, (size_t) n_tokens * sizeof(int8_t));
         s->scratch = grown;
+        s->scratch_logits = grown_logits;
         s->scratch_cap = n_tokens;
     }
     memcpy(s->scratch, tokens, (size_t) n_tokens * sizeof(int32_t));
 
     struct llama_batch batch = llama_batch_get_one(s->scratch, n_tokens);
+    if (!want_logits) {
+        // An explicit all-zero flag array = no output rows at all; llama
+        // treats the NULL default as "output the last token".
+        batch.logits = s->scratch_logits;
+    }
     return llama_decode(s->ctx, batch);
 }
 

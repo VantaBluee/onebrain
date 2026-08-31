@@ -72,7 +72,12 @@ extern "C" {
 
     pub fn ob_session_new(m: *mut ObModel, p: *const ObSessionParams) -> *mut ObSession;
     pub fn ob_session_free(s: *mut ObSession);
-    pub fn ob_decode(s: *mut ObSession, tokens: *const i32, n_tokens: i32) -> i32;
+    pub fn ob_decode(
+        s: *mut ObSession,
+        tokens: *const i32,
+        n_tokens: i32,
+        want_logits: bool,
+    ) -> i32;
     pub fn ob_sample_greedy(s: *mut ObSession) -> i32;
     pub fn ob_session_reset(s: *mut ObSession);
     pub fn ob_session_set_sampler(s: *mut ObSession, temp: f32, top_p: f32, top_k: i32, seed: u32);

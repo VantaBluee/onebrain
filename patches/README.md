@@ -103,9 +103,11 @@ Client-side async pipelining for the RPC backend (docs/perf.md §3 —
 overlapped chunked prefill). Applies on top of 0001 + 0002 (the
 `ggml-rpc.cpp` hunks share context with 0002, the additive `ggml-rpc.h`
 declaration sits below 0001's `serve_fd`; `build.rs` applies the table in
-order). Client paths only; the server side and the wire format are
-untouched. Applied idempotently by `crates/onebrain-engine/build.rs`
-(marker symbol: `ob_rpc_drain_to` in `ggml-rpc.cpp`).
+order). Client paths of `ggml-rpc.cpp`, one scheduler hunk in
+`ggml-backend.cpp`, and two hunks in `llama-context.cpp`; the server side
+and the wire format are untouched. Applied idempotently by
+`crates/onebrain-engine/build.rs` (marker symbol: `ob_rpc_drain_to` in
+`ggml-rpc.cpp`).
 
 Mechanism: the RPC protocol already sends `GRAPH_COMPUTE`,
 `GRAPH_RECOMPUTE`, `SET_TENSOR`, and `MEMSET_TENSOR` with no response —
@@ -122,15 +124,23 @@ round trip per ubatch. This patch adds:
   batched (see the correctness argument below). The transaction mutex also
   serializes whole exchanges per socket, so event waits arriving from
   another backend's thread can never interleave bytes on the wire;
+- pipelined fences — "ack tickets" (`ob_rpc_fence_begin` /
+  `ob_rpc_ticket_pop`): `event_record` puts one `GET_DEVICE_MEMORY`
+  REQUEST on the wire immediately and remembers the ledger position; the
+  16-byte response stays in the socket buffer until a later wait pops it.
+  Because the in-order server answers a response-bearing command only
+  after executing everything queued before it — and keeps processing
+  afterwards — a popped ticket is a *positional* ack: draining to an old
+  event marker never waits for work submitted after that marker. This is
+  what keeps a deep ubatch train actually overlapped; a wait-side-only
+  fence can never wait for less than the whole queue and re-serializes
+  the pipeline to depth one. Tickets are strictly FIFO with the stream,
+  so every response-bearing exchange pops all outstanding tickets before
+  reading its own response;
 - `synchronize` = drain everything submitted on the backend's socket;
-  `event_record` = snapshot the submitted count into the event (a FIFO
-  marker); `event_wait`/`event_synchronize` = drain that socket to the
-  marker. A drain is free when the ledger already proves completion, and
-  otherwise costs one fence round trip — `GET_DEVICE_MEMORY`, an existing
-  response-bearing command with unchanged semantics. A fence necessarily
-  waits for the whole queue (there are no per-command acks), which
-  over-synchronizes past the marker; the completed check keeps that
-  amortized across the scheduler's rotating pipeline copies;
+  `event_wait`/`event_synchronize` = drain to the recorded marker
+  (tickets first, then — only if the ledger still cannot prove the
+  target — one blocking fence round trip);
 - async tensor entry points: `set_tensor_async` (a no-response
   `SET_TENSOR`; the data is serialized before returning, so the caller's
   buffer is immediately reusable), `get_tensor_async` (a get MUST observe
@@ -140,6 +150,17 @@ round trip per ubatch. This patch adds:
   gated on a synchronous CPU source backend; same-server copies reuse
   remote `COPY_TENSOR`; anything else falls back to the scheduler's
   synchronized copy path);
+- a client-side cache for `GET_ALLOC_SIZE` responses (resolves upstream's
+  own `TODO: cache the alloc responses`). The server's answer is a pure
+  function of what it deserializes — op, type, shapes, strides, op_params,
+  and the same for srcs — so the key is the request bytes with the
+  volatile identity fields (client-side addresses) reduced to presence
+  bits. Why it matters here: graph allocation issues these queries every
+  ubatch (`FLASH_ATTN_EXT` nodes — ~20/ubatch measured), each one a
+  response-bearing round trip that must first drain every outstanding
+  ticket, i.e. one full pipeline stall per graph. Cached, steady state
+  issues no allocation round trips at all. Bounded (4096 entries,
+  clear-on-overflow); failed exchanges are never cached;
 - device caps flip to `async = true, events = true`, which is exactly what
   `llama_context`'s pipeline-parallel gate checks. With our distributed
   loads (n_devices > 1, split-mode layer, full offload, offload_kqv, no
@@ -158,38 +179,74 @@ round trip per ubatch. This patch adds:
   deliberate nuance: even disabled, split-boundary input copies still go
   through the (correct) fire-and-forget `cpy_tensor_async` path — the
   baseline restores the M3 *scheduler shape* (no parallel copies, no
-  events), which is what the overlap A/B measures.
+  events), which is what the overlap A/B measures. (The alloc-size cache
+  is also active either way; it removes identical round trips from both
+  sides of the A/B.)
+
+The `ggml-backend.cpp` hunk (scheduler, upstream-worthy on its own): skip
+the split-input copy entirely for empty tensors (a zero in `ne`). During
+chunked prefill, the ubatches that produce no output rows feed the
+final-stage split a zero-row boundary tensor; upstream's synchronizing
+copy fallback still fenced the producing backend for that zero-byte copy,
+stalling the scheduler once per ubatch and serializing pipeline-parallel
+prefill end to end. An empty tensor carries no data and no dependency.
+
+The `llama-context.cpp` hunks:
+
+1. resolve upstream's own TODO at the pipeline_parallel gate ("should we
+   ignore ACCEL types too?"): ACCEL devices (BLAS/Accelerate — linked into
+   our macOS CPU builds) advertise no async/events and vetoed pipelining
+   for the whole context. `ggml_backend_sched` already null-checks
+   per-backend events and falls back to blocking synchronization at every
+   wait/record site, so an eventless ACCEL backend simply runs its own
+   boundaries synchronously while the capable backends still overlap.
+2. keep graph REUSE off the pipelined path: under pipeline parallelism the
+   reuse branch skips `ggml_backend_sched_alloc_graph` — so the
+   scheduler's pipeline copies never rotate — and must fully synchronize
+   before `set_inputs` (the in-flight graph reads the very tensors being
+   overwritten). A "reused" prefill therefore executes strictly
+   sequentially, one ubatch at a time, with the pipeline machinery inert.
+   Multi-token (prefill-shaped) ubatches now take the alloc path
+   (rotating copies, real overlap); single-token decode keeps graph reuse
+   — one ubatch per `llama_decode` has nothing to overlap with, and the
+   rebuild would cost decode latency for no gain.
 
 Correctness argument (NO wire change): the RPC server processes commands
 strictly serially, in order, per connection. Deferring ack reads therefore
 preserves semantics — the response of ANY later response-bearing command on
 the same socket proves that every command submitted before it has fully
 executed, and a read's own response cannot arrive before prior computes
-finished. Remote write-after-read hazards (the scheduler overwriting an
-input copy an in-flight graph may still read) are ordered by the socket
-itself: the overwrite is a later command on the same connection.
+finished. Ticket responses are ordinary `GET_DEVICE_MEMORY` responses,
+read strictly in request order, so request/response pairing stays exact.
+Remote write-after-read hazards (the scheduler overwriting an input copy
+an in-flight graph may still read) are ordered by the socket itself: the
+overwrite is a later command on the same connection.
 
-Failure composition with 0002: a fence (or any drain) that fails marks the
+Failure composition with 0002: a fence or ticket read that fails marks the
 socket dead exactly like every other round trip, and the error surfaces as
 an error return on whichever status-returning call drains or runs next
 (`graph_compute` → `GGML_STATUS_FAILED` fail-fast, `cpy` → false, gets →
 zeroed destination). Void paths (`synchronize`, `event_wait`) log loudly
 via the 0002 first-failure logger and never abort; teardown with pending
-work either drains naturally through the response-bearing `FREE_BUFFER`
-round trips (live server) or fails fast (dead socket) — no hangs either
-way. The 0002 residuals are unchanged, including the one-token
-zeroed-logits window at the final budgeted token.
+work (tickets included) either drains naturally through the
+response-bearing `FREE_BUFFER` round trips (live server) or fails fast
+(dead socket) — no hangs either way. The 0002 residuals are unchanged,
+including the one-token zeroed-logits window at the final budgeted token.
 
 Upstreaming note: a strong candidate PR — it makes `llama.cpp --rpc`
 benefit from upstream's own pipeline parallelism with zero protocol
-changes, and the implicit-ack ledger is self-contained. Upstream review
-would focus on the fence choice (`GET_DEVICE_MEMORY` as a semantic no-op
-vs adding a dedicated lightweight PING command — the latter is a protocol
-version bump we deliberately avoided), on the conservative drain-to-now
-fence semantics, and on whether `ggml_backend_rpc_pipeline_enable` should
-be public API or a build flag (upstream has no config-knob use case; ours
-is the measured A/B baseline). Rebase risk on vendor bumps: moderate —
-the hunks touch `send_rpc_cmd` (both overloads), the backend/device
-interface tables, and the caps struct; a bump that reshapes those forces
-a deliberate re-port (the build fails loudly via the marker check +
-`git apply`).
+changes; the implicit-ack ledger, ack tickets, and alloc-size cache are
+self-contained, and the empty-copy skip plus both llama-context hunks fix
+upstream TODOs/latent issues that bite any async backend, not just RPC.
+Upstream review would focus on the fence choice (`GET_DEVICE_MEMORY` as a
+semantic no-op vs adding a dedicated lightweight PING command — the
+latter is a protocol version bump we deliberately avoided), on the
+reuse-vs-pipelining trade in llama-context (upstream may prefer making
+reuse rotate copies instead of bypassing it), and on whether
+`ggml_backend_rpc_pipeline_enable` should be public API or a build flag
+(upstream has no config-knob use case; ours is the measured A/B
+baseline). Rebase risk on vendor bumps: moderate — the hunks touch
+`send_rpc_cmd` (both overloads), the backend/device interface tables, the
+caps struct, the scheduler's input-copy loop, and llama-context's reuse
+gate; a bump that reshapes those forces a deliberate re-port (the build
+fails loudly via the marker check + `git apply`).

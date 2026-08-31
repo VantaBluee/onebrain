@@ -171,7 +171,16 @@ ob_session * ob_session_new(ob_model * m, const ob_session_params * p);
 void ob_session_free(ob_session * s);
 // Decode tokens (appended to the tracked position). 0 = ok; llama_decode
 // codes otherwise (1 = no KV slot, 2 = aborted, <0 = error).
-int32_t ob_decode(ob_session * s, const int32_t * tokens, int32_t n_tokens);
+// `want_logits = false` requests NO output rows: the KV state advances
+// identically but the output head is never gathered or computed. For a
+// prompt chunked to n_batch, only the FINAL chunk's logits are ever
+// sampled — skipping the rest removes the one hard cross-node sync a
+// distributed pipelined prefill would otherwise pay per chunk
+// (docs/perf.md §3): the output-row fetch is the only per-chunk command
+// that must wait for that chunk's last graph before the next chunk's
+// work can be submitted.
+int32_t ob_decode(ob_session * s, const int32_t * tokens, int32_t n_tokens,
+                  bool want_logits);
 // Greedy-sample from the last decoded logits.
 int32_t ob_sample_greedy(ob_session * s);
 

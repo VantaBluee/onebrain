@@ -932,10 +932,19 @@ impl<'m> Session<'m> {
         self.n_seq_max
     }
 
-    /// Decode tokens, chunked to the session's batch size.
+    /// Decode tokens, chunked to the session's batch size. Only the FINAL
+    /// chunk asks for logits: nothing samples from an intermediate chunk,
+    /// and on a distributed pipelined session the output-row fetch is the
+    /// one per-chunk command that must block on that chunk's last graph
+    /// before the next chunk's ubatches can be submitted (docs/perf.md §3).
+    /// The decoded KV state is identical either way.
     pub fn decode(&mut self, tokens: &[Token]) -> Result<(), EngineError> {
-        for chunk in tokens.chunks(self.n_batch as usize) {
-            let status = unsafe { sys::ob_decode(self.ptr, chunk.as_ptr(), chunk.len() as i32) };
+        let n_chunks = tokens.chunks(self.n_batch as usize).count();
+        for (i, chunk) in tokens.chunks(self.n_batch as usize).enumerate() {
+            let want_logits = i + 1 == n_chunks;
+            let status = unsafe {
+                sys::ob_decode(self.ptr, chunk.as_ptr(), chunk.len() as i32, want_logits)
+            };
             if status != 0 {
                 return Err(EngineError::Decode { status });
             }

@@ -2,38 +2,67 @@ onebrain vendor patch 0003: RPC client-side async pipelining
 (docs/perf.md §3 — overlapped chunked prefill)
 
 Applies on top of 0001 + 0002. Client paths of ggml-rpc.cpp (plus one
-additive declaration in ggml-rpc.h) and one hunk in llama-context.cpp;
-the server side and the wire format are untouched.
+additive declaration in ggml-rpc.h), two small hunks in llama-context.cpp,
+and one hunk in ggml-backend.cpp; the server side and the wire format are
+untouched.
 
-The llama-context.cpp hunk resolves upstream's own TODO at the
-pipeline_parallel gate ("should we ignore ACCEL types too?"): ACCEL
-devices (BLAS/Accelerate - linked into our macOS CPU builds) advertise
-no async/events and vetoed pipelining for the whole context, so overlap
-engaged on Linux/Windows but never on macOS. ggml_backend_sched already
-null-checks per-backend events and falls back to a blocking
-ggml_backend_synchronize at every wait/record site, so an eventless
-ACCEL backend simply runs its own boundaries synchronously while the
-capable backends still overlap. Strong upstreaming candidate.
+Mechanism (details at the ob_rpc_pending block in ggml-rpc.cpp): the RPC
+server executes commands serially, in order, per connection, and several
+commands carry no response (GRAPH_COMPUTE, GRAPH_RECOMPUTE, SET_TENSOR,
+MEMSET_TENSOR). Deferring "acks" is therefore free: the response of ANY
+later response-bearing command on the same socket proves every command
+before it fully executed. The patch adds
 
-Correctness argument (also at the ob_rpc_pending block in the file): the
-RPC server executes commands serially, in order, per connection, and
-several commands carry no response (GRAPH_COMPUTE, GRAPH_RECOMPUTE,
-SET_TENSOR, MEMSET_TENSOR). Deferring "acks" is therefore free: the
-response of ANY later response-bearing command on the same socket proves
-every command before it fully executed. The patch adds a per-socket
-pending-command ledger (submitted/completed counters — the pending-ack
-FIFO with implicit, batched acks), implements synchronize as a drain
-(fence = one GET_DEVICE_MEMORY round trip when the ledger cannot prove
-completion), events as markers into the ledger (record = snapshot
-submitted; wait/synchronize = drain to the marker), async set/get/cpy
-tensor entry points, and flips device caps to async=true, events=true —
-which is exactly what llama.cpp's pipeline_parallel gate requires.
-ggml_backend_rpc_pipeline_enable(false) reverts the caps advertisement
-process-wide (contexts created afterwards run without parallel copies) —
-the hook behind OneBrain's `[perf] prefill_overlap = false` constructed
-M3 baseline.
-Failures compose with 0002: a failed fence marks the socket dead and the
-error surfaces on whichever status-returning call drains or runs next.
+ - a per-socket pending-command ledger (submitted/completed counters — the
+   pending-ack FIFO with implicit, batched acks);
+ - pipelined fences ("ack tickets"): event_record puts one
+   GET_DEVICE_MEMORY REQUEST on the wire immediately and defers reading
+   the response; a later event wait pops tickets in FIFO order, so
+   draining to an old marker never waits for work submitted after it.
+   Without tickets, a wait-side fence can only wait for the WHOLE queue,
+   which re-serializes a deep ubatch train to depth one;
+ - synchronize as drain-everything; events as markers into the ledger;
+   async set/get/cpy tensor entry points;
+ - a client-side cache for GET_ALLOC_SIZE responses (resolves upstream's
+   own TODO): graph allocation queries alloc sizes per ubatch
+   (FLASH_ATTN_EXT nodes), and any response-bearing round trip must first
+   drain every outstanding ticket — cached, steady state issues no
+   allocation round trips at all;
+ - device caps flip to async=true, events=true — exactly what llama.cpp's
+   pipeline_parallel gate requires; ggml_backend_rpc_pipeline_enable(false)
+   reverts the caps advertisement process-wide (the hook behind OneBrain's
+   `[perf] prefill_overlap = false` constructed M3 baseline).
+
+The ggml-backend.cpp hunk skips the scheduler's split-input copy for
+empty tensors (a zero in ne — e.g. a graph that gathers 0 output rows
+during chunked prefill): there is no data and no dependency, yet the
+synchronizing fallback stalled the scheduler on the producing backend
+once per ubatch for a zero-byte copy, serializing pipeline-parallel
+prefill end to end. Upstream-worthy on its own.
+
+The llama-context.cpp hunks:
+ 1. resolve upstream's TODO at the pipeline_parallel gate ("should we
+    ignore ACCEL types too?"): ACCEL devices (BLAS/Accelerate — linked
+    into our macOS CPU builds) advertise no async/events and vetoed
+    pipelining for the whole context; ggml_backend_sched already
+    null-checks per-backend events and falls back to blocking
+    synchronization, so an eventless ACCEL backend simply runs its own
+    boundaries synchronously while capable backends still overlap.
+ 2. keep graph REUSE off the pipelined path (multi-token ubatches under
+    pipeline parallelism): the reuse path skips
+    ggml_backend_sched_alloc_graph — the scheduler's pipeline copies
+    never rotate — and must fully synchronize before set_inputs (the
+    in-flight graph reads the tensors being overwritten), so a "reused"
+    prefill executes strictly sequentially per ubatch. Multi-token
+    ubatches take the alloc path (rotating copies, real overlap);
+    single-token decode keeps reuse — one ubatch per llama_decode has
+    nothing to overlap with, and the rebuild would cost latency for no
+    gain.
+
+Failures compose with 0002: a failed fence/ticket read marks the socket
+dead and the error surfaces on whichever status-returning call drains or
+runs next; teardown drains naturally through the response-bearing
+FREE_BUFFER round trips (live server) or fails fast (dead socket).
 
 diff --git a/ggml/include/ggml-rpc.h b/ggml/include/ggml-rpc.h
 index 1d1646d84..3ae4ff9a0 100644
@@ -53,11 +82,40 @@ index 1d1646d84..3ae4ff9a0 100644
  GGML_BACKEND_API ggml_backend_reg_t ggml_backend_rpc_reg(void);
  GGML_BACKEND_API ggml_backend_reg_t ggml_backend_rpc_add_server(const char * endpoint);
  
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index e519bdf50..57acd6c0f 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1624,6 +1624,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+             struct ggml_tensor * input = split->inputs[input_id];
+             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
+ 
++            // ob-patch-0003: an empty tensor (a zero in ne, e.g. a graph that
++            // gathers 0 output rows during chunked prefill) carries no data,
++            // so there is nothing to copy and no dependency to synchronize.
++            // Without this, the synchronizing fallback below stalls the
++            // scheduler on the producing backend once per ubatch for a
++            // zero-byte copy, serializing pipeline-parallel prefill.
++            if (ggml_nbytes(input) == 0) {
++                continue;
++            }
++
+             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
+                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
+                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
 diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
-index 815e9ad88..a95324a63 100644
+index 815e9ad88..248e8bec0 100644
 --- a/ggml/src/ggml-rpc/ggml-rpc.cpp
 +++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
-@@ -34,6 +34,13 @@ namespace fs = std::filesystem;
+@@ -6,6 +6,7 @@
+ 
+ #include <array>
+ #include <cinttypes>
++#include <deque>
+ #include <optional>
+ #include <string>
+ #include <vector>
+@@ -34,6 +35,13 @@ namespace fs = std::filesystem;
  // server fails the in-flight request, not the process. The first failure on a
  // socket marks it dead; later commands on it fail fast without touching the
  // wire. Server-side paths and the wire format are untouched.
@@ -71,7 +129,7 @@ index 815e9ad88..a95324a63 100644
  
  // all RPC structures must be packed
  #pragma pack(push, 1)
-@@ -348,6 +355,75 @@ static void ob_rpc_log_fail(const char * where) {
+@@ -348,6 +356,108 @@ static void ob_rpc_log_fail(const char * where) {
      }
  }
  
@@ -122,6 +180,16 @@ index 815e9ad88..a95324a63 100644
 +    uint64_t submitted = 0;
 +    // Highest `submitted` value proven executed by a later response.
 +    uint64_t completed = 0;
++    // Pipelined fences ("ack tickets"): positions whose fence REQUEST is
++    // already on the wire but whose response has not been read yet. The
++    // server answers a response-bearing command only after executing
++    // everything queued before it, so each deferred response, once read,
++    // proves execution up to its recorded position — without waiting for
++    // anything submitted after it. Responses arrive strictly in request
++    // order (the server is serial per connection), so this is a FIFO, and
++    // every response-bearing exchange must pop ALL outstanding tickets
++    // before reading its own response.
++    std::deque<uint64_t> tickets;
 +};
 +
 +static std::mutex ob_rpc_pending_map_mutex;
@@ -144,10 +212,33 @@ index 815e9ad88..a95324a63 100644
 +    return state;
 +}
 +
++// onebrain: patches/0003: read one outstanding pipelined-fence response and
++// advance the ledger to its marker. Caller holds `pending.mtx` and
++// guarantees `!pending.tickets.empty()`. The response bytes are the fence
++// command's own (rpc_msg_get_device_memory_rsp); a short or malformed read
++// desyncs the stream exactly like any other failed response, so the socket
++// is marked dead (patches/0002) and the caller fails fast from then on.
++static bool ob_rpc_ticket_pop(const socket_ptr & sock, ob_rpc_pending & pending) {
++    uint64_t marker = pending.tickets.front();
++    pending.tickets.pop_front();
++    uint64_t out_size;
++    rpc_msg_get_device_memory_rsp response;
++    if (!sock->recv_data(&out_size, sizeof(out_size)) ||
++        out_size != sizeof(response) ||
++        !sock->recv_data(&response, sizeof(response))) {
++        ob_rpc_mark_dead(sock);
++        return false;
++    }
++    if (marker > pending.completed) {
++        pending.completed = marker;
++    }
++    return true;
++}
++
  // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
  // No response
  static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size) {
-@@ -356,6 +432,12 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input,
+@@ -356,6 +466,12 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input,
      if (ob_rpc_is_dead(sock)) {
          return false;
      }
@@ -160,7 +251,7 @@ index 815e9ad88..a95324a63 100644
      uint8_t cmd_byte = cmd;
      if (!sock->send_data(&cmd_byte, sizeof(cmd_byte)) ||
          !sock->send_data(&input_size, sizeof(input_size)) ||
-@@ -364,15 +446,30 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input,
+@@ -364,15 +480,38 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input,
          ob_rpc_mark_dead(sock); // onebrain: error-return semantics (patches/0002)
          return false;
      }
@@ -181,6 +272,14 @@ index 815e9ad88..a95324a63 100644
 +    // strict request/response alternation per socket.
 +    auto pending = ob_rpc_pending_for(sock);
 +    std::lock_guard<std::recursive_mutex> lock(pending->mtx);
++    // Responses arrive in request order: any outstanding pipelined-fence
++    // responses (tickets) precede this exchange's on the stream, so they
++    // must be consumed first to keep request/response pairing exact.
++    while (!pending->tickets.empty()) {
++        if (!ob_rpc_ticket_pop(sock, *pending)) {
++            return false;
++        }
++    }
      if (!send_rpc_cmd(sock, cmd, input, input_size)) {
          return false;
      }
@@ -191,7 +290,7 @@ index 815e9ad88..a95324a63 100644
      uint64_t out_size;
      if (!sock->recv_data(&out_size, sizeof(out_size)) ||
          out_size != output_size ||
-@@ -382,9 +479,69 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input,
+@@ -382,9 +521,109 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input,
          ob_rpc_mark_dead(sock);
          return false;
      }
@@ -220,11 +319,51 @@ index 815e9ad88..a95324a63 100644
 +    if (pending->completed >= target) {
 +        return;
 +    }
++    // Pipelined fences first: each outstanding ticket blocks only until the
++    // server has executed past ITS marker — draining to an old event marker
++    // through tickets does not wait for work submitted after it, which is
++    // what keeps a deep ubatch train actually overlapped.
++    while (pending->completed < target && !pending->tickets.empty()) {
++        if (!ob_rpc_ticket_pop(sock, *pending)) {
++            ob_rpc_log_fail(__func__);
++            return;
++        }
++    }
++    if (pending->completed >= target) {
++        return;
++    }
 +    rpc_msg_get_device_memory_req request = {device};
 +    rpc_msg_get_device_memory_rsp response;
 +    if (!send_rpc_cmd(sock, RPC_CMD_GET_DEVICE_MEMORY, &request, sizeof(request), &response, sizeof(response))) {
 +        ob_rpc_log_fail(__func__);
 +    }
++}
++
++// onebrain: patches/0003: pipelined fence — put the fence REQUEST on the
++// wire now and defer reading its response (the "ack ticket"). One existing
++// response-bearing command (GET_DEVICE_MEMORY, unchanged wire semantics)
++// per marker turns a later drain into a positional wait: the server answers
++// it only after executing everything queued before it and keeps processing
++// afterwards, so waiting on the ticket does not stall work submitted after
++// the marker. The 16-byte response sits in the socket buffer until popped.
++// Called at event_record time, so each recorded marker costs one tiny
++// round trip amortized across the pipeline instead of a full-queue fence
++// at wait time.
++static void ob_rpc_fence_begin(const socket_ptr & sock, uint32_t device) {
++    auto pending = ob_rpc_pending_for(sock);
++    if (pending == nullptr) {
++        return;
++    }
++    std::lock_guard<std::recursive_mutex> lock(pending->mtx);
++    rpc_msg_get_device_memory_req request = {device};
++    if (!send_rpc_cmd(sock, RPC_CMD_GET_DEVICE_MEMORY, &request, sizeof(request))) {
++        // Dead socket (patches/0002): drains fail fast there anyway.
++        return;
++    }
++    // The marker includes the fence command itself: the server has run it
++    // by the time the response exists, and nothing else moved `submitted`
++    // (the transaction lock is held).
++    pending->tickets.push_back(pending->submitted);
 +}
 +
 +// onebrain: patches/0003: drain everything currently submitted on `sock`.
@@ -261,7 +400,90 @@ index 815e9ad88..a95324a63 100644
  // RPC client-side implementation
  
  // Performs HELLO handshake with transport auto-negotiation.
-@@ -776,8 +933,136 @@ static void ggml_backend_rpc_free(ggml_backend_t backend) {
+@@ -711,6 +950,36 @@ static size_t ggml_backend_rpc_get_max_size(ggml_backend_buffer_type_t buft) {
+     return buft_ctx->max_size;
+ }
+ 
++// onebrain: patches/0003: client-side cache for GET_ALLOC_SIZE (this
++// resolves upstream's own TODO below). The server's answer is a pure
++// function of what it deserializes from the request — op, type, shapes,
++// strides, op_params and the same for the srcs — never of the volatile
++// identity fields (client-side addresses in id/buffer/data/view_src). The
++// cache key is the request bytes with those fields reduced to presence
++// bits and the name cleared. Why this matters for pipelining: graph
++// allocation issues these queries per ubatch (FLASH_ATTN_EXT nodes), and
++// any response-bearing round trip must first drain every outstanding
++// pipelined fence on the socket (responses are strictly FIFO), which would
++// re-serialize the ubatch train once per graph. With the cache, steady
++// state issues no allocation round trips at all.
++static void ob_rpc_alloc_key_sanitize(rpc_tensor * t) {
++    t->id        = t->id != 0 ? 1 : 0;
++    t->buffer    = t->buffer != 0 ? 1 : 0;
++    t->data      = 0;
++    t->view_src  = t->view_src != 0 ? 1 : 0;
++    t->use_count = 0;
++    for (int i = 0; i < GGML_MAX_SRC; i++) {
++        t->src[i] = t->src[i] != 0 ? 1 : 0;
++    }
++    memset(t->name, 0, sizeof(t->name));
++}
++
++static std::mutex ob_rpc_alloc_size_cache_mutex;
++static std::unordered_map<std::string, uint64_t> ob_rpc_alloc_size_cache;
++// A different endpoint could in principle answer differently (different
++// backend build); bound staleness and growth by clearing past this size.
++static const size_t OB_RPC_ALLOC_SIZE_CACHE_MAX = 4096;
++
+ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
+     // should we query the remote server for the actual size
+     bool rpc_get = false;
+@@ -738,16 +1007,44 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
+             request.srcs[i] = serialize_tensor(tensor->src[i]);
+         }
+ 
+-        // TODO: cache the alloc responses to avoid extra RPC calls?
++        // onebrain: patches/0003: consult the cache before going to the wire.
++        rpc_msg_get_alloc_size_req key_req = request;
++        ob_rpc_alloc_key_sanitize(&key_req.tensor);
++        for (int i = 0; i < GGML_MAX_SRC; i++) {
++            ob_rpc_alloc_key_sanitize(&key_req.srcs[i]);
++            // A src's position inside its parent view (e.g. which KV-cache
++            // slice a layer reads) cannot change the NODE's allocation size;
++            // keying on it would make every layer a separate miss.
++            key_req.srcs[i].view_offs = 0;
++        }
++        std::string key = buft_ctx->endpoint;
++        key.append(1, '\0');
++        key.append(reinterpret_cast<const char *>(&key_req), sizeof(key_req));
++        {
++            std::lock_guard<std::mutex> lock(ob_rpc_alloc_size_cache_mutex);
++            auto it = ob_rpc_alloc_size_cache.find(key);
++            if (it != ob_rpc_alloc_size_cache.end()) {
++                return it->second;
++            }
++        }
++
+         rpc_msg_get_alloc_size_rsp response;
+         bool status = send_rpc_cmd(sock, RPC_CMD_GET_ALLOC_SIZE, &request, sizeof(request), &response, sizeof(response));
+         if (!status) { // onebrain: error-return semantics (patches/0002)
+             // Fall back to the local size; a dead server fails the subsequent
+             // alloc/compute anyway, and 0 could silently under-allocate.
++            // (Never cached: a torn exchange proves nothing about sizes.)
+             ob_rpc_log_fail(__func__);
+             return ggml_nbytes(tensor);
+         }
+ 
++        {
++            std::lock_guard<std::mutex> lock(ob_rpc_alloc_size_cache_mutex);
++            if (ob_rpc_alloc_size_cache.size() >= OB_RPC_ALLOC_SIZE_CACHE_MAX) {
++                ob_rpc_alloc_size_cache.clear();
++            }
++            ob_rpc_alloc_size_cache[key] = response.alloc_size;
++        }
+         return response.alloc_size;
+     }
+ 
+@@ -776,8 +1073,142 @@ static void ggml_backend_rpc_free(ggml_backend_t backend) {
  }
  
  static void ggml_backend_rpc_synchronize(ggml_backend_t backend) {
@@ -356,6 +578,12 @@ index 815e9ad88..a95324a63 100644
 +    if (sock == nullptr) {
 +        return; // never-connected endpoint: nothing to mark
 +    }
++    // Record = eager pipelined fence: put the fence request for this marker
++    // on the wire now (its deferred response is the ticket a later wait
++    // pops), then snapshot the resulting position. Without the ticket, the
++    // wait-side fence could only wait for the WHOLE queue, which serializes
++    // a deep pipeline right back to depth one.
++    ob_rpc_fence_begin(sock, rpc_ctx->device);
 +    uint64_t submitted = 0;
 +    if (auto pending = ob_rpc_pending_for(sock)) {
 +        std::lock_guard<std::recursive_mutex> lock(pending->mtx);
@@ -399,7 +627,7 @@ index 815e9ad88..a95324a63 100644
  }
  
  static void add_tensor(ggml_tensor * tensor, const ggml_cgraph * cgraph, std::vector<rpc_tensor> & tensors, std::unordered_set<ggml_tensor*> & visited) {
-@@ -865,19 +1150,20 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
+@@ -865,19 +1296,20 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
  static ggml_backend_i ggml_backend_rpc_interface = {
      /* .get_name                = */ ggml_backend_rpc_name,
      /* .free                    = */ ggml_backend_rpc_free,
@@ -425,7 +653,7 @@ index 815e9ad88..a95324a63 100644
      /* .graph_optimize          = */ NULL,
  };
  
-@@ -2055,15 +2341,43 @@ static void ggml_backend_rpc_device_get_props(ggml_backend_dev_t dev, struct ggm
+@@ -2055,15 +2487,43 @@ static void ggml_backend_rpc_device_get_props(ggml_backend_dev_t dev, struct ggm
      props->description = ggml_backend_rpc_device_get_description(dev);
      props->type        = ggml_backend_rpc_device_get_type(dev);
      ggml_backend_rpc_device_get_memory(dev, &props->memory_free, &props->memory_total);
@@ -471,7 +699,7 @@ index 815e9ad88..a95324a63 100644
  static ggml_backend_t ggml_backend_rpc_device_init(ggml_backend_dev_t dev, const char * params) {
      ggml_backend_rpc_device_context * ctx = (ggml_backend_rpc_device_context *)dev->context;
  
-@@ -2109,9 +2423,10 @@ static const struct ggml_backend_device_i ggml_backend_rpc_device_i = {
+@@ -2109,9 +2569,10 @@ static const struct ggml_backend_device_i ggml_backend_rpc_device_i = {
      /* .supports_op          = */ ggml_backend_rpc_device_supports_op,
      /* .supports_buft        = */ ggml_backend_rpc_device_supports_buft,
      /* .offload_op           = */ NULL,
@@ -486,7 +714,7 @@ index 815e9ad88..a95324a63 100644
  
  // backend reg interface
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 0402044da..a08c953b2 100644
+index 0402044da..f55902c0f 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -436,9 +436,16 @@ llama_context::llama_context(
@@ -508,3 +736,23 @@ index 0402044da..a08c953b2 100644
                      continue;
                  }
                  auto * dev = ggml_backend_get_device(backend.get());
+@@ -1336,7 +1343,18 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
+     const auto gparams = graph_params(res, ubatch, mctx, gtype);
+ 
+-    if (!graph_reuse_disable && res->can_reuse(gparams)) {
++    // ob-patch-0003: under pipeline parallelism, reusing the previous graph
++    // serializes the pipeline: the reuse path skips
++    // ggml_backend_sched_alloc_graph (so the scheduler's pipeline copies
++    // never rotate) and must fully synchronize before set_inputs (the
++    // in-flight graph reads the very tensors being overwritten). A
++    // multi-token (prefill-shaped) ubatch is exactly the case pipeline
++    // parallelism exists for, so take the alloc path there — it rotates the
++    // input copies and lets consecutive ubatches overlap. Single-token
++    // decode keeps graph reuse: one ubatch per llama_decode has nothing to
++    // overlap with, and the rebuild would cost latency for no gain.
++    const bool pipelined_ubatch = cparams.pipeline_parallel && ubatch.n_tokens > 1;
++    if (!graph_reuse_disable && !pipelined_ubatch && res->can_reuse(gparams)) {
+         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
+ 
+         // with pipeline parallelism, the previous graph_compute_async may still be running
