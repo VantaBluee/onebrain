@@ -129,8 +129,16 @@ fn bridge_death_mid_generation_is_an_error_not_an_abort() {
     )
     .expect("distributed load through the loopback bridge");
 
+    // A distributed load must identify as such: it is the gate that keeps
+    // Session::generate on confirm-before-send (docs/resilience.md
+    // "Confirm-before-send and the solo exemption").
+    assert!(
+        model.is_distributed(),
+        "a model loaded over RPC servers must report is_distributed()"
+    );
+
     let prompt = model.tokenize("Once upon a time", true).expect("tokenize");
-    let result = {
+    let (result, streamed) = {
         let mut session = Session::new(
             &model,
             &SessionParams {
@@ -143,16 +151,20 @@ fn bridge_death_mid_generation_is_an_error_not_an_abort() {
 
         let kill = bridge.kill_handles();
         let mut streamed = 0usize;
-        // Ask for far more tokens than the healthy path would need so the
-        // only way out (besides EOG on a tiny model, which the loopback test
-        // proves does not happen this early) is the injected failure.
-        session.generate_greedy(&prompt, 64, |_tok, _piece| {
+        // generate() is the confirm-before-send loop (the default sampler
+        // chain is greedy). Ask for far more tokens than the healthy path
+        // would need so the only way out (besides EOG on a tiny model,
+        // which the loopback test proves does not happen this early) is
+        // the injected failure.
+        let result = session.generate(&prompt, 64, |_tok, _piece| {
             streamed += 1;
             if streamed == 2 {
                 // >= 2 tokens streamed: kill the bridge mid-generation.
                 kill_all(&kill);
             }
-        })
+            std::ops::ControlFlow::Continue(())
+        });
+        (result, streamed)
     };
 
     match result {
@@ -161,6 +173,15 @@ fn bridge_death_mid_generation_is_an_error_not_an_abort() {
             panic!("expected Err(EngineError::Decode {{..}}) after bridge teardown, got {other:?}")
         }
     }
+    // CONFIRM-BEFORE-SEND (distributed) behavioral pin: after the bridge
+    // died inside piece 2's callback, the loop sampled token 3 from the
+    // last healthy logits, but its own decode failed — so its piece must
+    // never have been emitted. (The solo exemption in docs/resilience.md
+    // deliberately does NOT apply here.)
+    assert_eq!(
+        streamed, 2,
+        "a distributed generation must not emit a piece whose own decode failed"
+    );
 
     // Freeing the model sends buffer frees over the dead bridge; the patched
     // client must tolerate them silently (no abort, no hang).

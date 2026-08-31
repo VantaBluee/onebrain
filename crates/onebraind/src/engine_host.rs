@@ -2,7 +2,9 @@
 //!
 //! One `std::thread` owns the loaded [`Model`] and its single [`Session`].
 //! Since M7 (docs/perf.md §6) the session is created with a unified KV
-//! cache and `n_seq_max = [perf] max_concurrent_requests`, and the serving
+//! cache and `n_seq_max = [perf] max_concurrent_requests` (except at
+//! `max_concurrent_requests == 1`, where [`target_session_shape`] picks
+//! the cheaper plain single-sequence layout), and the serving
 //! loop is a MULTI-SEQUENCE STEP LOOP: up to `n_seq_max` generations run
 //! concurrently, each decode step batching one token per active sequence,
 //! with prompt prefills chunk-interleaved FCFS between steps. The HTTP side
@@ -134,6 +136,13 @@ pub struct HostPerf {
     /// requests (docs/perf.md §4). `false` restores the reset-per-request
     /// behavior exactly.
     pub kv_reuse: bool,
+    /// `[perf] n_threads`: engine threads for single-token decode. `0`
+    /// auto-detects the performance-core count (docs/perf.md "Thread-count
+    /// defaults"); positive values are explicit overrides.
+    pub n_threads: i32,
+    /// `[perf] n_threads_batch`: engine threads for batch decodes (prefill
+    /// and multi-token steps). `0` auto-detects the physical-core count.
+    pub n_threads_batch: i32,
 }
 
 impl Default for HostPerf {
@@ -144,8 +153,49 @@ impl Default for HostPerf {
             n_ubatch: 512,
             prefill_overlap: true,
             kv_reuse: true,
+            n_threads: 0,
+            n_threads_batch: 0,
         }
     }
+}
+
+/// Resolve the `[perf]` thread knobs to the concrete counts every engine
+/// session is created with (docs/perf.md "Thread-count defaults"): a
+/// positive knob is an explicit override, `0` takes the machine's detected
+/// recommendation (performance cores for decode, all physical cores for
+/// batch/prefill). Never llama.cpp's own 4-thread default — measured
+/// 1.7-2.1x slower decode and 3-4x slower prefill on modern CPUs.
+/// Target-session shape for a load: `(n_seq_max, kv_unified)`.
+///
+/// docs/perf.md §6 serves up to `max_concurrent_requests` sequences from
+/// ONE unified KV pool — but that layout is not free: measured same-run,
+/// the daemon-shaped session (`kv_unified = true`, `n_seq_max = 4`) costs
+/// ~0.6 ms per decoded token versus the plain single-sequence session
+/// EVEN WITH exactly one active request (+3% on a mid-size model, +20%
+/// on a tiny one; the step-loop machinery itself is negligible). With
+/// `max_concurrent_requests == 1` the §6 admission/headroom math
+/// degenerates to the single slot, so a 1-concurrency host creates the
+/// exact pre-M7 session shape and pays nothing. STRICTLY gated on the
+/// knob being 1: any concurrency >= 2 keeps the unified layout the §6
+/// headroom math assumes.
+fn target_session_shape(perf: &HostPerf) -> (u32, bool) {
+    let n_seq_max = perf.max_concurrent.max(1);
+    (n_seq_max, n_seq_max > 1)
+}
+
+fn resolved_threads(perf: &HostPerf) -> (i32, i32) {
+    let rec = onebrain_engine::cpu::recommended_threads();
+    let n_threads = if perf.n_threads > 0 {
+        perf.n_threads
+    } else {
+        rec.n_threads
+    };
+    let n_threads_batch = if perf.n_threads_batch > 0 {
+        perf.n_threads_batch
+    } else {
+        rec.n_threads_batch
+    };
+    (n_threads, n_threads_batch)
 }
 
 /// The runtime-togglable subset of [`HostPerf`] (docs/perf.md §10), shared
@@ -740,20 +790,29 @@ fn host_loop(
                 (model, info, reference, resp, true, draft)
             }
         };
+        // Thread counts (docs/perf.md "Thread-count defaults"): resolved
+        // once per load, shared by the target, draft, and embed sessions.
+        let (n_threads, n_threads_batch) = resolved_threads(&perf);
+        // M7 micro-batched decode (docs/perf.md §6): one session serves up
+        // to max_concurrent sequences out of ONE unified KV pool of n_ctx
+        // tokens — the admission headroom math in the serve loop assumes
+        // exactly this layout. EXCEPT at max_concurrent == 1, where the
+        // math degenerates to the single slot and the unified layout's
+        // measured ~0.6 ms/tok cost buys nothing (see
+        // target_session_shape).
+        let (n_seq_max, kv_unified) = target_session_shape(&perf);
         let mut session = match Session::new(
             &model,
             &SessionParams {
                 n_ctx: info.n_ctx,
                 n_batch: perf.n_batch.max(1),
-                // M7 micro-batched decode (docs/perf.md §6): one session
-                // serves up to max_concurrent sequences out of ONE unified
-                // KV pool of n_ctx tokens — the admission headroom math in
-                // the serve loop assumes exactly this layout.
-                n_seq_max: perf.max_concurrent.max(1),
-                kv_unified: true,
+                n_seq_max,
+                kv_unified,
                 // §3: the physical micro-batch becomes a config knob; the
                 // engine caps it at n_batch.
                 n_ubatch: perf.n_ubatch,
+                n_threads,
+                n_threads_batch,
                 ..SessionParams::default()
             },
         ) {
@@ -791,6 +850,8 @@ fn host_loop(
                     n_ctx: info.n_ctx,
                     n_batch: perf.n_batch.max(1),
                     n_ubatch: perf.n_ubatch,
+                    n_threads,
+                    n_threads_batch,
                     ..SessionParams::default()
                 },
             ) {
@@ -807,7 +868,10 @@ fn host_loop(
             model = %info.name,
             n_layer = info.n_layer,
             n_ctx = info.n_ctx,
-            n_seq_max = perf.max_concurrent.max(1),
+            n_seq_max,
+            kv_unified,
+            n_threads,
+            n_threads_batch,
             draft = draft_loaded.as_ref().map(|(_, name)| name.as_str()),
             "model loaded"
         );
@@ -1263,9 +1327,12 @@ struct ActiveGen {
     /// Confirmed tokens generated THIS attempt.
     attempt_tokens: Vec<Token>,
     /// Sampled but not yet confirmed by a successful decode containing it
-    /// (confirm-before-send, docs/resilience.md): the token and its
-    /// rendered piece.
-    pending: Option<(Token, String)>,
+    /// (docs/resilience.md "Confirm-before-send and the solo exemption").
+    /// DISTRIBUTED: `Unsent` — the piece is emitted only after the next
+    /// decode succeeds. SOLO: `Sent` — the piece was already delivered
+    /// (or stop-withheld) at sample time; the decode that follows only
+    /// confirms bookkeeping.
+    pending: Option<PendingTok>,
     /// CONFIRMED pieces the client's channel had no room for, in emission
     /// order (a speculative round can confirm several at once); the
     /// sequence pauses (its decode skips steps) until they are delivered,
@@ -1299,6 +1366,35 @@ struct ActiveGen {
     ttft_ms: Option<u64>,
     /// Finished/cancelled this iteration; reaped by the retain sweep.
     done: bool,
+}
+
+/// A sampled token whose own decode has not happened yet, plus what was
+/// already done with its piece (docs/resilience.md "Confirm-before-send
+/// and the solo exemption").
+#[derive(Debug)]
+enum PendingTok {
+    /// CONFIRM-BEFORE-SEND (distributed): the piece is emitted only after
+    /// the token's own decode succeeds — a torn remote can zero the
+    /// fetched logits behind a successful-looking step, and a piece once
+    /// streamed cannot be unstreamed (it would poison the client text and
+    /// the M5 resume prefix).
+    Unsent { tok: Token, piece: String },
+    /// Solo emit-at-sample (docs/perf.md §2 exemption): the piece already
+    /// went through the stop-scan and delivery when the token was sampled
+    /// — no transport can corrupt logits behind a successful solo decode,
+    /// and solo decode failure is terminal with no resume prefix.
+    /// `admitted = false` records that the piece completed a stop-string
+    /// match and was withheld; the sequence finishes Stop at confirm time
+    /// (the same step it would on the distributed path).
+    Sent { tok: Token, admitted: bool },
+}
+
+impl PendingTok {
+    fn tok(&self) -> Token {
+        match self {
+            PendingTok::Unsent { tok, .. } | PendingTok::Sent { tok, .. } => *tok,
+        }
+    }
 }
 
 /// A terminal decided while confirmed pieces were still parked on the
@@ -1464,6 +1560,7 @@ fn serve_model(
                         loaded_reference,
                         distributed,
                         &batch_error,
+                        perf,
                         &mut queue,
                     ) {
                         Pumped::Handled => {}
@@ -1481,6 +1578,7 @@ fn serve_model(
                         loaded_reference,
                         distributed,
                         &batch_error,
+                        perf,
                         &mut queue,
                     ) {
                         Pumped::Handled => {}
@@ -1716,6 +1814,10 @@ fn serve_model(
                 && g.terminal_after_drain.is_none()
                 && g.prefill_done >= g.prefix.len()
                 && g.pending.is_some()
+                // A solo pending that already completed a stop match at
+                // sample time finishes at its confirming decode; drafting
+                // past it would be pure waste.
+                && !matches!(g.pending, Some(PendingTok::Sent { admitted: false, .. }))
                 && g.remaining > 1
                 && g.sampler.temperature <= 0.0
             {
@@ -1749,8 +1851,8 @@ fn serve_model(
                 {
                     continue;
                 }
-                if let Some((tok, _)) = &g.pending {
-                    match batch.push(*tok, g.kv_len as i32, g.seq, true) {
+                if let Some(p) = &g.pending {
+                    match batch.push(p.tok(), g.kv_len as i32, g.seq, true) {
                         Ok(index) => decodes.push((i, index)),
                         Err(e) => {
                             push_failure = Some((i, e.to_string()));
@@ -1814,6 +1916,7 @@ fn serve_model(
                         loaded_reference,
                         distributed,
                         &batch_error,
+                        perf,
                         &mut queue,
                     ) {
                         Pumped::Handled => {}
@@ -1899,48 +2002,80 @@ fn serve_model(
         }
 
         // 9. Post-step per decoding sequence: confirm the pending token
-        // (its decode succeeded — confirm-before-send holds), emit its
-        // piece, then sample the next token from this step's logits.
+        // (its decode succeeded), emit its piece if it is still unsent
+        // (CONFIRM-BEFORE-SEND on a distributed model; a solo model
+        // already delivered it at sample time — docs/resilience.md
+        // "Confirm-before-send and the solo exemption"), then sample the
+        // next token from this step's logits.
         let mut emitted = false;
         for (i, index) in decodes {
             let g = &mut active[i];
             g.kv_len += 1;
-            let (tok, piece) = g
+            let pending = g
                 .pending
                 .take()
                 .expect("a stepped sequence has a pending token");
-            g.attempt_tokens.push(tok);
+            g.attempt_tokens.push(pending.tok());
             g.remaining -= 1;
-            if !g.scan.admit(&piece) {
-                // The piece completes a stop-string match: hold it back and
-                // finish with Stop (contract: the completing piece is never
-                // sent; the token still counts as generated).
-                finish_seq(
-                    session,
-                    &mut free,
-                    &mut outbox,
-                    g,
-                    FinishKind::Stop,
-                    perf.kv_reuse.then_some(&mut retained),
-                );
-                continue;
-            }
-            match g.job.tx.try_send(TokenEvent::Token(piece)) {
-                Ok(()) => {
-                    g.pieces_sent += 1;
-                    emitted = true;
-                    if g.ttft_ms.is_none() {
-                        g.ttft_ms = Some(duration_ms(g.arrived.elapsed()));
-                    }
-                }
-                Err(TrySendError::Full(TokenEvent::Token(piece))) => {
-                    // Confirmed but undeliverable right now: park it and
-                    // pause this sequence; the others keep stepping.
-                    g.held.push_back(piece);
-                }
-                Err(_) => {
-                    cancel_seq(session, &mut free, g);
+            match pending {
+                PendingTok::Sent {
+                    admitted: false, ..
+                } => {
+                    // Solo: the piece completed a stop-string match at
+                    // sample time and was withheld (contract: the
+                    // completing piece is never sent; the token still
+                    // counts as generated). Finish Stop now that its
+                    // decode confirmed — the same step the distributed
+                    // path would.
+                    finish_seq(
+                        session,
+                        &mut free,
+                        &mut outbox,
+                        g,
+                        FinishKind::Stop,
+                        perf.kv_reuse.then_some(&mut retained),
+                    );
                     continue;
+                }
+                PendingTok::Sent { admitted: true, .. } => {
+                    // Solo: already delivered (or parked on `held`) at
+                    // sample time; this decode only confirmed it.
+                }
+                PendingTok::Unsent { piece, .. } => {
+                    if !g.scan.admit(&piece) {
+                        // The piece completes a stop-string match: hold it
+                        // back and finish with Stop (contract: the
+                        // completing piece is never sent; the token still
+                        // counts as generated).
+                        finish_seq(
+                            session,
+                            &mut free,
+                            &mut outbox,
+                            g,
+                            FinishKind::Stop,
+                            perf.kv_reuse.then_some(&mut retained),
+                        );
+                        continue;
+                    }
+                    match g.job.tx.try_send(TokenEvent::Token(piece)) {
+                        Ok(()) => {
+                            g.pieces_sent += 1;
+                            emitted = true;
+                            if g.ttft_ms.is_none() {
+                                g.ttft_ms = Some(duration_ms(g.arrived.elapsed()));
+                            }
+                        }
+                        Err(TrySendError::Full(TokenEvent::Token(piece))) => {
+                            // Confirmed but undeliverable right now: park it
+                            // and pause this sequence; the others keep
+                            // stepping.
+                            g.held.push_back(piece);
+                        }
+                        Err(_) => {
+                            cancel_seq(session, &mut free, g);
+                            continue;
+                        }
+                    }
                 }
             }
             if g.remaining == 0 {
@@ -1982,7 +2117,7 @@ fn serve_model(
                 continue;
             }
             match session.model().token_to_piece(next) {
-                Ok(piece) => g.pending = Some((next, piece)),
+                Ok(piece) => stage_pending(g, distributed, next, piece, &mut emitted),
                 Err(e) => fail_seq(session, &mut free, &mut outbox, g, e.to_string()),
             }
         }
@@ -2011,7 +2146,10 @@ fn serve_model(
                         );
                     } else {
                         match session.model().token_to_piece(first) {
-                            Ok(piece) => g.pending = Some((first, piece)),
+                            // Solo: the FIRST piece goes out here, straight
+                            // after the prefill — the whole measured TTFT
+                            // win of the solo exemption.
+                            Ok(piece) => stage_pending(g, distributed, first, piece, &mut emitted),
                             Err(e) => fail_seq(session, &mut free, &mut outbox, g, e.to_string()),
                         }
                     }
@@ -2032,6 +2170,7 @@ fn serve_model(
                 &mut outbox,
                 g,
                 &step,
+                distributed,
                 draft.as_deref_mut(),
                 perf.kv_reuse,
                 &mut retained,
@@ -2063,6 +2202,7 @@ fn serve_model(
 /// Handle one host message inside the serve loop. Generation requests are
 /// validated (and possibly terminated) here; model-replacing messages
 /// become the barrier.
+#[allow(clippy::too_many_arguments)]
 fn pump_msg(
     msg: HostMsg,
     session: &Session<'_>,
@@ -2070,6 +2210,7 @@ fn pump_msg(
     loaded_reference: &str,
     distributed: bool,
     batch_error: &Option<String>,
+    perf: &HostPerf,
     queue: &mut VecDeque<PreparedGen>,
 ) -> Pumped {
     match msg {
@@ -2086,7 +2227,14 @@ fn pump_msg(
             Pumped::Handled
         }
         HostMsg::Embed(job) => {
-            handle_embed(session.model(), info, loaded_reference, distributed, job);
+            handle_embed(
+                session.model(),
+                info,
+                loaded_reference,
+                distributed,
+                perf,
+                job,
+            );
             Pumped::Handled
         }
         HostMsg::Shutdown => Pumped::Exit,
@@ -2128,6 +2276,7 @@ fn handle_embed(
     info: &LoadedModel,
     loaded_reference: &str,
     distributed: bool,
+    perf: &HostPerf,
     job: EmbedJob,
 ) {
     let EmbedJob {
@@ -2181,12 +2330,18 @@ fn handle_embed(
     // non-causal embedding models additionally require
     // n_ubatch >= n_tokens. The mean-pool fallback chunks itself, so the
     // wide batch costs generative models nothing.
+    // Embedding decodes are batch-shaped (whole inputs per call), so the
+    // batch thread count is the one that matters; both are still set so a
+    // single-token input takes the same tuned count.
+    let (n_threads, n_threads_batch) = resolved_threads(perf);
     let mut session = match Session::new(
         model,
         &SessionParams {
             n_ctx: info.n_ctx,
             n_batch: info.n_ctx,
             n_ubatch: info.n_ctx,
+            n_threads,
+            n_threads_batch,
             embeddings: true,
             // The model's own declared pooling: purpose-built embedding
             // models use their trained head; generative models resolve to
@@ -2475,7 +2630,11 @@ fn build_spec_step(
     batch: &mut Batch,
     g: &ActiveGen,
 ) -> Result<SpecStep, onebrain_engine::EngineError> {
-    let (tok, _) = g.pending.as_ref().expect("eligibility checked pending");
+    let tok = g
+        .pending
+        .as_ref()
+        .expect("eligibility checked pending")
+        .tok();
     let confirmed = g.kv_len;
     debug_assert_eq!(
         g.prefix.len() + g.attempt_tokens.len(),
@@ -2505,7 +2664,7 @@ fn build_spec_step(
         }
     };
     let mut catchup: Vec<Token> = (synced..confirmed).map(stream_tok).collect();
-    catchup.push(*tok);
+    catchup.push(tok);
     draft.session.decode(&catchup)?;
     let mut draft_kv = confirmed + 1;
     // Draft greedily. K is capped by the decode budget beyond the pending
@@ -2537,7 +2696,7 @@ fn build_spec_step(
     draft.synced = Some((g.uid, draft_kv));
     batch.clear();
     let mut indexes = Vec::with_capacity(1 + drafts.len());
-    indexes.push(batch.push(*tok, confirmed as i32, g.seq, true)?);
+    indexes.push(batch.push(tok, confirmed as i32, g.seq, true)?);
     for (i, d) in drafts.iter().enumerate() {
         indexes.push(batch.push(*d, (confirmed + 1 + i) as i32, g.seq, true)?);
     }
@@ -2561,13 +2720,14 @@ fn process_spec_step(
     outbox: &mut Vec<PendingTerminal>,
     g: &mut ActiveGen,
     step: &SpecStep,
+    distributed: bool,
     draft: Option<&mut DraftCtx<'_, '_>>,
     kv_reuse: bool,
     retained: &mut Vec<RetainedSlot>,
     emitted: &mut bool,
 ) -> Option<String> {
     let old_confirmed = g.kv_len;
-    let (tok, piece) = g
+    let pending = g
         .pending
         .take()
         .expect("a speculative round has a pending token");
@@ -2576,9 +2736,12 @@ fn process_spec_step(
     // draft token is confirmed when the target's greedy choice after the
     // previous confirmed token IS that draft token — its own decode
     // already happened in the same batch, so emitting it preserves
-    // confirm-before-send exactly. Sampling goes through g's own chain
+    // confirm-before-send exactly (on a solo model the pending token's
+    // piece went out at sample time already — the solo exemption; the
+    // drafts' pieces are emitted here the moment they are known, which IS
+    // their sample time). Sampling goes through g's own chain
     // (speculation is greedy-only, so the chain is its greedy chain).
-    let mut confirmed: Vec<(Token, String)> = vec![(tok, piece)];
+    let mut confirmed: Vec<(Token, String)> = Vec::new();
     let mut next_pending: Option<Token> = None;
     let mut render_error: Option<String> = None;
     for (i, d) in step.drafts.iter().enumerate() {
@@ -2595,7 +2758,7 @@ fn process_spec_step(
             }
         }
     }
-    let accepted = confirmed.len() - 1;
+    let accepted = confirmed.len();
     g.drafted += step.drafts.len() as u32;
     g.accepted += accepted as u32;
     if let Some(message) = render_error {
@@ -2618,8 +2781,8 @@ fn process_spec_step(
     // Roll back rejected draft positions (position rule: a real seq_rm,
     // never a rewound counter). The verify decoded 1 + drafts.len()
     // tokens; we keep 1 + accepted.
-    let keep = old_confirmed + confirmed.len();
-    if confirmed.len() < 1 + step.drafts.len() {
+    let keep = old_confirmed + 1 + confirmed.len();
+    if confirmed.len() < step.drafts.len() {
         if let Err(e) = session.seq_rm(g.seq, keep as i32, -1) {
             if let Some(d) = draft {
                 d.session.reset();
@@ -2633,30 +2796,60 @@ fn process_spec_step(
     }
     g.kv_len = keep;
 
-    // Bookkeeping + emission in stream order. The stop-scan can end the
-    // run mid-list: later confirmed tokens are then discarded — they never
-    // count as generated — and their KV entries are trimmed off.
-    let confirmed_total = confirmed.len();
+    // Bookkeeping + emission in stream order: the pending token first,
+    // then the accepted drafts. The stop-scan can end the run mid-list:
+    // later confirmed tokens are then discarded — they never count as
+    // generated — and their KV entries are trimmed off.
+    let confirmed_total = 1 + confirmed.len();
     let mut finish: Option<FinishKind> = None;
-    let mut kept = 0usize;
-    for (t, p) in confirmed {
-        g.attempt_tokens.push(t);
-        g.remaining -= 1;
-        kept += 1;
-        if !g.scan.admit(&p) {
-            // Stop match: the completing piece is held back entirely; the
-            // token still counts as generated (contract).
-            finish = Some(FinishKind::Stop);
-            break;
+    let mut kept = 1usize;
+    // Entry 0: the pending token. Its budget/stream bookkeeping is
+    // identical either way; a solo (`Sent`) pending already went through
+    // the stop-scan and delivery at sample time, so only its recorded
+    // verdict applies here.
+    g.attempt_tokens.push(pending.tok());
+    g.remaining -= 1;
+    match pending {
+        PendingTok::Sent { admitted, .. } => {
+            if !admitted {
+                // Stop match recorded at sample time: the completing piece
+                // was withheld; finish Stop now that its decode confirmed.
+                finish = Some(FinishKind::Stop);
+            }
         }
-        deliver_piece(g, p, emitted);
-        if g.remaining == 0 {
-            debug_assert_eq!(
-                kept, confirmed_total,
-                "K is budget-capped, so the budget runs out only on the last token"
-            );
-            finish = Some(FinishKind::Length);
-            break;
+        PendingTok::Unsent { piece, .. } => {
+            if !g.scan.admit(&piece) {
+                // Stop match: the completing piece is held back entirely;
+                // the token still counts as generated (contract).
+                finish = Some(FinishKind::Stop);
+            } else {
+                deliver_piece(g, piece, emitted);
+            }
+        }
+    }
+    if finish.is_none() {
+        // Spec eligibility required budget beyond the pending token, so
+        // the budget cannot run out on entry 0.
+        debug_assert!(g.remaining > 0, "spec rounds need remaining > 1 at build");
+        for (t, p) in confirmed {
+            g.attempt_tokens.push(t);
+            g.remaining -= 1;
+            kept += 1;
+            if !g.scan.admit(&p) {
+                // Stop match: the completing piece is held back entirely;
+                // the token still counts as generated (contract).
+                finish = Some(FinishKind::Stop);
+                break;
+            }
+            deliver_piece(g, p, emitted);
+            if g.remaining == 0 {
+                debug_assert_eq!(
+                    kept, confirmed_total,
+                    "K is budget-capped, so the budget runs out only on the last token"
+                );
+                finish = Some(FinishKind::Length);
+                break;
+            }
         }
     }
     if kept < confirmed_total {
@@ -2699,7 +2892,7 @@ fn process_spec_step(
             finish = Some(FinishKind::Stop);
         } else {
             match session.model().token_to_piece(next) {
-                Ok(p) => g.pending = Some((next, p)),
+                Ok(p) => stage_pending(g, distributed, next, p, emitted),
                 Err(e) => {
                     fail_seq(session, free, outbox, g, e.to_string());
                     return None;
@@ -2717,6 +2910,42 @@ fn process_spec_step(
         }
     }
     None
+}
+
+/// Stage a freshly sampled token as `g`'s pending token.
+///
+/// DISTRIBUTED: the piece is parked unsent — CONFIRM-BEFORE-SEND
+/// (distributed) holds exactly as documented in docs/resilience.md; step 9
+/// emits it only after the next decode succeeds.
+///
+/// SOLO emit-at-sample (docs/perf.md §2 exemption, soundness argument in
+/// docs/resilience.md "Confirm-before-send and the solo exemption"): the
+/// sampled token was drawn from logits a SUCCEEDED `llama_decode`
+/// produced and no transport exists that could have corrupted them, so
+/// the piece is stop-scanned and delivered NOW — one decode step earlier
+/// than confirm-time emission (that step is the whole of the measured
+/// TTFT win). A solo decode failure afterwards is terminal with no retry
+/// prefix, so nothing can ever resume past the already-sent piece; the
+/// residual is one extra CORRECT piece before a terminal error. The
+/// stop-scan verdict is recorded so the completing piece of a stop match
+/// is never sent and the finish itself still happens at confirm time —
+/// identical bookkeeping (kv/attempt/remaining) to the distributed path.
+fn stage_pending(
+    g: &mut ActiveGen,
+    distributed: bool,
+    tok: Token,
+    piece: String,
+    emitted: &mut bool,
+) {
+    if distributed {
+        g.pending = Some(PendingTok::Unsent { tok, piece });
+        return;
+    }
+    let admitted = g.scan.admit(&piece);
+    if admitted {
+        deliver_piece(g, piece, emitted);
+    }
+    g.pending = Some(PendingTok::Sent { tok, admitted });
 }
 
 /// Deliver a confirmed piece in order: behind any held backlog, otherwise
@@ -3181,6 +3410,115 @@ impl EngineBackend for DaemonBackend {
 mod tests {
     use super::*;
 
+    /// Thread-knob resolution (docs/perf.md "Thread-count defaults"):
+    /// 0 = the machine's detected recommendation (never llama.cpp's fixed
+    /// 4-thread default), positive = explicit override used as-is.
+    #[test]
+    fn thread_knobs_resolve_to_detection_or_override() {
+        let auto = HostPerf::default();
+        assert_eq!((auto.n_threads, auto.n_threads_batch), (0, 0));
+        let rec = onebrain_engine::cpu::recommended_threads();
+        assert_eq!(
+            resolved_threads(&auto),
+            (rec.n_threads, rec.n_threads_batch),
+            "0 must resolve to the detected per-machine counts"
+        );
+        let (n, nb) = resolved_threads(&auto);
+        assert!(n >= 1 && nb >= n, "resolved counts are sane");
+        // Explicit overrides win, each knob independently.
+        let over = HostPerf {
+            n_threads: 3,
+            n_threads_batch: 7,
+            ..HostPerf::default()
+        };
+        assert_eq!(resolved_threads(&over), (3, 7));
+        let half = HostPerf {
+            n_threads: 5,
+            ..HostPerf::default()
+        };
+        assert_eq!(resolved_threads(&half), (5, rec.n_threads_batch));
+    }
+
+    /// Single-request session shape (docs/perf.md §6 exemption): the
+    /// unified multi-sequence layout costs ~0.6 ms/tok with nothing to
+    /// show for it at concurrency 1, so ONLY `max_concurrent == 1` drops
+    /// to the plain single-sequence session; every higher (or degenerate
+    /// 0) knob value keeps the unified layout the §6 headroom math
+    /// assumes.
+    #[test]
+    fn single_request_hosts_use_the_plain_session_shape() {
+        let shape = |max_concurrent| {
+            target_session_shape(&HostPerf {
+                max_concurrent,
+                ..HostPerf::default()
+            })
+        };
+        assert_eq!(shape(1), (1, false), "knob 1: pre-M7 single-seq session");
+        assert_eq!(shape(0), (1, false), "values below 1 are treated as 1");
+        assert_eq!(shape(2), (2, true), "any concurrency keeps unified KV");
+        assert_eq!(shape(4), (4, true), "the default shape is unchanged");
+    }
+
+    /// Behavioral pin for the same exemption: greedy output through a
+    /// 1-concurrency host (plain session shape) is byte-identical to the
+    /// default 4-concurrency host (unified shape) — the shape changes
+    /// cost, never content.
+    #[test]
+    fn single_request_session_shape_is_byte_identical() {
+        let Some((one, one_handle, smoke)) = spawn_with_smoke_model(
+            None,
+            HostPerf {
+                max_concurrent: 1,
+                ..HostPerf::default()
+            },
+        ) else {
+            return;
+        };
+        let (text_one, stats_one) = run_to_done(&one, &smoke, "Once upon a time", 12);
+        one.send(HostMsg::Shutdown).unwrap();
+        one_handle.join().unwrap();
+
+        let Some((four, four_handle, smoke)) = spawn_with_smoke_model(None, HostPerf::default())
+        else {
+            return;
+        };
+        let (text_four, stats_four) = run_to_done(&four, &smoke, "Once upon a time", 12);
+        four.send(HostMsg::Shutdown).unwrap();
+        four_handle.join().unwrap();
+
+        assert_eq!(
+            text_one, text_four,
+            "the single-request session shape must not change greedy output"
+        );
+        assert_eq!(stats_one.completion_tokens, stats_four.completion_tokens);
+    }
+
+    /// Grep-level pin (docs/resilience.md "Confirm-before-send and the
+    /// solo exemption"): the step loop's DISTRIBUTED path must keep
+    /// parking sampled pieces unsent until their own decode succeeds.
+    /// The `PendingTok::Unsent` machinery and its gate are the contract;
+    /// deleting or un-gating them must fail here, not silently ship.
+    #[test]
+    fn confirm_before_send_distributed_gate_stays_in_the_step_loop() {
+        let src = include_str!("engine_host.rs");
+        assert!(
+            src.contains("enum PendingTok"),
+            "the pending-token state machine must remain"
+        );
+        assert!(
+            src.contains("CONFIRM-BEFORE-SEND (distributed)"),
+            "the distributed confirm-before-send arm must remain documented"
+        );
+        assert!(
+            src.contains("g.pending = Some(PendingTok::Unsent { tok, piece });"),
+            "stage_pending must park distributed pieces unsent"
+        );
+        assert!(
+            src.contains("if distributed {"),
+            "stage_pending must gate emit-at-sample on the model being solo"
+        );
+    }
+
     /// Load the OB_SMOKE_MODEL solo into a fresh host (by its local path)
     /// and hand back everything a supervised-generation test needs. `None`
     /// when the env var is unset (the test should skip).
@@ -3196,13 +3534,27 @@ mod tests {
     /// draft==target case: greedy determinism makes acceptance total).
     fn spawn_smoke(
         decode_delay: Option<Duration>,
-        perf: HostPerf,
+        mut perf: HostPerf,
         with_draft: bool,
     ) -> Option<(EngineHost, std::thread::JoinHandle<()>, String)> {
         let Ok(smoke) = std::env::var("OB_SMOKE_MODEL") else {
             eprintln!("OB_SMOKE_MODEL not set; skipping supervised generation test");
             return None;
         };
+        // Cap auto-detected engine threads for tests: this suite runs
+        // dozens of engine sessions in ONE process in parallel, and ggml's
+        // spin-wait workers oversubscribe the machine into timing-window
+        // failures (a real daemon serves ONE session). The 260K smoke
+        // model gains nothing past 2 threads anyway. Detection itself is
+        // pinned by thread_knobs_resolve_to_detection_or_override and the
+        // engine's thread-invariance smoke test; a test passing explicit
+        // counts keeps them.
+        if perf.n_threads == 0 {
+            perf.n_threads = 2;
+        }
+        if perf.n_threads_batch == 0 {
+            perf.n_threads_batch = 2;
+        }
         let (host, handle) = EngineHost::spawn(decode_delay, perf);
         let (ptx, _prx) = mpsc::unbounded_channel();
         let (rtx, rrx) = oneshot::channel();

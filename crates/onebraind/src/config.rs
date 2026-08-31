@@ -85,6 +85,18 @@ pub struct PerfSection {
     /// Defined now for the contract's config surface; consumed when the
     /// speculative loop lands. `None` = no draft configured.
     pub draft_model: Option<String>,
+    /// Engine threads for single-token decode (docs/perf.md "Thread-count
+    /// defaults"). `0` (the default) auto-detects the machine's
+    /// performance-core count — llama.cpp's own engine default of 4
+    /// threads left decode 1.7-2.1x slower than measured-best on modern
+    /// CPUs. Positive values are used as-is (machine-dependent tuning
+    /// knob); decode is bandwidth-bound, so more is not always better.
+    pub n_threads: i32,
+    /// Engine threads for batch decodes (prefill and multi-token steps).
+    /// `0` (the default) auto-detects the full physical-core count —
+    /// prefill is compute-bound and scales further than decode. Positive
+    /// values are used as-is.
+    pub n_threads_batch: i32,
 }
 
 impl Default for PerfSection {
@@ -96,6 +108,8 @@ impl Default for PerfSection {
             prefill_overlap: true,
             kv_reuse: true,
             draft_model: None,
+            n_threads: 0,
+            n_threads_batch: 0,
         }
     }
 }
@@ -411,6 +425,11 @@ mod tests {
         assert!(p.prefill_overlap);
         assert!(p.kv_reuse);
         assert_eq!(p.draft_model, None);
+        // Thread knobs default to 0 = auto-detect (performance cores /
+        // physical cores) — the measured-best-safe default; a positive
+        // value is an explicit machine-specific override.
+        assert_eq!(p.n_threads, 0);
+        assert_eq!(p.n_threads_batch, 0);
         // A config file without a [perf] table parses to the same defaults.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
@@ -435,6 +454,7 @@ mod tests {
         assert_eq!(c.perf.queue_depth, 8);
         assert_eq!(c.perf.n_ubatch, 512);
         assert!(c.perf.kv_reuse);
+        assert_eq!(c.perf.n_threads, 0);
         // Full save/load roundtrip with every knob set.
         let c = Config {
             perf: PerfSection {
@@ -444,6 +464,8 @@ mod tests {
                 prefill_overlap: false,
                 kv_reuse: false,
                 draft_model: Some("tinystories-260k".into()),
+                n_threads: 12,
+                n_threads_batch: 20,
             },
             ..Default::default()
         };

@@ -52,10 +52,16 @@ What it does:
 - `get_tensor` zeroes the destination and returns (void signature); the
   socket is now marked dead, so the surrounding decode fails at its next
   remote command. A token sampled from such zeroed logits is never
-  delivered: the engine's confirm-before-send loop only streams a token
-  after its own decode succeeds (residual: a tear exactly at the FINAL
-  budgeted token has no confirming decode — one-token window, Length
-  finishes only). `set_tensor` / `memset_tensor` / `buffer_clear` log
+  delivered: on DISTRIBUTED models the engine's confirm-before-send
+  loops only stream a token after its own decode succeeds (residual: a
+  tear exactly at the FINAL budgeted token has no confirming decode —
+  one-token window, Length finishes only). Solo sessions are exempt and
+  emit at sample time (docs/resilience.md "Confirm-before-send and the
+  solo exemption"): this zeroing path is the ONLY way logits can be
+  corrupted behind an apparently successful decode, it lives entirely
+  in the RPC client, so a solo model has no tear path; solo decode
+  failure is terminal with no resume prefix that could ever consume an
+  unsent piece. `set_tensor` / `memset_tensor` / `buffer_clear` log
   (first failure loud, later ones debug) and return; `cpy_tensor` returns
   false; `init_tensor` returns `GGML_STATUS_FAILED`.
 - Alloc/query paths return failure values their callers already handle:

@@ -5,6 +5,7 @@
 //! load a GGUF, tokenize, greedy generation, and the engine build hash that
 //! nodes compare at handshake. Distributed execution arrives in M3.
 
+pub mod cpu;
 pub mod rpc;
 pub mod rpc_cache;
 mod sys;
@@ -308,6 +309,11 @@ impl Default for ModelParams {
 pub struct Model {
     ptr: *mut sys::ObModel,
     path: String,
+    /// Loaded across remote RPC devices (`load_distributed*` with at least
+    /// one server). Gates [`Session::generate`]'s confirm-before-send: a
+    /// distributed decode can tear mid-request (docs/resilience.md), a
+    /// solo one cannot.
+    distributed: bool,
 }
 
 // The underlying llama_model is not tied to a thread.
@@ -327,6 +333,7 @@ impl Model {
         Ok(Model {
             ptr,
             path: path_str,
+            distributed: false,
         })
     }
 
@@ -357,6 +364,7 @@ impl Model {
         Ok(Model {
             ptr,
             path: path_strs[0].clone(),
+            distributed: false,
         })
     }
 
@@ -446,11 +454,20 @@ impl Model {
         Ok(Model {
             ptr,
             path: path_strs[0].clone(),
+            distributed: !servers.is_empty(),
         })
     }
 
     pub fn path(&self) -> &str {
         &self.path
+    }
+
+    /// True when the model's graph executes across remote RPC devices —
+    /// the case where a mid-request transport tear is possible and
+    /// [`Session::generate`] must keep confirm-before-send
+    /// (docs/resilience.md "Confirm-before-send and the solo exemption").
+    pub fn is_distributed(&self) -> bool {
+        self.distributed
     }
 
     pub fn n_layer(&self) -> i32 {
@@ -701,6 +718,13 @@ pub struct SessionParams {
     pub n_batch: u32,
     /// <= 0 lets the engine choose.
     pub n_threads: i32,
+    /// Threads for BATCH decodes (`n_tokens > 1`: prefill and micro-batched
+    /// steps). Separate from `n_threads` because the two optima differ on
+    /// hybrid P/E-core machines: prefill is compute-bound and keeps scaling
+    /// where bandwidth-bound single-token decode regresses (docs/perf.md
+    /// "Thread-count defaults"). `<= 0` follows `n_threads` — exactly the
+    /// pre-widening behavior, where the shim tied the two together.
+    pub n_threads_batch: i32,
     /// Physical micro-batch: `llama_decode` splits each `n_batch` chunk
     /// into `n_ubatch` slices internally; per-slice activation copies bound
     /// distributed prefill cost (docs/perf.md §0/§3). 0 = engine default;
@@ -735,6 +759,7 @@ impl Default for SessionParams {
             n_ctx: 4096,
             n_batch: 512,
             n_threads: 0,
+            n_threads_batch: 0,
             // llama.cpp's own default; spelled out because it becomes a
             // `[perf]` config knob (docs/perf.md §3).
             n_ubatch: 512,
@@ -758,6 +783,7 @@ impl SessionParams {
             n_ubatch: self.n_ubatch,
             n_seq_max: self.n_seq_max,
             n_threads: self.n_threads,
+            n_threads_batch: self.n_threads_batch,
             flash_attn_type: self.flash_attn_type.code(),
             type_k: self.type_k.code(),
             type_v: self.type_v.code(),
@@ -1242,28 +1268,56 @@ impl<'m> Session<'m> {
                 return Ok(stats);
             }
             let piece = self.model.token_to_piece(tok)?;
-            // Confirm-before-send (docs/resilience.md): a token's own
-            // decode must succeed BEFORE its piece is emitted. With a torn
-            // remote (patches/0002), the logits fetch that produced `tok`
-            // can have been silently zeroed — the very next decode on the
-            // dead socket fails, and a piece once streamed cannot be
-            // unstreamed (it would poison both the client text and the
-            // resume prefix). Costs one decode step of first-token latency;
-            // the token sequence is unchanged. Residual: a tear exactly at
-            // the final budgeted token has no confirming decode (the tear
-            // window is one token; documented in patches/README.md).
-            self.decode(&[tok])?;
-            stats.generated_tokens += 1;
-            if stats.generated_tokens == 1 {
-                // Time to first token = up to the first EMITTED piece, so
-                // it includes the confirming decode above — that is the
-                // moment the piece may actually reach the client.
-                stats.ttft_ms = start.elapsed().as_secs_f64() * 1e3;
-            }
-            if on_token(tok, &piece).is_break() {
-                stats.finished = FinishReason::Aborted;
-                stats.decode_ms = decode_start.elapsed().as_secs_f64() * 1e3;
-                return Ok(stats);
+            if self.model.distributed {
+                // Confirm-before-send (distributed — docs/resilience.md
+                // "Confirm-before-send and the solo exemption"): a token's
+                // own decode must succeed BEFORE its piece is emitted. With
+                // a torn remote (patches/0002), the logits fetch that
+                // produced `tok` can have been silently zeroed — the very
+                // next decode on the dead socket fails, and a piece once
+                // streamed cannot be unstreamed (it would poison both the
+                // client text and the resume prefix). Costs one decode step
+                // of first-token latency; the token sequence is unchanged.
+                // Residual: a tear exactly at the final budgeted token has
+                // no confirming decode (the tear window is one token;
+                // documented in patches/README.md).
+                self.decode(&[tok])?;
+                stats.generated_tokens += 1;
+                if stats.generated_tokens == 1 {
+                    // Time to first token = up to the first EMITTED piece,
+                    // so it includes the confirming decode above — that is
+                    // the moment the piece may actually reach the client.
+                    stats.ttft_ms = start.elapsed().as_secs_f64() * 1e3;
+                }
+                if on_token(tok, &piece).is_break() {
+                    stats.finished = FinishReason::Aborted;
+                    stats.decode_ms = decode_start.elapsed().as_secs_f64() * 1e3;
+                    return Ok(stats);
+                }
+            } else {
+                // Solo emit-at-sample (docs/perf.md §2, the solo
+                // confirm-before-send exemption): with no transport in the
+                // path there is no tear that can corrupt logits behind a
+                // successful decode return — `tok` is always drawn from
+                // logits a SUCCEEDED decode produced — and a solo decode
+                // failure is terminal (no retry, no resume prefix), so
+                // nothing can ever resume past an unsent piece. Emitting
+                // before the next decode removes one decode step from
+                // first-token latency; the residual is that the stream may
+                // deliver one extra (CORRECT) piece before a terminal
+                // error. An aborted callback returns without decoding the
+                // just-emitted token (the KV then lacks it; reset() before
+                // reusing the session, as every caller already does).
+                stats.generated_tokens += 1;
+                if stats.generated_tokens == 1 {
+                    stats.ttft_ms = start.elapsed().as_secs_f64() * 1e3;
+                }
+                if on_token(tok, &piece).is_break() {
+                    stats.finished = FinishReason::Aborted;
+                    stats.decode_ms = decode_start.elapsed().as_secs_f64() * 1e3;
+                    return Ok(stats);
+                }
+                self.decode(&[tok])?;
             }
         }
         stats.decode_ms = decode_start.elapsed().as_secs_f64() * 1e3;
@@ -1464,6 +1518,10 @@ mod tests {
         assert_eq!(p.n_ctx, 4096);
         assert_eq!(p.n_batch, 512);
         assert_eq!(p.n_threads, 0);
+        assert_eq!(
+            p.n_threads_batch, 0,
+            "0 follows n_threads: the pre-widening shim tied the two counts"
+        );
         assert_eq!(p.n_ubatch, 512, "llama.cpp default n_ubatch");
         assert_eq!(p.n_seq_max, 1, "llama.cpp default n_seq_max");
         assert!(!p.kv_unified, "llama.cpp default kv_unified = false");
@@ -1557,6 +1615,129 @@ mod tests {
             gen(&solo),
             gen(&split),
             "single-part split load must generate identical greedy tokens"
+        );
+    }
+
+    /// Thread-count defaults (docs/perf.md "Thread-count defaults"):
+    /// greedy output must be byte-identical whatever thread counts a
+    /// session runs with — ggml parallelizes row-wise, so the count
+    /// changes speed, never results. This is the byte-identity anchor for
+    /// the daemon resolving `n_threads`/`n_threads_batch` to the detected
+    /// per-machine counts instead of llama.cpp's fixed 4.
+    #[test]
+    fn smoke_greedy_is_thread_count_invariant() {
+        let Ok(model_path) = std::env::var("OB_SMOKE_MODEL") else {
+            eprintln!("OB_SMOKE_MODEL not set; skipping thread-invariance smoke test");
+            return;
+        };
+        let model = Model::load(Path::new(&model_path), &ModelParams::default()).expect("load");
+        let prompt = model.tokenize("Once upon a time", true).unwrap();
+        let detected = cpu::recommended_threads();
+        let gen = |n_threads: i32, n_threads_batch: i32| {
+            let mut session = Session::new(
+                &model,
+                &SessionParams {
+                    n_ctx: 256,
+                    n_batch: 64,
+                    n_threads,
+                    n_threads_batch,
+                    ..SessionParams::default()
+                },
+            )
+            .unwrap();
+            session.generate_greedy(&prompt, 24, |_, _| {}).unwrap()
+        };
+        let baseline = gen(0, 0); // llama.cpp's own default (tied, 4)
+        assert_eq!(baseline, gen(1, 1), "single-threaded must match");
+        assert_eq!(baseline, gen(2, 3), "split decode/batch counts must match");
+        assert_eq!(
+            baseline,
+            gen(detected.n_threads, detected.n_threads_batch),
+            "the detected serving default must match llama.cpp's 4-thread output"
+        );
+    }
+
+    /// Solo emit-at-sample behavioral pin (docs/resilience.md
+    /// "Confirm-before-send and the solo exemption"): on a SOLO model,
+    /// `generate` emits a sampled piece BEFORE the token's own decode —
+    /// observable as exactly ONE more streamed piece than a hand-rolled
+    /// confirm-before-send loop when a mid-generation decode failure is
+    /// forced (KV exhaustion via a tiny n_ctx: transport-free, and the
+    /// documented residual "one extra CORRECT piece before a terminal
+    /// error" in the flesh).
+    #[test]
+    fn smoke_solo_generate_emits_at_sample_time() {
+        let Ok(model_path) = std::env::var("OB_SMOKE_MODEL") else {
+            eprintln!("OB_SMOKE_MODEL not set; skipping solo emit-at-sample test");
+            return;
+        };
+        let model = Model::load(Path::new(&model_path), &ModelParams::default()).expect("load");
+        assert!(!model.is_distributed(), "a plain load is solo");
+        let prompt = model.tokenize("Once upon a time", true).unwrap();
+        let params = SessionParams {
+            n_ctx: 32,
+            n_batch: 32,
+            ..SessionParams::default()
+        };
+
+        // Reference: the pre-exemption confirm-before-send order, hand
+        // rolled — a piece counts only after its token's own decode
+        // succeeded. Greedy determinism makes the token stream identical
+        // to generate()'s below.
+        let mut reference = Session::new(&model, &params).unwrap();
+        reference.decode(&prompt).unwrap();
+        let mut confirmable = 0usize;
+        let failed = loop {
+            let tok = reference.sample();
+            if model.is_eog(tok) {
+                break false;
+            }
+            let _piece = model.token_to_piece(tok).unwrap();
+            if reference.decode(&[tok]).is_err() {
+                break true;
+            }
+            confirmable += 1;
+            assert!(confirmable < 256, "n_ctx 32 must exhaust the KV quickly");
+        };
+        assert!(failed, "KV exhaustion must hit before EOG on this prompt");
+
+        let mut s = Session::new(&model, &params).unwrap();
+        let mut streamed = 0usize;
+        let result = s.generate(&prompt, 4096, |_, _| {
+            streamed += 1;
+            std::ops::ControlFlow::Continue(())
+        });
+        assert!(
+            matches!(result, Err(EngineError::Decode { .. })),
+            "got {result:?}"
+        );
+        assert_eq!(
+            streamed,
+            confirmable + 1,
+            "solo generate must emit exactly one piece more than \
+             confirm-before-send would: the sample-time emission of the \
+             token whose own decode then failed"
+        );
+    }
+
+    /// Grep-level pin (docs/resilience.md "Confirm-before-send and the
+    /// solo exemption"): the distributed confirm-before-send arm must
+    /// stay in `Session::generate`, gated on the model being distributed.
+    /// Removing or un-gating it is a contract change that must fail here.
+    #[test]
+    fn confirm_before_send_distributed_gate_stays_in_generate() {
+        let src = include_str!("lib.rs");
+        assert!(
+            src.contains("if self.model.distributed {"),
+            "Session::generate must gate emission order on Model::distributed"
+        );
+        assert!(
+            src.contains("Confirm-before-send (distributed"),
+            "the distributed confirm-before-send arm (and its rationale) must remain"
+        );
+        assert!(
+            src.contains("Solo emit-at-sample"),
+            "the solo exemption arm must remain documented at the emission site"
         );
     }
 

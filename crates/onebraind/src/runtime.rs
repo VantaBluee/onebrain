@@ -91,6 +91,11 @@ pub fn run_blocking() -> Result<(), DaemonError> {
         n_ubatch: config.perf.n_ubatch,
         prefill_overlap: config.perf.prefill_overlap,
         kv_reuse: config.perf.kv_reuse,
+        // Thread knobs (docs/perf.md "Thread-count defaults"): 0 = the
+        // host auto-detects at load (performance cores for decode,
+        // physical cores for prefill); positive = explicit override.
+        n_threads: config.perf.n_threads,
+        n_threads_batch: config.perf.n_threads_batch,
         ..HostPerf::default()
     };
     let (host, host_thread) = EngineHost::spawn(decode_delay, host_perf);

@@ -172,6 +172,12 @@ ob_session * ob_session_new(ob_model * m, const ob_session_params * p) {
         params.n_threads = p->n_threads;
         params.n_threads_batch = p->n_threads;
     }
+    // A separate batch-decode count (prefill / multi-token steps): set only
+    // when positive, so {n_threads, 0} reproduces the pre-widening tied
+    // behavior bit-for-bit and {0, 0} keeps llama.cpp's own defaults.
+    if (p->n_threads_batch > 0) {
+        params.n_threads_batch = p->n_threads_batch;
+    }
     params.flash_attn_type = (enum llama_flash_attn_type) p->flash_attn_type;
     params.type_k = (enum ggml_type) p->type_k;
     params.type_v = (enum ggml_type) p->type_v;

@@ -153,6 +153,13 @@ typedef struct ob_session_params {
     // docs/perf.md §6). 0 = engine default (1).
     uint32_t n_seq_max;
     int32_t  n_threads; // <= 0 lets the engine pick
+    // Threads for BATCH decodes (n_tokens > 1: prefill, micro-batched
+    // steps). llama.cpp keeps two counts because their optima differ on
+    // hybrid P/E-core machines (prefill is compute-bound and scales past
+    // the point where bandwidth-bound decode regresses — docs/perf.md
+    // "Thread-count defaults"). <= 0 follows n_threads (which is exactly
+    // the pre-widening behavior: the shim tied them together).
+    int32_t  n_threads_batch;
     // Mirrors enum llama_flash_attn_type: -1 AUTO, 0 disabled, 1 enabled.
     int32_t  flash_attn_type;
     // ggml_type codes for the KV cache (0 = F32, 1 = F16, 2 = Q4_0,

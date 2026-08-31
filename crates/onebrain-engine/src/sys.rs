@@ -35,6 +35,7 @@ pub struct ObSessionParams {
     pub n_ubatch: u32,
     pub n_seq_max: u32,
     pub n_threads: c_int,
+    pub n_threads_batch: c_int,
     pub flash_attn_type: i32,
     pub type_k: i32,
     pub type_v: i32,

@@ -63,8 +63,40 @@ ships with the instrument that proves it.
   and memory ops `ob_memory_seq_rm/seq_cp/seq_keep/seq_pos_max`.
   Position rule (upstream-enforced): sequence positions must stay
   consecutive — rollback is a real `seq_rm`, never a rewound counter.
-- `Session::generate` keeps confirm-before-send exactly as documented in
-  docs/resilience.md.
+- Distributed sessions keep confirm-before-send exactly as documented
+  in docs/resilience.md; solo sessions emit each piece at sample time
+  (docs/resilience.md "Confirm-before-send and the solo exemption": no
+  tear path exists solo, solo decode failure is terminal, and no resume
+  prefix can consume an unsent piece — the exemption removes one decode
+  step from TTFT). Applies to both `Session::generate` and the daemon's
+  step loop; the gate is solely whether the loaded model is
+  distributed.
+
+## Thread-count defaults (post-M7 measured fix)
+
+- Problem (measured): a `SessionParams` with `n_threads = 0` resolves to
+  llama.cpp's `GGML_DEFAULT_N_THREADS = 4` regardless of the machine.
+  On a 24-core hybrid box that left decode 1.7-2.1x and prefill 3-4x
+  below measured-best, while the worker RPC serve path already used all
+  cores — the head was the artificial bottleneck.
+- Fix: `ob_session_params` carries a separate `n_threads_batch` (<= 0
+  follows `n_threads`, exactly the pre-widening tied behavior), and the
+  daemon resolves BOTH counts at every load via
+  `onebrain_engine::cpu::recommended_threads()`: decode threads = the
+  performance-core count (single-token decode is memory-bandwidth-bound
+  and regresses when efficiency cores join), batch/prefill threads = the
+  full physical-core count (prefill is compute-bound and keeps scaling).
+  No affinity pinning anywhere: pinned masks measured strictly worse
+  (E-core-only collapsed an order of magnitude).
+- Config: `[perf] n_threads` / `n_threads_batch` (both default `0` =
+  auto-detect; positive = explicit override, used as-is). The target,
+  draft, and embed sessions all take the resolved counts; the scheduler
+  microbench (`profile.rs`) measures with the same counts so
+  `profile.toml` reflects how the node actually serves (absolute values
+  shifted when this landed; relative node ordering is preserved).
+- `SessionParams::default()` still resolves both fields to 0 (llama.cpp's
+  own defaults) — the §2 bit-for-bit contract for existing callers is
+  unchanged; the daemon opts in explicitly.
 
 ## 3. Overlapped chunked prefill (patch 0003 — the DoD headline)
 
@@ -144,7 +176,12 @@ ships with the instrument that proves it.
   `n_seq_max = max_concurrent_requests`; each decode step batches one
   token per active sequence (prefills chunk-interleave FCFS; no
   starvation: a sequence's decode never waits on another's prefill
-  chunk more than one chunk).
+  chunk more than one chunk). Single-request exemption (measured): the
+  unified multi-sequence layout costs ~0.6 ms per decoded token even
+  with one active request, so `max_concurrent_requests = 1` creates the
+  plain pre-M7 session (`n_seq_max = 1`, per-sequence KV) instead —
+  strictly gated on the knob being 1; the admission math degenerates to
+  the single slot there. Greedy output is byte-identical either way.
 - Admission control (fixes the audited unbounded-queue gap): a request
   that cannot fit (unified-KV headroom check at admission) queues up to
   `queue_depth` (default 8), beyond which the dialects return a typed

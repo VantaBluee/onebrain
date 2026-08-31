@@ -57,6 +57,52 @@ wire format are untouched.
    the new epoch (proposal/ack/load as usual). In-flight/queued requests
    always finish on the old epoch first.
 
+## Confirm-before-send and the solo exemption
+
+Documented here because this file is the failure contract the rule
+serves (the rule itself predates this section — it was previously
+described only in patches/README.md and docs/perf.md §2).
+
+**Distributed models: confirm-before-send.** A token's piece is emitted
+only after the token's OWN decode succeeds. Rationale: with a torn
+remote, patch 0002's `get_tensor` failure path ZEROES the fetched
+logits and returns — the decode that produced the sampled token can
+have appeared to succeed while its logits are garbage; the very next
+decode on the dead socket fails. A piece once streamed cannot be
+unstreamed: it would poison both the client text and the step-4 retry
+prefix (`prompt + already_generated`), which must contain exactly the
+tokens whose pieces were derived from real logits. Both serving loops
+hold the rule for distributed models: the daemon's step loop
+(`engine_host.rs`, the `PendingTok::Unsent` arm) and
+`Session::generate`. Residual (unchanged): a tear exactly at the final
+budgeted token has no confirming decode — one-token window, Length
+finishes only.
+
+**Solo models are exempt: emit at sample time.** The tear analysis
+that motivates the rule has no solo counterpart:
+
+- No transport exists that can corrupt logits behind a successful
+  return — `llama_decode` on local devices either computes real logits
+  and returns success, or fails. Every sampled token is therefore
+  drawn from logits a SUCCEEDED decode produced; there is no
+  "zeroed-logits behind an apparent success" path (patch 0002 lives
+  entirely in the RPC client).
+- A solo decode failure is terminal: the daemon errors the sequence
+  (`fail_seq` — "nothing to retry onto") and `Session::generate`
+  returns the error. No retry path exists, so no resume prefix can
+  ever be built that would have to account for an unsent piece.
+
+Solo loops may therefore emit a piece the moment its token is sampled,
+one decode step earlier — measured as ~23% of TTFT on a small model
+(the confirming decode is always exactly one decode step). The only
+residual: a stream may deliver one extra CORRECT piece immediately
+before a terminal error (the piece's own confirming decode failed —
+the piece itself came from healthy logits). Terminal events still
+never overtake a delivered or held piece; the stop-string contract is
+unchanged (the completing piece is scanned at sample time and
+withheld). Distributed sessions are entirely untouched — the exemption
+is gated on the loaded model being solo, nothing else.
+
 ## Worker-side drain & shutdown
 
 `onebrain stop` on a worker with an active shard: send proto `Draining`

@@ -86,13 +86,23 @@ fn median(mut samples: Vec<f64>) -> f64 {
 /// (~seconds); call from a blocking context.
 pub fn measure_compute(model_path: &Path) -> Result<ComputeProfile, ProfileError> {
     let model = Model::load(model_path, &ModelParams::default())?;
+    // Thread counts match the serving default (docs/perf.md "Thread-count
+    // defaults"): the daemon's engine host resolves its sessions to the
+    // detected performance-core / physical-core counts, so the profile
+    // must measure the same configuration or the cost model would score
+    // this node with llama.cpp's 4-thread default it never serves at.
+    // (Absolute profile.toml values shift when this landed; relative
+    // node ordering is preserved — every node measures its own best.)
+    let threads = onebrain_engine::cpu::recommended_threads();
     let mut session = Session::new(
         &model,
         &SessionParams {
             n_ctx: 256,
             n_batch: PREFILL_PROMPT_TOKENS as u32,
-            // M7 widened SessionParams (docs/perf.md §2); the defaults
-            // reproduce the pre-widening session exactly.
+            n_threads: threads.n_threads,
+            n_threads_batch: threads.n_threads_batch,
+            // M7 widened SessionParams (docs/perf.md §2); the other
+            // defaults reproduce the pre-widening session exactly.
             ..SessionParams::default()
         },
     )?;
