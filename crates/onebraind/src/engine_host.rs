@@ -52,7 +52,9 @@
 //! remote KV — and the supervisor re-prefills each affected sequence after
 //! one re-plan (docs/perf.md task rule: retry may serialize; correctness
 //! first). Solo-model decode failures keep the pre-M5 behavior: a terminal
-//! [`TokenEvent::Error`] on `job.tx`.
+//! [`TokenEvent::Error`] on `job.tx` — queued behind any confirmed pieces
+//! still parked on a full client channel, exactly like a finish (see
+//! [`fail_seq`]): no terminal ever overtakes or drops confirmed output.
 //!
 //! # Ordering with model-replacing messages
 //!
@@ -73,13 +75,14 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use onebrain_api::backend::{
-    DoneStats, EngineBackend, FinishKind, GenerateJob, ModelSummary, PromptInput, PullEvent,
-    TokenEvent,
+    DoneStats, EmbedJob, EmbedResult, EngineBackend, FinishKind, GenerateJob, ModelSummary,
+    PromptInput, PullEvent, TokenEvent,
 };
 use onebrain_api::ApiError;
 use onebrain_engine::rpc::RemoteServer;
 use onebrain_engine::{
-    Batch, Model, ModelParams, SamplerParams, SeqId, Session, SessionParams, Token,
+    Batch, Model, ModelParams, PoolingType, Sampler, SamplerParams, SeqId, Session, SessionParams,
+    Token,
 };
 use onebrain_models::registry::{ModelRef, Resolved};
 use onebrain_models::{cache, download};
@@ -305,6 +308,12 @@ pub enum HostMsg {
     /// except a distributed decode failure, which reaches ONLY `outcome`
     /// (the supervisor decides what the client sees).
     Generate(SupervisedGenerate),
+    /// One embeddings request (M1 `/v1/embeddings` / `/api/embed`): served
+    /// inline by the host thread with a short-lived dedicated embeddings
+    /// session against the loaded model — see [`handle_embed`] for the
+    /// mechanism and why in-flight generations are never disturbed. The
+    /// result (or typed error) goes back on the job's own oneshot.
+    Embed(EmbedJob),
     /// Ask what is loaded. Answered over a std channel so non-async callers
     /// can wait with a timeout; the host replies with `try_send`, so a
     /// caller that gave up never blocks or wedges the host. Retained for
@@ -550,6 +559,21 @@ fn host_loop(
                         };
                         let _ = sup.job.tx.blocking_send(TokenEvent::Error(message));
                         let _ = sup.outcome.send(GenOutcome::Finished);
+                    }
+                    Ok(HostMsg::Embed(job)) => {
+                        // Same posture as Generate above: no model, typed
+                        // refusal — with the shard hint when this node is
+                        // a worker (embeddings, like generations, are
+                        // served by the head).
+                        let error = match serving_shard {
+                            Some(epoch) => ApiError::Internal(format!(
+                                "{} (this node is serving a pipeline shard for epoch {epoch}; \
+                                 send embeddings to the cluster head)",
+                                ApiError::NoModel
+                            )),
+                            None => ApiError::NoModel,
+                        };
+                        let _ = job.resp.send(Err(error));
                     }
                     Ok(HostMsg::ServeShard { epoch }) => {
                         tracing::info!(epoch = epoch.0, "engine host entering shard-serving state");
@@ -891,7 +915,12 @@ fn host_loop(
                 }));
                 continue 'outer;
             }
-            Some(HostMsg::Generate(_) | HostMsg::Models { .. } | HostMsg::Shutdown) => {
+            Some(
+                HostMsg::Generate(_)
+                | HostMsg::Embed(_)
+                | HostMsg::Models { .. }
+                | HostMsg::Shutdown,
+            ) => {
                 unreachable!("serve_model handles these inline")
             }
         }
@@ -1118,8 +1147,9 @@ impl ProgressThrottle {
 // The multi-sequence serve loop (docs/perf.md §6)
 // ---------------------------------------------------------------------------
 
-/// llama.cpp's "random seed" sentinel: kept verbatim on sampler reinstalls
-/// so a request without an explicit seed stays randomly seeded.
+/// llama.cpp's "random seed" sentinel: passed verbatim into a request's
+/// sampler chain so a request without an explicit seed stays randomly
+/// seeded.
 const SEED_RANDOM: u32 = 0xFFFF_FFFF;
 
 /// How long the serve loop waits for new messages when work exists but no
@@ -1241,15 +1271,23 @@ struct ActiveGen {
     /// sequence pauses (its decode skips steps) until they are delivered,
     /// so one slow client never stalls the other sequences.
     held: VecDeque<String>,
-    /// A finish decided while `held` was non-empty: applied once the held
-    /// pieces drain, so the terminal event never overtakes them.
-    finish_after_drain: Option<FinishKind>,
+    /// A terminal (finish OR error) decided while `held` was non-empty:
+    /// applied once the held pieces drain, so no terminal event ever
+    /// overtakes a confirmed piece. The wait is bounded by client
+    /// liveness — a client that disconnects is reaped by the disconnect
+    /// sweep with the backlog undelivered (Aborted semantics: nobody is
+    /// listening).
+    terminal_after_drain: Option<DeferredTerminal>,
     remaining: usize,
     budget: usize,
     pieces_sent: usize,
     sampler: SamplerParams,
-    /// Sampler-chain installs so far (seed derivation on reinstall).
-    installs: u32,
+    /// This generation's own sampler chain (per-sequence sampling): built
+    /// once at admission from the job's params, so interleaved sampled
+    /// requests each keep their own RNG/chain state and behave exactly as
+    /// if they ran alone. The M5 retry seed-restart semantics hold because
+    /// a resumed attempt is a NEW admission with the original seed.
+    chain: Sampler,
     /// Speculative counters (docs/perf.md §5): draft-proposed tokens and
     /// the subset the target accepted.
     drafted: u32,
@@ -1261,6 +1299,18 @@ struct ActiveGen {
     ttft_ms: Option<u64>,
     /// Finished/cancelled this iteration; reaped by the retain sweep.
     done: bool,
+}
+
+/// A terminal decided while confirmed pieces were still parked on the
+/// client's channel ([`ActiveGen::held`]): held pieces are CONFIRMED
+/// output, so every terminal — the M8 gate covered finishes; errors follow
+/// the same rule — queues behind them instead of overtaking (or dropping)
+/// them. The held-retry sweep applies the terminal once the backlog
+/// drains; a client that disconnects first is reaped with the backlog
+/// undelivered (Aborted semantics — the documented boundary).
+enum DeferredTerminal {
+    Finish(FinishKind),
+    Error(String),
 }
 
 /// A terminal event whose client channel was full at finish time; retried
@@ -1328,8 +1378,6 @@ fn serve_model(
     // prefix reuse (empty forever when the knob is off). Invariant: every
     // retained seq id is also in `free`.
     let mut retained: Vec<RetainedSlot> = Vec::new();
-    // Which sequence's sampler params are installed in the session chain.
-    let mut sampler_owner: Option<SeqId> = None;
     // Monotonic per-admission id (draft-KV ownership across slot reuse).
     let mut next_uid: u64 = 0;
     // Set when the draft session errored: speculative decoding stands down
@@ -1374,20 +1422,28 @@ fn serve_model(
                 }
             }
             if g.held.is_empty() && !g.done {
-                if let Some(finish) = g.finish_after_drain.take() {
-                    // §4 retention requires the slot's KV to mirror
-                    // prefix + attempt exactly; a spent-budget resume
-                    // finishes here without ever prefilling, so its empty
-                    // KV must be released, never retained.
-                    let kv_complete = g.prefill_done >= g.prefix.len();
-                    finish_seq(
-                        session,
-                        &mut free,
-                        &mut outbox,
-                        g,
-                        finish,
-                        (perf.kv_reuse && kv_complete).then_some(&mut retained),
-                    );
+                match g.terminal_after_drain.take() {
+                    Some(DeferredTerminal::Finish(finish)) => {
+                        // §4 retention requires the slot's KV to mirror
+                        // prefix + attempt exactly; a spent-budget resume
+                        // finishes here without ever prefilling, so its
+                        // empty KV must be released, never retained.
+                        let kv_complete = g.prefill_done >= g.prefix.len();
+                        finish_seq(
+                            session,
+                            &mut free,
+                            &mut outbox,
+                            g,
+                            finish,
+                            (perf.kv_reuse && kv_complete).then_some(&mut retained),
+                        );
+                    }
+                    Some(DeferredTerminal::Error(message)) => {
+                        // Error-after-drain: the backlog is delivered, so
+                        // fail_seq now terminates immediately.
+                        fail_seq(session, &mut free, &mut outbox, g, message);
+                    }
+                    None => {}
                 }
             }
         }
@@ -1406,6 +1462,7 @@ fn serve_model(
                         session,
                         info,
                         loaded_reference,
+                        distributed,
                         &batch_error,
                         &mut queue,
                     ) {
@@ -1422,6 +1479,7 @@ fn serve_model(
                         session,
                         info,
                         loaded_reference,
+                        distributed,
                         &batch_error,
                         &mut queue,
                     ) {
@@ -1529,6 +1587,28 @@ fn serve_model(
             }
 
             let p = queue.pop_front().expect("checked non-empty");
+            // Per-sequence sampler chain: built once per admission from the
+            // job's own params, before a slot is taken — an allocation
+            // failure (OOM-class) terminates the job typed without
+            // occupying anything.
+            let sampler = SamplerParams {
+                temperature: p.job.params.temperature,
+                top_p: p.job.params.top_p,
+                top_k: p.job.params.top_k,
+                seed: p.job.params.seed.unwrap_or(SEED_RANDOM),
+            };
+            let chain = match Sampler::new(&sampler) {
+                Ok(chain) => chain,
+                Err(e) => {
+                    // The channel may carry earlier traffic (resume), so
+                    // park the terminal like any other full-channel case.
+                    deliver_terminal(&mut outbox, &p.job.tx, TokenEvent::Error(e.to_string()));
+                    if let Some(outcome) = p.outcome {
+                        let _ = outcome.send(GenOutcome::Finished);
+                    }
+                    continue;
+                }
+            };
             // Slot choice: the reuse match wins its own slot; otherwise
             // prefer a free slot with no retained cache (preserving other
             // caches); when every free slot is a cache, sacrifice the
@@ -1581,14 +1661,9 @@ fn serve_model(
                     (seq, 0)
                 }
             };
-            if sampler_owner == Some(seq) {
-                // The chain still belongs to the PREVIOUS occupant of this
-                // id; force a reinstall for the new generation.
-                sampler_owner = None;
-            }
             let uid = next_uid;
             next_uid += 1;
-            active.push(admit(p, seq, reused, uid));
+            active.push(admit(p, sampler, chain, seq, reused, uid));
             if let Some(d) = draft.as_deref() {
                 let g = active.last().expect("just pushed");
                 if g.sampler.temperature > 0.0 {
@@ -1638,7 +1713,7 @@ fn serve_model(
         if !spec_disabled && active.len() == 1 {
             let g = &mut active[0];
             if g.held.is_empty()
-                && g.finish_after_drain.is_none()
+                && g.terminal_after_drain.is_none()
                 && g.prefill_done >= g.prefix.len()
                 && g.pending.is_some()
                 && g.remaining > 1
@@ -1669,7 +1744,7 @@ fn serve_model(
         if spec.is_none() {
             for (i, g) in active.iter().enumerate() {
                 if !g.held.is_empty()
-                    || g.finish_after_drain.is_some()
+                    || g.terminal_after_drain.is_some()
                     || g.prefill_done < g.prefix.len()
                 {
                     continue;
@@ -1688,7 +1763,7 @@ fn serve_model(
         if spec.is_none() && push_failure.is_none() {
             for (i, g) in active.iter().enumerate() {
                 if !g.held.is_empty()
-                    || g.finish_after_drain.is_some()
+                    || g.terminal_after_drain.is_some()
                     || g.prefill_done >= g.prefix.len()
                 {
                     continue;
@@ -1737,6 +1812,7 @@ fn serve_model(
                         session,
                         info,
                         loaded_reference,
+                        distributed,
                         &batch_error,
                         &mut queue,
                     ) {
@@ -1797,20 +1873,28 @@ fn serve_model(
                 }
             } else {
                 // Solo decode failure: terminal errors, exactly the pre-M5
-                // posture — nothing to retry onto.
+                // posture — nothing to retry onto. A sequence with
+                // confirmed pieces still parked on a full client channel
+                // stays active as a draining zombie (fail_seq defers its
+                // Error behind the backlog); it never decodes again and is
+                // reaped by the held sweep or the disconnect sweep.
                 tracing::warn!(error = %e, "solo decode failed; erroring the active sequences");
                 for g in active.iter_mut() {
                     fail_seq(session, &mut free, &mut outbox, g, e.to_string());
                 }
-                active.clear();
+                active.retain(|g| !g.done);
             }
-            // All sequence ids are free again (fresh list beats replaying
-            // partial bookkeeping). Queued jobs stay queued: on a torn
-            // distributed model their prefill fails fast and the
-            // supervisor's retry owns them; on a solo model they fail with
-            // the same decode error individually (pre-M7 equivalent).
-            free = (0..n_seq_max as SeqId).rev().collect();
-            sampler_owner = None;
+            // Every sequence id not owned by a draining zombie is free
+            // again (a fresh list beats replaying partial bookkeeping; the
+            // distributed arm drained `active` entirely). Queued jobs stay
+            // queued: on a torn distributed model their prefill fails fast
+            // and the supervisor's retry owns them; on a solo model they
+            // fail with the same decode error individually (pre-M7
+            // equivalent).
+            free = (0..n_seq_max as SeqId)
+                .rev()
+                .filter(|s| !active.iter().any(|g| g.seq == *s))
+                .collect();
             continue 'serve;
         }
 
@@ -1875,12 +1959,11 @@ fn serve_model(
                     // held piece (same rule as the speculative path), and
                     // finishing now would drop it — the held-retry sweep
                     // applies this finish once the backlog drains.
-                    g.finish_after_drain = Some(FinishKind::Length);
+                    g.terminal_after_drain = Some(DeferredTerminal::Finish(FinishKind::Length));
                 }
                 continue;
             }
-            install_sampler(session, &mut sampler_owner, g);
-            let next = session.sample_ith(index as i32);
+            let next = session.sample_ith_with(&mut g.chain, index as i32);
             if session.model().is_eog(next) {
                 if g.held.is_empty() {
                     finish_seq(
@@ -1894,7 +1977,7 @@ fn serve_model(
                 } else {
                     // Same deferral as Length above: EOG was sampled while
                     // this step's piece is still parked.
-                    g.finish_after_drain = Some(FinishKind::Stop);
+                    g.terminal_after_drain = Some(DeferredTerminal::Finish(FinishKind::Stop));
                 }
                 continue;
             }
@@ -1914,8 +1997,7 @@ fn serve_model(
                 if g.prefill_done == g.prefix.len() {
                     g.prefill_finished = Some(Instant::now());
                     let index = tail_index.expect("the prefix tail carries logits");
-                    install_sampler(session, &mut sampler_owner, g);
-                    let first = session.sample_ith(index as i32);
+                    let first = session.sample_ith_with(&mut g.chain, index as i32);
                     if session.model().is_eog(first) {
                         // EOG straight after the prompt: Stop with zero
                         // generated tokens (matches the solo path).
@@ -1944,7 +2026,6 @@ fn serve_model(
         // positions are rolled back with a real seq_rm.
         if let Some(step) = spec {
             let g = &mut active[0];
-            install_sampler(session, &mut sampler_owner, g);
             if let Some(e) = process_spec_step(
                 session,
                 &mut free,
@@ -1987,6 +2068,7 @@ fn pump_msg(
     session: &Session<'_>,
     info: &LoadedModel,
     loaded_reference: &str,
+    distributed: bool,
     batch_error: &Option<String>,
     queue: &mut VecDeque<PreparedGen>,
 ) -> Pumped {
@@ -2003,11 +2085,163 @@ fn pump_msg(
             }
             Pumped::Handled
         }
+        HostMsg::Embed(job) => {
+            handle_embed(session.model(), info, loaded_reference, distributed, job);
+            Pumped::Handled
+        }
         HostMsg::Shutdown => Pumped::Exit,
         other @ (HostMsg::Load { .. }
         | HostMsg::LoadDistributed { .. }
         | HostMsg::Unload { .. }
         | HostMsg::ServeShard { .. }) => Pumped::Ctrl(other),
+    }
+}
+
+/// Serve one embeddings request against the loaded model (M1
+/// `/v1/embeddings` / `/api/embed`).
+///
+/// # Mechanism (documented honestly)
+///
+/// A SHORT-LIVED dedicated embeddings session is created against the
+/// already-loaded model, used serially for every text in the request, and
+/// dropped before returning. The generation session is a separate llama
+/// context whose KV, sampler chain, and retained §4 prefixes are never
+/// touched. Because this runs inside the host thread's message pump, it is
+/// naturally serialized BETWEEN decode steps: an in-flight generation
+/// pauses for the embed's duration (the documented cost of the host loop's
+/// single-thread serialization) but is never disturbed, reordered, or
+/// corrupted. Creating the session per request trades a context
+/// setup/teardown per call for zero idle memory and zero interaction with
+/// the generation context's admission math — the right trade until
+/// embeddings traffic proves otherwise.
+///
+/// # Distributed models
+///
+/// Refused with the typed [`ApiError::EmbeddingsDistributed`] (remedy
+/// names a solo load). A second context against an RPC-split model would
+/// issue its own remote command stream interleaved with the generation
+/// context's pipelined one, which the overlap patches (patches/0002)
+/// assume is single-context; nothing proves the combination sound, so
+/// honesty beats silent wrongness (docs/resilience.md posture).
+fn handle_embed(
+    model: &Model,
+    info: &LoadedModel,
+    loaded_reference: &str,
+    distributed: bool,
+    job: EmbedJob,
+) {
+    let EmbedJob {
+        model: requested,
+        texts,
+        resp,
+    } = job;
+    if distributed {
+        let _ = resp.send(Err(ApiError::EmbeddingsDistributed(requested)));
+        return;
+    }
+    // Same name rule as prepare_generation: the canonical loaded name and
+    // the reference the load was requested with are both accepted.
+    if requested != info.name && requested != loaded_reference {
+        let _ = resp.send(Err(ApiError::ModelNotLoaded(requested)));
+        return;
+    }
+    let started = Instant::now();
+    // Tokenize everything first: input validation must fail typed before
+    // the embeddings context's memory is allocated.
+    let mut token_lists = Vec::with_capacity(texts.len());
+    let mut prompt_tokens: u32 = 0;
+    for (i, text) in texts.iter().enumerate() {
+        let tokens = match model.tokenize(text, true) {
+            Ok(tokens) if tokens.is_empty() => {
+                let _ = resp.send(Err(ApiError::BadRequest(format!(
+                    "`input[{i}]` produced no tokens; provide non-empty text"
+                ))));
+                return;
+            }
+            Ok(tokens) => tokens,
+            Err(e) => {
+                let _ = resp.send(Err(ApiError::Internal(e.to_string())));
+                return;
+            }
+        };
+        if tokens.len() > info.n_ctx as usize {
+            let _ = resp.send(Err(ApiError::BadRequest(format!(
+                "`input[{i}]` is {} tokens but the loaded context length is {}; shorten \
+                 the input or raise ctx_len in config.toml",
+                tokens.len(),
+                info.n_ctx
+            ))));
+            return;
+        }
+        prompt_tokens += tokens.len() as u32;
+        token_lists.push(tokens);
+    }
+    // n_batch = n_ubatch = n_ctx: an engine-pooled model reduces over ONE
+    // decode call (Session::embed refuses inputs past n_batch), and
+    // non-causal embedding models additionally require
+    // n_ubatch >= n_tokens. The mean-pool fallback chunks itself, so the
+    // wide batch costs generative models nothing.
+    let mut session = match Session::new(
+        model,
+        &SessionParams {
+            n_ctx: info.n_ctx,
+            n_batch: info.n_ctx,
+            n_ubatch: info.n_ctx,
+            embeddings: true,
+            // The model's own declared pooling: purpose-built embedding
+            // models use their trained head; generative models resolve to
+            // none and Session::embed mean-pools in Rust (documented
+            // there).
+            pooling: PoolingType::Unspecified,
+            ..SessionParams::default()
+        },
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = resp.send(Err(ApiError::Internal(e.to_string())));
+            return;
+        }
+    };
+    let mut embeddings = Vec::with_capacity(token_lists.len());
+    for tokens in &token_lists {
+        match session.embed(tokens) {
+            Ok(mut vector) => {
+                l2_normalize(&mut vector);
+                embeddings.push(vector);
+            }
+            Err(e) => {
+                let _ = resp.send(Err(ApiError::Internal(e.to_string())));
+                return;
+            }
+        }
+    }
+    tracing::info!(
+        inputs = texts.len(),
+        tokens = prompt_tokens,
+        elapsed_ms = duration_ms(started.elapsed()),
+        "embeddings request served"
+    );
+    let _ = resp.send(Ok(EmbedResult {
+        embeddings,
+        prompt_tokens,
+    }));
+}
+
+/// Scale a vector to unit L2 norm in place (OpenAI parity: their
+/// embeddings — and llama.cpp's own OpenAI-compatible server — return
+/// normalized vectors, so cosine similarity is a plain dot product for
+/// unmodified clients). A zero or non-finite norm leaves the vector
+/// untouched rather than manufacturing NaNs.
+fn l2_normalize(v: &mut [f32]) {
+    let norm = v
+        .iter()
+        .map(|x| f64::from(*x) * f64::from(*x))
+        .sum::<f64>()
+        .sqrt();
+    if norm.is_finite() && norm > 0.0 {
+        for x in v.iter_mut() {
+            *x = (f64::from(*x) / norm) as f32;
+        }
     }
 }
 
@@ -2135,8 +2369,8 @@ fn prepare_generation(
         // Interrupted on the very last token's decode with every piece
         // already delivered: finish as Length without touching the engine.
         // With undelivered pieces (`unsent`), the job is queued instead:
-        // admission seeds them into `held` with `finish_after_drain =
-        // Length`, so the sweep delivers them before the terminal event.
+        // admission seeds them into `held` with a deferred Length finish,
+        // so the sweep delivers them before the terminal event.
         let _ = job.tx.try_send(TokenEvent::Done(DoneStats {
             prompt_tokens: prompt_tokens.len() as u32,
             completion_tokens: prior_generated.len() as u32,
@@ -2164,8 +2398,17 @@ fn prepare_generation(
 
 /// Turn a queue entry into an active sequence on `seq`. `reused` is the
 /// prefix length already present in the slot's KV from a §4 reuse hit (0 =
-/// cold slot); the prefill loop starts decoding there.
-fn admit(p: PreparedGen, seq: SeqId, reused: usize, uid: u64) -> ActiveGen {
+/// cold slot); the prefill loop starts decoding there. `sampler`/`chain`
+/// are this generation's own sampler params and chain, built by the
+/// admission loop from the job's params.
+fn admit(
+    p: PreparedGen,
+    sampler: SamplerParams,
+    chain: Sampler,
+    seq: SeqId,
+    reused: usize,
+    uid: u64,
+) -> ActiveGen {
     let prefix: Vec<Token> = p
         .prompt_tokens
         .iter()
@@ -2176,12 +2419,6 @@ fn admit(p: PreparedGen, seq: SeqId, reused: usize, uid: u64) -> ActiveGen {
         reused < prefix.len().max(1),
         "reuse must leave at least the prefix tail to decode"
     );
-    let sampler = SamplerParams {
-        temperature: p.job.params.temperature,
-        top_p: p.job.params.top_p,
-        top_k: p.job.params.top_k,
-        seed: p.job.params.seed.unwrap_or(SEED_RANDOM),
-    };
     ActiveGen {
         seq,
         uid,
@@ -2203,12 +2440,13 @@ fn admit(p: PreparedGen, seq: SeqId, reused: usize, uid: u64) -> ActiveGen {
         // A resume whose budget is already spent has nothing to decode:
         // deliver the backlog, then finish as Length (the sweep applies
         // this once `held` drains; the batch builder never steps it).
-        finish_after_drain: (p.remaining == 0).then_some(FinishKind::Length),
+        terminal_after_drain: (p.remaining == 0)
+            .then_some(DeferredTerminal::Finish(FinishKind::Length)),
         remaining: p.remaining,
         budget: p.budget,
         pieces_sent: p.prior_pieces,
         sampler,
-        installs: 0,
+        chain,
         drafted: 0,
         accepted: 0,
         arrived: p.arrived,
@@ -2223,31 +2461,6 @@ fn admit(p: PreparedGen, seq: SeqId, reused: usize, uid: u64) -> ActiveGen {
 /// matching).
 fn common_prefix_len(a: &[Token], b: &[Token]) -> usize {
     a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
-}
-
-/// Install `g`'s sampler chain unless it already owns the session chain.
-///
-/// The engine has ONE chain per session, so per-sequence sampler state is
-/// approximated: greedy (temperature <= 0) is stateless and exact under
-/// any interleaving; a sampled request that runs ALONE installs once and
-/// keeps its chain (byte-for-byte the pre-M7 behavior); interleaved
-/// sampled requests reinstall on each owner switch, deriving a fresh seed
-/// per install so the chain never replays a draw. That last case is the
-/// same documented-acceptable divergence class as the M5 retry seed-chain
-/// restart (docs/resilience.md step 4) — the §6 correctness asserts are
-/// greedy-only. A true per-sequence chain needs a shim primitive; see the
-/// M7 concerns log.
-fn install_sampler(session: &mut Session<'_>, owner: &mut Option<SeqId>, g: &mut ActiveGen) {
-    if *owner == Some(g.seq) {
-        return;
-    }
-    let mut params = g.sampler.clone();
-    if params.temperature > 0.0 && params.seed != SEED_RANDOM && g.installs > 0 {
-        params.seed = params.seed.wrapping_add(g.installs);
-    }
-    g.installs = g.installs.wrapping_add(1);
-    session.set_sampler(&params);
-    *owner = Some(g.seq);
 }
 
 /// Build one speculative verify round (docs/perf.md §5) for the single
@@ -2363,12 +2576,13 @@ fn process_spec_step(
     // draft token is confirmed when the target's greedy choice after the
     // previous confirmed token IS that draft token — its own decode
     // already happened in the same batch, so emitting it preserves
-    // confirm-before-send exactly.
+    // confirm-before-send exactly. Sampling goes through g's own chain
+    // (speculation is greedy-only, so the chain is its greedy chain).
     let mut confirmed: Vec<(Token, String)> = vec![(tok, piece)];
     let mut next_pending: Option<Token> = None;
     let mut render_error: Option<String> = None;
     for (i, d) in step.drafts.iter().enumerate() {
-        let target_next = session.sample_ith(step.indexes[i] as i32);
+        let target_next = session.sample_ith_with(&mut g.chain, step.indexes[i] as i32);
         if target_next != *d {
             next_pending = Some(target_next);
             break;
@@ -2398,7 +2612,8 @@ fn process_spec_step(
     if next_pending.is_none() {
         // Every draft accepted: the next pending comes from the last
         // draft's logits (full-acceptance continuation).
-        next_pending = Some(session.sample_ith(step.indexes[step.drafts.len()] as i32));
+        next_pending =
+            Some(session.sample_ith_with(&mut g.chain, step.indexes[step.drafts.len()] as i32));
     }
     // Roll back rejected draft positions (position rule: a real seq_rm,
     // never a rewound counter). The verify decoded 1 + drafts.len()
@@ -2498,7 +2713,7 @@ fn process_spec_step(
         } else {
             // Held pieces must reach the client before the terminal event;
             // the held-retry sweep applies this finish once they drain.
-            g.finish_after_drain = Some(kind);
+            g.terminal_after_drain = Some(DeferredTerminal::Finish(kind));
         }
     }
     None
@@ -2559,12 +2774,14 @@ fn finish_seq(
         .unwrap_or(0);
     let ttft_ms = g.ttft_ms.unwrap_or(0);
     // The stable per-generation instrumentation line (docs/perf.md §1) —
-    // sim-greppable; counts are THIS attempt's engine work: on a §4 reuse
-    // hit the prefill count is exactly the decoded suffix, and the §5
-    // draft counters ride at the end. Stats below span all attempts.
+    // sim-greppable; counts are THIS attempt's engine work: the prefill
+    // count is the tokens actually DECODED this attempt (on a §4 reuse hit
+    // that is exactly the decoded suffix; a spent-budget resume finishes
+    // without ever prefilling and honestly reports 0), and the §5 draft
+    // counters ride at the end. Stats below span all attempts.
     tracing::info!(
         "perf: prefill {}tok {}ms decode {}tok {}ms ttft {}ms drafted {} accepted {}",
-        g.prefix.len() - g.reused,
+        g.prefill_done.saturating_sub(g.reused),
         prefill_ms,
         g.attempt_tokens.len(),
         decode_ms,
@@ -2611,6 +2828,18 @@ fn finish_seq(
 }
 
 /// Terminate `g` with an error (solo decode failure, piece-render failure).
+///
+/// Error-after-drain: with confirmed pieces still parked on the client's
+/// momentarily-full channel (`held`), the Error queues behind them exactly
+/// like a finish would — the sequence stays active as a draining zombie
+/// (never stepped again; the batch builder skips any set
+/// `terminal_after_drain`) and the held-retry sweep applies the terminal
+/// once the backlog empties. The wait's boundary is client liveness: a
+/// client that DISCONNECTS is reaped by the disconnect sweep with the
+/// backlog undelivered — Aborted semantics, nobody is listening — and a
+/// terminal already decided (a finish waiting behind the same backlog)
+/// wins over a later error: that generation was complete before the
+/// failure.
 fn fail_seq(
     session: &mut Session<'_>,
     free: &mut Vec<SeqId>,
@@ -2618,6 +2847,12 @@ fn fail_seq(
     g: &mut ActiveGen,
     message: String,
 ) {
+    if !g.held.is_empty() {
+        if g.terminal_after_drain.is_none() {
+            g.terminal_after_drain = Some(DeferredTerminal::Error(message));
+        }
+        return;
+    }
     deliver_terminal(outbox, &g.job.tx, TokenEvent::Error(message));
     if let Some(outcome) = g.outcome.take() {
         let _ = outcome.send(GenOutcome::Finished);
@@ -2855,6 +3090,17 @@ impl EngineBackend for DaemonBackend {
             return Err(ApiError::ShuttingDown);
         }
         Ok(())
+    }
+
+    fn embed(&self, job: EmbedJob) -> Result<(), ApiError> {
+        // Straight to the host, bypassing the supervisor: embeddings have
+        // no stream to supervise and no distributed retry story (the host
+        // refuses distributed targets typed), and they take no §6
+        // admission slot — the request serializes on the host thread's
+        // message pump regardless, and its short-lived session never
+        // shares the generation session's unified-KV pool the admission
+        // math budgets.
+        self.host.send(HostMsg::Embed(job))
     }
 
     fn pull(&self, model: String, tx: mpsc::Sender<PullEvent>) -> Result<(), ApiError> {
@@ -3321,6 +3567,269 @@ mod tests {
             orx.blocking_recv().expect("outcome must arrive"),
             GenOutcome::Finished
         ));
+        host.send(HostMsg::Shutdown).unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn full_channel_at_error_never_drops_the_held_piece() {
+        // The error-path dual of the test above (the M8 gate fixed
+        // Length/EOG finishes; this pins fail_seq): a solo decode failure
+        // while a CONFIRMED piece sits parked on a full client channel
+        // must deliver that piece first and the Error terminal after it —
+        // never drop it, never let the Error overtake it.
+        let Some((host, handle, smoke)) = spawn_with_smoke_model(None, HostPerf::default()) else {
+            return;
+        };
+        // A: healthy greedy generation into a capacity-1 channel that is
+        // not read yet. After the first piece fills the channel, the next
+        // confirmed piece parks in `held` and A pauses with exactly
+        // pieces_sent = 1 and one held piece.
+        let (tx_a, mut rx_a) = mpsc::channel(1);
+        let (otx_a, orx_a) = oneshot::channel();
+        host.send(HostMsg::Generate(SupervisedGenerate {
+            job: greedy_job(smoke.clone(), 8, tx_a),
+            resume: None,
+            outcome: otx_a,
+        }))
+        .unwrap();
+        // Let A reach the parked state (the smoke model needs only
+        // milliseconds; once parked it stays parked until we read).
+        std::thread::sleep(Duration::from_millis(500));
+        // B: a resume whose prompt carries an out-of-vocabulary token id.
+        // Its prefill decode fails (llama validates batch token ids before
+        // touching any KV state), which is a SOLO decode failure erroring
+        // every active sequence — A included, while A's piece is parked.
+        let (tx_b, mut rx_b) = mpsc::channel(8);
+        let (otx_b, orx_b) = oneshot::channel();
+        host.send(HostMsg::Generate(SupervisedGenerate {
+            job: greedy_job(smoke.clone(), 4, tx_b),
+            resume: Some(ResumeState {
+                prompt_tokens: vec![1, 2, 999_999],
+                generated_tokens: vec![],
+                pieces_sent: 0,
+                scan: StopScan::new(vec![]),
+            }),
+            outcome: otx_b,
+        }))
+        .unwrap();
+        // B had nothing parked: its Error is immediate.
+        match rx_b.blocking_recv().expect("B must terminate") {
+            TokenEvent::Error(message) => {
+                assert!(message.contains("decode failed"), "got: {message}");
+            }
+            other => panic!("expected Error for B, got {other:?}"),
+        }
+        assert!(matches!(
+            orx_b.blocking_recv().expect("B outcome"),
+            GenOutcome::Finished
+        ));
+        // A: every confirmed piece — the parked one included — must arrive
+        // BEFORE the Error terminal.
+        let mut pieces = 0u32;
+        loop {
+            match rx_a.blocking_recv().expect("A must terminate") {
+                TokenEvent::Token(_) => pieces += 1,
+                TokenEvent::Error(message) => {
+                    assert!(message.contains("decode failed"), "got: {message}");
+                    break;
+                }
+                TokenEvent::Done(stats) => panic!("A must error, got Done: {stats:?}"),
+            }
+        }
+        assert!(
+            pieces >= 2,
+            "the piece parked on the full channel must be delivered before \
+             the Error terminal (got {pieces} pieces)"
+        );
+        assert!(matches!(
+            orx_a.blocking_recv().expect("A outcome"),
+            GenOutcome::Finished
+        ));
+        // The failed-over slots serve again: a healthy job completes.
+        let (text, _) = run_to_done(&host, &smoke, "Once upon a time", 4);
+        assert!(!text.is_empty(), "slots must serve again after the failure");
+        host.send(HostMsg::Shutdown).unwrap();
+        handle.join().unwrap();
+    }
+
+    /// A fixed-seed sampled job (temperature > 0).
+    fn sampled_job(
+        model: String,
+        prompt: &str,
+        max_tokens: u32,
+        seed: u32,
+        tx: mpsc::Sender<TokenEvent>,
+    ) -> GenerateJob {
+        GenerateJob {
+            model,
+            prompt: PromptInput::Raw(prompt.into()),
+            params: onebrain_api::backend::GenParams {
+                max_tokens,
+                temperature: 0.8,
+                top_p: 0.95,
+                top_k: 40,
+                seed: Some(seed),
+                ..Default::default()
+            },
+            dialect: onebrain_api::backend::ApiDialect::Openai,
+            tx,
+        }
+    }
+
+    /// Drive one sampled job to completion, returning its text.
+    fn run_sampled_to_done(
+        host: &EngineHost,
+        model: &str,
+        prompt: &str,
+        max_tokens: u32,
+        seed: u32,
+    ) -> String {
+        let (tx, mut rx) = mpsc::channel(64);
+        let (otx, orx) = oneshot::channel();
+        host.send(HostMsg::Generate(SupervisedGenerate {
+            job: sampled_job(model.to_string(), prompt, max_tokens, seed, tx),
+            resume: None,
+            outcome: otx,
+        }))
+        .unwrap();
+        let mut text = String::new();
+        loop {
+            match rx.blocking_recv().expect("stream must terminate") {
+                TokenEvent::Token(piece) => text.push_str(&piece),
+                TokenEvent::Done(_) => break,
+                TokenEvent::Error(e) => panic!("unexpected error: {e}"),
+            }
+        }
+        assert!(matches!(
+            orx.blocking_recv().expect("outcome must arrive"),
+            GenOutcome::Finished
+        ));
+        text
+    }
+
+    /// Byte-compat pin (per-sequence sampler chains): a sampled request
+    /// running ALONE must produce exactly what the session-chain path
+    /// produces — the oracle is the engine's own `set_sampler` + `generate`
+    /// loop with identical params, i.e. the same chain construction and
+    /// seed semantics the host used before standalone chains.
+    #[test]
+    fn sampled_alone_run_matches_the_session_chain_construction() {
+        let Some((host, handle, smoke)) = spawn_with_smoke_model(None, HostPerf::default()) else {
+            return;
+        };
+        const MAX: u32 = 8;
+        const SEED: u32 = 42;
+        let prompt = "Once upon a time";
+        // Oracle: an independent load of the same tiny file, driven through
+        // the session's own chain (pre-change construction).
+        let model = Model::load(Path::new(&smoke), &ModelParams::default()).unwrap();
+        let prompt_tokens = model.tokenize(prompt, true).unwrap();
+        let mut session = Session::new(
+            &model,
+            &SessionParams {
+                n_ctx: 512,
+                ..SessionParams::default()
+            },
+        )
+        .unwrap();
+        session.set_sampler(&SamplerParams {
+            temperature: 0.8,
+            top_p: 0.95,
+            top_k: 40,
+            seed: SEED,
+        });
+        let mut expected = String::new();
+        session
+            .generate(&prompt_tokens, MAX as usize, |_, piece| {
+                expected.push_str(piece);
+                std::ops::ControlFlow::Continue(())
+            })
+            .unwrap();
+        assert!(!expected.is_empty(), "the oracle run must emit text");
+
+        let text = run_sampled_to_done(&host, &smoke, prompt, MAX, SEED);
+        assert_eq!(
+            text, expected,
+            "an alone sampled run must match the session-chain construction \
+             byte-for-byte"
+        );
+        // Determinism across host runs with the same seed (each admission
+        // builds a fresh chain seeded identically).
+        let again = run_sampled_to_done(&host, &smoke, prompt, MAX, SEED);
+        assert_eq!(again, text, "fixed-seed sampling must be deterministic");
+        host.send(HostMsg::Shutdown).unwrap();
+        handle.join().unwrap();
+    }
+
+    /// Per-sequence sampler chains: two INTERLEAVED fixed-seed sampled
+    /// (temperature > 0) generations must each be byte-identical to their
+    /// alone-runs. Pre-change, the shared session chain was reinstalled
+    /// with a derived seed on every owner switch — a documented divergence
+    /// this feature removes.
+    #[test]
+    fn interleaved_sampled_requests_match_their_alone_runs() {
+        let Some((host, handle, smoke)) = spawn_with_smoke_model(None, HostPerf::default()) else {
+            return;
+        };
+        const MAX: u32 = 8;
+        let prompt_a = "Once upon a time";
+        let prompt_b = "The little dog";
+        let alone_a = run_sampled_to_done(&host, &smoke, prompt_a, MAX, 7);
+        let alone_b = run_sampled_to_done(&host, &smoke, prompt_b, MAX, 1234);
+        assert!(!alone_a.is_empty() && !alone_b.is_empty());
+
+        // A's channel holds ONE piece and is not read until B finishes, so
+        // the two sequences provably interleave (B completes while A is
+        // mid-generation) and sampling alternates between their chains.
+        let (tx_a, mut rx_a) = mpsc::channel(1);
+        let (otx_a, orx_a) = oneshot::channel();
+        host.send(HostMsg::Generate(SupervisedGenerate {
+            job: sampled_job(smoke.clone(), prompt_a, MAX, 7, tx_a),
+            resume: None,
+            outcome: otx_a,
+        }))
+        .unwrap();
+        let (tx_b, mut rx_b) = mpsc::channel(64);
+        let (otx_b, orx_b) = oneshot::channel();
+        host.send(HostMsg::Generate(SupervisedGenerate {
+            job: sampled_job(smoke.clone(), prompt_b, MAX, 1234, tx_b),
+            resume: None,
+            outcome: otx_b,
+        }))
+        .unwrap();
+        let mut text_b = String::new();
+        loop {
+            match rx_b.blocking_recv().expect("B terminates while A stalls") {
+                TokenEvent::Token(piece) => text_b.push_str(&piece),
+                TokenEvent::Done(_) => break,
+                TokenEvent::Error(e) => panic!("B errored: {e}"),
+            }
+        }
+        let mut text_a = String::new();
+        loop {
+            match rx_a.blocking_recv().expect("A must terminate") {
+                TokenEvent::Token(piece) => text_a.push_str(&piece),
+                TokenEvent::Done(_) => break,
+                TokenEvent::Error(e) => panic!("A errored: {e}"),
+            }
+        }
+        assert!(matches!(
+            orx_a.blocking_recv().unwrap(),
+            GenOutcome::Finished
+        ));
+        assert!(matches!(
+            orx_b.blocking_recv().unwrap(),
+            GenOutcome::Finished
+        ));
+        assert_eq!(
+            text_a, alone_a,
+            "interleaved sampled A must be byte-identical to its alone-run"
+        );
+        assert_eq!(
+            text_b, alone_b,
+            "interleaved sampled B must be byte-identical to its alone-run"
+        );
         host.send(HostMsg::Shutdown).unwrap();
         handle.join().unwrap();
     }
@@ -3863,6 +4372,85 @@ mod tests {
         ));
         assert_eq!(text_a, alone_a, "concurrent A must match its alone-run");
         assert_eq!(text_b, alone_b, "concurrent B must match its alone-run");
+        host.send(HostMsg::Shutdown).unwrap();
+        handle.join().unwrap();
+    }
+
+    /// Ask the host to embed `texts` against `model`; returns the typed
+    /// result the way the gateway receives it.
+    fn run_embed(host: &EngineHost, model: &str, texts: &[&str]) -> Result<EmbedResult, ApiError> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        host.send(HostMsg::Embed(EmbedJob {
+            model: model.to_string(),
+            texts: texts.iter().map(|t| t.to_string()).collect(),
+            resp: resp_tx,
+        }))
+        .unwrap();
+        resp_rx.blocking_recv().expect("host must answer embeds")
+    }
+
+    /// The embeddings surface through the host: dims match the model's
+    /// n_embd, vectors are finite unit-norm and deterministic, name
+    /// validation is typed, and a generation still runs cleanly afterwards
+    /// (the short-lived embed session leaves the serving session alone).
+    #[test]
+    fn embed_via_host_returns_unit_norm_vectors_and_typed_errors() {
+        let Some((host, handle, smoke)) = spawn_with_smoke_model(None, HostPerf::default()) else {
+            return;
+        };
+        // Independent load of the same tiny file is the n_embd oracle.
+        let n_embd = Model::load(Path::new(&smoke), &ModelParams::default())
+            .expect("smoke model loads")
+            .n_embd() as usize;
+
+        let result = run_embed(&host, &smoke, &["Once upon a time", "The little dog"])
+            .expect("embed succeeds");
+        assert_eq!(result.embeddings.len(), 2);
+        assert!(result.prompt_tokens > 0);
+        for vector in &result.embeddings {
+            assert_eq!(vector.len(), n_embd, "vector must be n_embd wide");
+            assert!(vector.iter().all(|v| v.is_finite()));
+            let norm: f64 = vector
+                .iter()
+                .map(|v| f64::from(*v).powi(2))
+                .sum::<f64>()
+                .sqrt();
+            assert!(
+                (norm - 1.0).abs() < 1e-3,
+                "vectors must be unit L2 norm (got {norm})"
+            );
+        }
+        assert_ne!(
+            result.embeddings[0], result.embeddings[1],
+            "different texts must embed differently"
+        );
+        let again = run_embed(&host, &smoke, &["Once upon a time"]).expect("embed succeeds");
+        assert_eq!(
+            again.embeddings[0], result.embeddings[0],
+            "embeddings must be deterministic across requests"
+        );
+
+        match run_embed(&host, "not-the-loaded-model", &["hi"]) {
+            Err(ApiError::ModelNotLoaded(name)) => assert_eq!(name, "not-the-loaded-model"),
+            other => panic!("expected ModelNotLoaded, got {other:?}"),
+        }
+
+        // The serving session is untouched: a generation still completes.
+        let (text, _) = run_to_done(&host, &smoke, "Once upon a time", 4);
+        assert!(!text.is_empty(), "generation must still work after embeds");
+        host.send(HostMsg::Shutdown).unwrap();
+        handle.join().unwrap();
+    }
+
+    /// With nothing loaded, an embed fails typed with NoModel (mirrors the
+    /// Generate posture in phase 1).
+    #[test]
+    fn embed_without_model_is_no_model_typed() {
+        let (host, handle) = EngineHost::spawn(None, HostPerf::default());
+        match run_embed(&host, "anything", &["hi"]) {
+            Err(ApiError::NoModel) => {}
+            other => panic!("expected NoModel, got {other:?}"),
+        }
         host.send(HostMsg::Shutdown).unwrap();
         handle.join().unwrap();
     }
