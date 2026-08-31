@@ -890,6 +890,22 @@ pub(crate) fn netem_setup() -> Result<()> {
     Ok(())
 }
 
+/// Re-shape BOTH veth ends to a new netem `rate` (tc syntax, e.g.
+/// "200mbit"), keeping the 0.5 ms per-direction delay. The M8 advisor step
+/// (sim.rs) drops the link under the daemon's 400 Mbps slow-link threshold
+/// AFTER the M7 overlap step is done with the contract's 1 Gbit shape —
+/// `tc qdisc change` swaps the shaping in place without touching the
+/// namespaces or addresses.
+pub(crate) fn netem_reshape(rate: &str) -> Result<()> {
+    for (ns, veth) in [(NS_A, VETH_A), (NS_B, VETH_B)] {
+        sh(&[
+            "ip", "netns", "exec", ns, "tc", "qdisc", "change", "dev", veth, "root", "netem",
+            "rate", rate, "delay", "0.5ms",
+        ])?;
+    }
+    Ok(())
+}
+
 /// Run one admin command, failing loudly with its stderr.
 fn sh(argv: &[&str]) -> Result<()> {
     let out = Command::new(argv[0])

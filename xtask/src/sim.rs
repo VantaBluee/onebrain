@@ -162,11 +162,42 @@
 //!     tables; the peer row carries real figures via the mesh
 //!     BenchRequest; no failed runs).
 //!
+//! After M7, the **M8 product-polish** proofs run (docs/product.md "DoD
+//! hooks"). The dashboard, metrics-topology, and request-log steps run in
+//! BOTH modes (under `--netem` they drive the overlap step's still-live
+//! cluster through in-namespace curl); of the v1 advisor rules only
+//! slow-link is deterministically firable at all, and only on a shaped
+//! link — so the netem leg reshapes the veth pair under the daemon's
+//! 400 Mbps threshold and ASSERTS the finding, while the loopback leg
+//! prints the advisor content assert-free ([`m8_advisor_print_step`]'s
+//! doc records rule by rule why nothing can be asserted there).
+//!
+//! 23. **m8 setup** (loopback mode only) — A restarts with `[debug]
+//!     decode_delay_ms` so request-log decode timings are provably
+//!     nonzero, B restarts default, and a forced `--nodes 2` load gives
+//!     the metrics document a distributed plan to mirror. (The netem leg
+//!     reuses the overlap step's forced plan instead.)
+//! 24. **dashboard** — `GET /` serves the HTML shell WITHOUT a token and
+//!     carries the app-root marker; `/dash/app.css` serves as text/css;
+//!     `/api/internal/metrics` without a token answers 401 (internal
+//!     routes have no loopback exemption).
+//! 25. **metrics-live** — the metrics document names this node and the
+//!     connected peer with PROBED rtt/bandwidth figures plus the
+//!     Hello-retained version/engine-build, its plan view equals the
+//!     active plan (epoch + assignment-for-assignment), and the
+//!     assignment node ids are exactly the two paired endpoints; then one
+//!     generation lands in `requests[]` with dialect, token counts, and
+//!     nonzero decode timing — while the raw JSON document does NOT
+//!     contain the prompt text (privacy: docs/product.md §1/§10).
+//! 26. **advisor** — netem: the slow-link line fires against the
+//!     reshaped sub-400 Mbps link; loopback: assert-free rendering.
+//!
 //! `--netem` (Linux, root only — SKIP + exit 0 anywhere else): the same
 //! M3/M4 scenario inside the pair-sim network namespaces, shaped to
 //! 1 Gbit / 0.5 ms per direction (chaos and the M6 logistics section are
-//! skipped there, and of M7 only the overlap step runs — WITH its timing
-//! asserts; see the notes in `scenario`).
+//! skipped there; of M7 only the overlap step runs — WITH its timing
+//! asserts — and the M8 proofs then run against that cluster, ending with
+//! the reshaped slow-link advisor assert; see the notes in `scenario`).
 //!
 //! One `[PASS]`/`[FAIL]` checklist line per step; daemon-log tails are
 //! dumped on failure; `OB_E2E_SKIP_BUILD=1` skips the inner build.
@@ -184,7 +215,8 @@ use serde_json::{json, Value};
 
 use crate::e2e::{dump_daemon_log, kill_hard, locate_onebrain_binary, step};
 use crate::pair_sim::{
-    cleanup, is_root, netem_setup, peer_ref, two_free_ports, Node, PeerRef, NS_A, NS_B,
+    cleanup, is_root, netem_reshape, netem_setup, peer_ref, two_free_ports, Node, PeerRef, NS_A,
+    NS_B,
 };
 
 /// The first NDJSON line (`status: "window"`) must arrive within this.
@@ -713,7 +745,15 @@ fn scenario(
              proofs independent of link shaping (and they drive the loopback-only SSE \
              stream machinery, like chaos); they run in the default mode on every OS"
         );
-        return Ok(());
+        // ---- M8 product-polish proofs (docs/product.md "DoD hooks") ----
+        // The dashboard/metrics/request-log steps run against the overlap
+        // step's still-live cluster (forced distributed plan on the shaped
+        // link); the advisor step then reshapes the link under the
+        // slow-link threshold — the ONE M8 assert that needs netem.
+        m8_dashboard_step(env.a, true)?;
+        m8_metrics_live_step(&env)?;
+        m8_request_log_step(&env)?;
+        return m8_advisor_netem_step(&env);
     }
     chaos_section(&env, dims)?;
 
@@ -721,7 +761,10 @@ fn scenario(
     logistics_section(&env)?;
 
     // ---- M7 performance proofs (docs/perf.md "DoD hooks") ---------------
-    perf_section(&env)
+    perf_section(&env)?;
+
+    // ---- M8 product-polish proofs (docs/product.md "DoD hooks") ---------
+    m8_section(&env)
 }
 
 // ---------------------------------------------------------------------------
@@ -2841,6 +2884,596 @@ fn check_cluster_bench_markdown(report: &str, local_node: &str, peer_node: &str)
         }
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// M8 product-polish section (docs/product.md "DoD hooks", module docs 23–26)
+// ---------------------------------------------------------------------------
+
+/// `[debug] decode_delay_ms` on the head during the loopback M8 steps: the
+/// request-log assert demands NONZERO decode timing, and 260K-model decode
+/// steps genuinely round to 0 ms on a fast host. Twelve delayed tokens put
+/// the decode wall time near half a second — unambiguous at ms precision.
+const M8_DECODE_DELAY_MS: u64 = 40;
+/// `num_predict` of the request-log generation (matches the M3 chat size).
+const M8_MAX_TOKENS: u32 = 12;
+/// The privacy-sentinel prompt of the request-log step: distinctive enough
+/// that its presence anywhere in the metrics document could only mean the
+/// prompt text leaked (docs/product.md §1: "No prompt text EVER"). No
+/// quotes or backslashes, so JSON escaping cannot mask a leak from the
+/// raw-body `contains` check.
+const M8_PROMPT: &str = "sim-m8-privacy-sentinel: the quick zebra never logs xylophones";
+/// The dashboard shell's app-root marker (crates/onebrain-dash assets —
+/// its unit tests pin the same string).
+const M8_DASH_ROOT_MARKER: &str = "id=\"ob-dash-root\"";
+/// The daemon's slow-link threshold (onebraind::advisor::SLOW_LINK_MBPS —
+/// duplicated because xtask deliberately depends on no workspace crates).
+const M8_SLOW_LINK_MBPS: f64 = 400.0;
+/// The netem reshape rate for the advisor step: half the threshold, so
+/// probe noise cannot straddle 400 Mbps (the 1 Gbit shape measured
+/// [500, 1100] in pair-sim's sanity band — proportionally ~[100, 220]).
+const M8_SLOW_RATE: &str = "200mbit";
+/// The stable middle of the slow-link finding's text (the rule's advice
+/// clause — figures and node names vary around it).
+const M8_SLOW_LINK_NEEDLE: &str = "a wired connection would lift";
+/// The on-connect bulk probe must have reported by then (pair-sim's
+/// bandwidth budget).
+const M8_BANDWIDTH_TIMEOUT: Duration = Duration::from_secs(30);
+/// A finished generation is recorded BEFORE its `done` reaches the client,
+/// so the request-log poll is a formality against scheduler jitter.
+const M8_REQUEST_LOG_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// M8 steps 23–26 in the default loopback mode. The netem leg runs the
+/// same dashboard/metrics/request-log steps against the M7 overlap
+/// cluster and swaps the print-only advisor step for the asserting
+/// [`m8_advisor_netem_step`] (see `scenario`).
+fn m8_section(env: &ChaosEnv) -> Result<()> {
+    let (mesh_a, mesh_b, _mesh_c) = env.mesh;
+    step(
+        "m8 setup: restart A (decode_delay 40ms) + B; forced 2-node plan for metrics",
+        || {
+            // Head first, as everywhere: clean epoch teardown.
+            restart_with(
+                env.a,
+                mesh_a,
+                false,
+                SimKnobs {
+                    decode_delay_ms: Some(M8_DECODE_DELAY_MS),
+                    ..SimKnobs::default()
+                },
+            )?;
+            restart_with(env.b, mesh_b, false, SimKnobs::default())?;
+            wait_connected(env.a, env.b, env.peer_a, env.peer_b, "after the m8 restart")?;
+            let plan = load_model(
+                env.a,
+                &json!({ "model": env.model_arg, "nodes": 2, "explain": true }),
+            )?;
+            assert_pipeline(&plan)
+        },
+    )?;
+    m8_dashboard_step(env.a, false)?;
+    m8_metrics_live_step(env)?;
+    m8_request_log_step(env)?;
+    m8_advisor_print_step(env.a)
+}
+
+/// M8 step 24: the dashboard shell is served token-free at `/` (with the
+/// app-root marker), assets serve under `/dash/` with a sane content-type,
+/// and the metrics route still demands the bearer token (401 without it —
+/// internal routes have no loopback exemption).
+fn m8_dashboard_step(node: &Node, netem: bool) -> Result<()> {
+    step(
+        "m8 dashboard: `/` + `/dash/*` serve tokenless; metrics without a token is 401",
+        || {
+            let (code, ctype, body) = http_get_unauthed(node, "/", netem)?;
+            if code != 200 {
+                bail!(
+                    "GET / without a token answered HTTP {code} (the shell must be \
+                     Bearer-exempt): {body}"
+                );
+            }
+            if !ctype.starts_with("text/html") {
+                bail!("GET / served content-type {ctype:?}, expected text/html");
+            }
+            if !body.contains(M8_DASH_ROOT_MARKER) {
+                bail!(
+                    "the dashboard shell lacks the app-root marker {M8_DASH_ROOT_MARKER}; \
+                     it starts: {:?}",
+                    body.chars().take(200).collect::<String>()
+                );
+            }
+            let (code, ctype, body) = http_get_unauthed(node, "/dash/app.css", netem)?;
+            if code != 200 {
+                bail!("GET /dash/app.css without a token answered HTTP {code}: {body}");
+            }
+            if !ctype.starts_with("text/css") {
+                bail!("GET /dash/app.css served content-type {ctype:?}, expected text/css");
+            }
+            if body.trim().is_empty() {
+                bail!("GET /dash/app.css served an empty body");
+            }
+            let (code, _ctype, body) = http_get_unauthed(node, "/api/internal/metrics", netem)?;
+            if code != 401 {
+                bail!(
+                    "GET /api/internal/metrics WITHOUT a token answered HTTP {code}, expected \
+                     401 (docs/product.md §1: token-auth'd, no loopback exemption): {body}"
+                );
+            }
+            println!("       shell + app.css tokenless; metrics tokenless -> 401");
+            Ok(())
+        },
+    )
+}
+
+/// M8 step 25 (topology half): the metrics document mirrors the LIVE
+/// cluster — this node plus the connected peer with probed link figures
+/// and Hello-retained build info, and a plan view equal to the active
+/// plan, assignment for assignment.
+fn m8_metrics_live_step(env: &ChaosEnv) -> Result<()> {
+    step(
+        "m8 metrics: both nodes with measured rtt/bandwidth; plan matches the active plan",
+        || {
+            // The on-connect bulk probe must have measured the link before
+            // the topology assert reads it (same budget as pair-sim).
+            env.a.wait_peer(
+                &env.peer_b.id,
+                M8_BANDWIDTH_TIMEOUT,
+                "rtt_ms + bandwidth_mbps measured",
+                |p| p["rtt_ms"].as_f64().is_some() && p["bandwidth_mbps"].as_f64().is_some(),
+            )?;
+            let metrics = env.a.get_json("/api/internal/metrics")?;
+
+            // This node, by name and endpoint-id prefix (assignments use
+            // the full ids, the dashboard correlates via the prefix).
+            let node = &metrics["node"];
+            if node["name"].as_str() != Some(env.a.name) {
+                bail!(
+                    "metrics node.name is {}, expected {:?}",
+                    node["name"],
+                    env.a.name
+                );
+            }
+            if node["id_prefix"].as_str() != Some(prefix8(&env.peer_a.id).as_str()) {
+                bail!(
+                    "metrics node.id_prefix is {}, expected {:?} (A's endpoint id is {})",
+                    node["id_prefix"],
+                    prefix8(&env.peer_a.id),
+                    env.peer_a.id
+                );
+            }
+            let version = node["version"]
+                .as_str()
+                .with_context(|| format!("metrics node lacks a `version` string: {node}"))?;
+            let engine_build = node["engine_build"]
+                .as_str()
+                .with_context(|| format!("metrics node lacks an `engine_build` string: {node}"))?;
+
+            // The paired worker: connected, with MEASURED link figures and
+            // the Hello-retained version/engine build (same binary runs
+            // both daemons, so retention is exactly equality here).
+            let peers = metrics["peers"]
+                .as_array()
+                .with_context(|| format!("metrics lacks a `peers` array: {metrics}"))?;
+            let peer = peers
+                .iter()
+                .find(|p| p["name"].as_str() == Some(env.b.name))
+                .with_context(|| {
+                    format!(
+                        "metrics peers[] lacks the paired worker {:?}: {}",
+                        env.b.name,
+                        serde_json::to_string(peers).unwrap_or_default()
+                    )
+                })?;
+            if peer["id_prefix"].as_str() != Some(prefix8(&env.peer_b.id).as_str()) {
+                bail!(
+                    "peer id_prefix is {}, expected {:?}: {peer}",
+                    peer["id_prefix"],
+                    prefix8(&env.peer_b.id)
+                );
+            }
+            let state = peer["state"].as_str().unwrap_or_default();
+            if !state.eq_ignore_ascii_case("connected") {
+                bail!(
+                    "peer {} is {state:?}, expected connected: {peer}",
+                    env.b.name
+                );
+            }
+            let rtt = peer["rtt_ms"].as_f64();
+            let bw = peer["bandwidth_mbps"].as_f64();
+            match (rtt, bw) {
+                (Some(r), Some(b)) if r > 0.0 && b > 0.0 => {
+                    println!(
+                        "       link {}<->{}: rtt {r:.2} ms, {b:.0} Mbps",
+                        env.a.name, env.b.name
+                    );
+                }
+                _ => bail!(
+                    "peer {} lacks positive measured rtt_ms/bandwidth_mbps: {peer}",
+                    env.b.name
+                ),
+            }
+            if peer["version"].as_str() != Some(version) {
+                bail!(
+                    "peer version is {} but this node runs {version:?} — the same binary \
+                     serves both daemons, so the Hello-retained version must match: {peer}",
+                    peer["version"]
+                );
+            }
+            if peer["engine_build"].as_str() != Some(engine_build) {
+                bail!(
+                    "peer engine_build is {} but this node runs {engine_build:?}: {peer}",
+                    peer["engine_build"]
+                );
+            }
+
+            // The plan view: head role, and EXACTLY the active plan.
+            let view = &metrics["plan"];
+            if view["role"].as_str() != Some("head") {
+                bail!(
+                    "metrics plan.role is {}, expected \"head\": {view}",
+                    view["role"]
+                );
+            }
+            let mplan = &view["plan"];
+            assert_pipeline(mplan)?;
+            let live = active_plan(env.a)?;
+            if plan_epoch(mplan)? != plan_epoch(&live)? {
+                bail!(
+                    "metrics plan epoch {} != active plan epoch {}: {mplan} vs {live}",
+                    plan_epoch(mplan)?,
+                    plan_epoch(&live)?
+                );
+            }
+            let (m_asgs, live_asgs) = (assignment_tuples(mplan)?, assignment_tuples(&live)?);
+            if m_asgs != live_asgs {
+                bail!(
+                    "metrics plan assignments {m_asgs:?} differ from the active plan's \
+                     {live_asgs:?}"
+                );
+            }
+            // ...and the assignments name exactly the two live endpoints.
+            let mut ids = assignment_node_ids(mplan);
+            ids.sort_unstable();
+            let mut want = vec![env.peer_a.id.clone(), env.peer_b.id.clone()];
+            want.sort_unstable();
+            if ids != want {
+                bail!("plan assignment node ids {ids:?} are not the paired endpoints {want:?}");
+            }
+            println!(
+                "       plan epoch {} mirrored with {} assignments over both endpoints",
+                plan_epoch(mplan)?,
+                m_asgs.len()
+            );
+            Ok(())
+        },
+    )
+}
+
+/// M8 step 25 (request-log half): one generation lands in `requests[]`
+/// with its dialect, token counts, and NONZERO decode timing — and the
+/// raw metrics document never contains the prompt text (docs/product.md
+/// §1 privacy line, asserted on the unparsed body so no field can hide
+/// it).
+fn m8_request_log_step(env: &ChaosEnv) -> Result<()> {
+    step(
+        "m8 request log: entry with nonzero timing; prompt text absent from the raw body",
+        || {
+            let name = model_name(env.a)?;
+            let before = latest_request_id(&env.a.get_json("/api/internal/metrics")?);
+            let (_text, line) = generate_raw(env.a, &name, M8_PROMPT, M8_MAX_TOKENS)?;
+            println!(
+                "       generated: prefill {}tok {}ms, decode {}tok {}ms",
+                line.prefill_tok, line.prefill_ms, line.decode_tok, line.decode_ms
+            );
+            // Recording precedes the client's own `done` (metrics.rs), so
+            // one poll normally suffices; the loop absorbs scheduler jitter.
+            let deadline = Instant::now() + M8_REQUEST_LOG_TIMEOUT;
+            let raw = loop {
+                let (code, text) =
+                    env.a
+                        .http("GET", "/api/internal/metrics", None, Duration::from_secs(5))?;
+                if code == 200 {
+                    let v: Value = serde_json::from_str(&text)
+                        .with_context(|| format!("metrics body is not JSON: {text}"))?;
+                    let now = latest_request_id(&v);
+                    if now.is_some() && now != before {
+                        break text;
+                    }
+                }
+                if Instant::now() >= deadline {
+                    bail!(
+                        "no new requests[] entry within {M8_REQUEST_LOG_TIMEOUT:?} of a \
+                         finished generation (newest before: {before:?})"
+                    );
+                }
+                std::thread::sleep(POLL_INTERVAL);
+            };
+            // Privacy first, on the UNPARSED document: the sentinel prompt
+            // must not appear anywhere.
+            if raw.contains(M8_PROMPT) {
+                bail!(
+                    "the metrics document contains the prompt text {M8_PROMPT:?} — \
+                     docs/product.md §1 forbids prompt text EVER (§10 privacy)"
+                );
+            }
+            let v: Value = serde_json::from_str(&raw).expect("parsed above");
+            let entry = &v["requests"][0];
+            if entry["dialect"] != "ollama" {
+                bail!(
+                    "newest entry dialect is {}, expected \"ollama\" (/api/generate): {entry}",
+                    entry["dialect"]
+                );
+            }
+            if entry["model"].as_str() != Some(name.as_str()) {
+                bail!(
+                    "newest entry model is {}, expected {name:?}: {entry}",
+                    entry["model"]
+                );
+            }
+            for field in ["prompt_tokens", "completion_tokens"] {
+                if entry[field].as_u64().is_none_or(|n| n == 0) {
+                    bail!("newest entry carries no {field}: {entry}");
+                }
+            }
+            // Nonzero timing: decode wall time is the deterministic figure
+            // (loopback: 12 tokens behind a 40 ms decode delay; netem: 12
+            // boundary crossings of the shaped link). ttft/prefill on a
+            // 260K model can honestly round to 0 ms, so they only print.
+            let decode_ms = entry["decode_ms"].as_u64().unwrap_or(0);
+            if decode_ms == 0 {
+                bail!("newest entry decode_ms is 0 — timing must be nonzero: {entry}");
+            }
+            let finish = entry["finish"].as_str().unwrap_or_default();
+            if !matches!(finish, "stop" | "length") {
+                bail!("newest entry finish is {finish:?}, expected stop|length: {entry}");
+            }
+            if entry["timestamp_unix"].as_u64().is_none_or(|t| t == 0) {
+                bail!("newest entry lacks a timestamp: {entry}");
+            }
+            println!(
+                "       {} [{}] {} {}tok->{}tok prefill {}ms decode {decode_ms}ms ttft {}ms \
+                 finish {finish}",
+                entry["id"],
+                entry["dialect"],
+                entry["model"],
+                entry["prompt_tokens"],
+                entry["completion_tokens"],
+                entry["prefill_ms"],
+                entry["ttft_ms"],
+            );
+            Ok(())
+        },
+    )
+}
+
+/// M8 step 26, loopback leg: the advisor findings render ASSERT-FREE. No
+/// v1 rule can fire deterministically on a healthy same-binary loopback
+/// pair — the contract's honesty rule ("no advice without a measurement
+/// behind it") is exactly why:
+///
+/// - slow-link needs a PROBED sub-400 Mbps link; loopback measures far
+///   above, and the netem leg reshapes the veth pair and asserts it.
+/// - version/engine skew needs two different builds, but one binary
+///   serves every sim daemon.
+/// - the battery rules need a measured discharge; `[debug]` deliberately
+///   has no battery override (overrides change what a node REPORTS about
+///   memory/speed, never fake a power source).
+/// - memory-starved needs usable memory measured FAR below a live plan
+///   share after planning; the override knob is config-only, and a
+///   restart tears the epoch and re-plans around the new figure.
+/// - solo-because-infeasible needs a ONE-node plan carrying a planner
+///   exclusion note, which a two-node cluster cannot produce: a head
+///   that fits auto-solos with no selection notes, and one that does
+///   not fit fails the plan (DoesNotFit) once its only worker is
+///   excluded.
+///
+/// Findings that DO fire on a given machine (say, a genuinely
+/// discharging laptop) print for eyeballs without turning the run red.
+fn m8_advisor_print_step(node: &Node) -> Result<()> {
+    step(
+        "m8 advisor: findings render (assert-free; the netem leg asserts slow-link)",
+        || {
+            let metrics = node.get_json("/api/internal/metrics")?;
+            let advisor = metrics["advisor"]
+                .as_array()
+                .with_context(|| format!("metrics lacks an `advisor` array: {metrics}"))?;
+            if advisor.is_empty() {
+                println!("       no findings (a healthy loopback pair has nothing to advise)");
+            }
+            for f in advisor {
+                println!(
+                    "       [{}] {}",
+                    f["severity"].as_str().unwrap_or("?"),
+                    f["text"].as_str().unwrap_or("?")
+                );
+            }
+            Ok(())
+        },
+    )
+}
+
+/// M8 step 26, netem leg: reshape the link under [`M8_SLOW_LINK_MBPS`],
+/// reconnect so the on-connect bulk probe measures the new shape, and
+/// assert the slow-link advisor line fires — the one rule whose input the
+/// sim can measure honestly, and only here (module docs).
+fn m8_advisor_netem_step(env: &ChaosEnv) -> Result<()> {
+    let (mesh_a, mesh_b, _mesh_c) = env.mesh;
+    step(
+        "m8 advisor: link reshaped to 200mbit; fresh probe lands under 400 Mbps",
+        || {
+            netem_reshape(M8_SLOW_RATE)?;
+            // The bulk probe runs once per connect: restart both daemons
+            // (head first — clean epoch teardown) so fresh sessions
+            // re-measure the reshaped link.
+            restart_with(env.a, mesh_a, true, SimKnobs::default())?;
+            restart_with(env.b, mesh_b, true, SimKnobs::default())?;
+            wait_connected(
+                env.a,
+                env.b,
+                env.peer_a,
+                env.peer_b,
+                "after the reshape restart",
+            )?;
+            let entry = env.a.wait_peer(
+                &env.peer_b.id,
+                M8_BANDWIDTH_TIMEOUT,
+                "a sub-400 Mbps probed bandwidth",
+                |p| {
+                    p["bandwidth_mbps"]
+                        .as_f64()
+                        .is_some_and(|bw| bw > 0.0 && bw < M8_SLOW_LINK_MBPS)
+                },
+            )?;
+            println!(
+                "       probed {:.0} Mbps (slow-link threshold {M8_SLOW_LINK_MBPS} Mbps)",
+                entry["bandwidth_mbps"].as_f64().unwrap_or(f64::NAN)
+            );
+            Ok(())
+        },
+    )?;
+    step(
+        "m8 advisor: netem asserts — the slow-link finding fires",
+        || {
+            let metrics = env.a.get_json("/api/internal/metrics")?;
+            let advisor = metrics["advisor"]
+                .as_array()
+                .with_context(|| format!("metrics lacks an `advisor` array: {metrics}"))?;
+            let finding = advisor
+                .iter()
+                .find(|f| {
+                    f["text"]
+                        .as_str()
+                        .is_some_and(|t| t.contains(M8_SLOW_LINK_NEEDLE) && t.contains(env.b.name))
+                })
+                .with_context(|| {
+                    format!(
+                        "no slow-link finding ({M8_SLOW_LINK_NEEDLE:?} naming {:?}) in advisor: {}",
+                        env.b.name,
+                        serde_json::to_string(advisor).unwrap_or_default()
+                    )
+                })?;
+            match finding["severity"].as_str() {
+                // Info without a plan, warn inside one — both prove the rule.
+                Some("info" | "warn") => {}
+                other => {
+                    bail!("slow-link finding severity is {other:?}, expected info|warn: {finding}")
+                }
+            }
+            println!(
+                "       [{}] {}",
+                finding["severity"].as_str().unwrap_or("?"),
+                finding["text"].as_str().unwrap_or("?")
+            );
+            Ok(())
+        },
+    )
+}
+
+/// The first 8 chars of an endpoint id — how metrics abbreviates ids
+/// (`id_prefix`) for dashboard correlation.
+fn prefix8(id: &str) -> String {
+    id.chars().take(8).collect()
+}
+
+/// The newest request-log entry's id, if any (`requests[]` is newest
+/// first).
+fn latest_request_id(metrics: &Value) -> Option<String> {
+    metrics["requests"][0]["id"].as_str().map(str::to_string)
+}
+
+/// Every assignment as a comparable `(node, start, end, stage)` tuple,
+/// sorted — plan-view equality without caring about serialization order.
+fn assignment_tuples(plan: &Value) -> Result<Vec<(String, u64, u64, u64)>> {
+    let mut out = Vec::new();
+    for a in plan.assignments()? {
+        let node = a["node"]
+            .as_str()
+            .with_context(|| format!("assignment lacks a `node` string: {a}"))?
+            .to_string();
+        let start = a
+            .pointer("/layers/start")
+            .and_then(Value::as_u64)
+            .with_context(|| format!("assignment lacks layers.start: {a}"))?;
+        let end = a
+            .pointer("/layers/end")
+            .and_then(Value::as_u64)
+            .with_context(|| format!("assignment lacks layers.end: {a}"))?;
+        let stage = a["stage"]
+            .as_u64()
+            .with_context(|| format!("assignment lacks a numeric `stage`: {a}"))?;
+        out.push((node, start, end, stage));
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// One UNAUTHENTICATED GET — no Authorization header, unlike `Node::http`
+/// which always presents the token. The dashboard routes must serve
+/// without it while the metrics route refuses. Returns (status,
+/// content-type, body); in netem mode the request rides in-namespace curl
+/// exactly like the authenticated calls.
+fn http_get_unauthed(node: &Node, path: &str, netem: bool) -> Result<(u16, String, String)> {
+    let url = node.url(path);
+    if !netem {
+        let resp = node
+            .client
+            .get(&url)
+            .timeout(Duration::from_secs(10))
+            .send()
+            .with_context(|| format!("GET {url} on {} failed", node.label))?;
+        let code = resp.status().as_u16();
+        let ctype = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let body = resp
+            .text()
+            .with_context(|| format!("reading GET {url} body"))?;
+        return Ok((code, ctype, body));
+    }
+    let out = node
+        .wrap(OsStr::new("curl"))
+        .args([
+            "-sS",
+            "-o",
+            "-",
+            "-w",
+            "\n%{content_type}\n%{http_code}",
+            "--max-time",
+            "10",
+            &url,
+        ])
+        .output()
+        .context("failed to spawn `ip netns exec ... curl` (is curl installed?)")?;
+    if !out.status.success() {
+        bail!(
+            "curl GET {path} on {} failed: {}",
+            node.label,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    parse_curl_meta_trailer(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Split curl's `-w "\n%{content_type}\n%{http_code}"` trailer off a body:
+/// the LAST line is the status code, the one before it the content-type.
+fn parse_curl_meta_trailer(text: &str) -> Result<(u16, String, String)> {
+    let code_cut = text
+        .rfind('\n')
+        .context("curl output is missing the status-code trailer")?;
+    let code: u16 = text[code_cut + 1..].trim().parse().with_context(|| {
+        format!(
+            "curl status trailer is not numeric: {:?}",
+            &text[code_cut + 1..]
+        )
+    })?;
+    let ct_cut = text[..code_cut]
+        .rfind('\n')
+        .context("curl output is missing the content-type trailer")?;
+    let ctype = text[ct_cut + 1..code_cut].trim().to_string();
+    Ok((code, ctype, text[..ct_cut].to_string()))
 }
 
 // ---------------------------------------------------------------------------
@@ -5459,5 +6092,84 @@ onebrain 4242 user   11u  IPv4 0xdeadbeef      0t0  TCP 10.0.0.5:52001->1.2.3.4:
             "no links measured (pair another device with `onebrain pair`)",
         );
         assert!(check_cluster_bench_markdown(&no_links, "sim-a", "sim-b").is_err());
+    }
+
+    #[test]
+    fn m8_curl_meta_trailer_splits_body_content_type_and_status() {
+        let (code, ctype, body) =
+            parse_curl_meta_trailer("<html>shell</html>\ntext/html; charset=utf-8\n200").unwrap();
+        assert_eq!(code, 200);
+        assert_eq!(ctype, "text/html; charset=utf-8");
+        assert_eq!(body, "<html>shell</html>");
+
+        // Multi-line bodies keep every interior newline.
+        let (code, ctype, body) =
+            parse_curl_meta_trailer("line1\nline2\ntext/css; charset=utf-8\n200").unwrap();
+        assert_eq!(code, 200);
+        assert_eq!(ctype, "text/css; charset=utf-8");
+        assert_eq!(body, "line1\nline2");
+
+        // Empty body + empty content-type (a 401 error response still
+        // carries a JSON body in practice, but the parser must not care).
+        let (code, ctype, body) = parse_curl_meta_trailer("\n\n401").unwrap();
+        assert_eq!(code, 401);
+        assert_eq!(ctype, "");
+        assert_eq!(body, "");
+
+        assert!(parse_curl_meta_trailer("no trailer at all").is_err());
+        assert!(parse_curl_meta_trailer("body\ntext/html\nnot-a-code").is_err());
+        assert!(parse_curl_meta_trailer("only-status\n200").is_err());
+    }
+
+    #[test]
+    fn m8_assignment_tuples_compare_plans_order_insensitively() {
+        let metrics_plan = json!({
+            "epoch": 7,
+            "strategy": "PipelineParallel",
+            "assignments": [
+                { "node": "bbbb", "layers": { "start": 3, "end": 5 }, "stage": 1 },
+                { "node": "aaaa", "layers": { "start": 0, "end": 3 }, "stage": 0 },
+            ],
+        });
+        let status_plan = json!({
+            "epoch": 7,
+            "strategy": "PipelineParallel",
+            "assignments": [
+                { "node": "aaaa", "layers": { "start": 0, "end": 3 }, "stage": 0 },
+                { "node": "bbbb", "layers": { "start": 3, "end": 5 }, "stage": 1 },
+            ],
+        });
+        assert_eq!(
+            assignment_tuples(&metrics_plan).unwrap(),
+            assignment_tuples(&status_plan).unwrap()
+        );
+
+        // A shifted layer range is a real mismatch.
+        let moved = json!({
+            "assignments": [
+                { "node": "aaaa", "layers": { "start": 0, "end": 4 }, "stage": 0 },
+                { "node": "bbbb", "layers": { "start": 4, "end": 5 }, "stage": 1 },
+            ],
+        });
+        assert_ne!(
+            assignment_tuples(&moved).unwrap(),
+            assignment_tuples(&status_plan).unwrap()
+        );
+        // Malformed assignments fail loudly rather than comparing equal.
+        assert!(assignment_tuples(&json!({ "assignments": [{ "node": "aaaa" }] })).is_err());
+        assert!(assignment_tuples(&json!({})).is_err());
+    }
+
+    #[test]
+    fn m8_sentinel_prompt_and_reshape_stay_honest() {
+        // The privacy sentinel must survive JSON round-tripping verbatim,
+        // or the raw-body `contains` check could miss a leak behind
+        // escaping.
+        let escaped = serde_json::to_string(M8_PROMPT).unwrap();
+        assert_eq!(escaped, format!("\"{M8_PROMPT}\""));
+        // The reshape rate must sit clearly under the daemon's slow-link
+        // threshold (half, so probe noise cannot straddle it).
+        let mbit: f64 = M8_SLOW_RATE.strip_suffix("mbit").unwrap().parse().unwrap();
+        assert!(mbit <= M8_SLOW_LINK_MBPS / 2.0);
     }
 }
